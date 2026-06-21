@@ -5,9 +5,30 @@ use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::settings::{RenderCreation, WgpuSettings};
 use bevy::render::texture::ImagePlugin;
 use bevy_flycam::prelude::*;
+use std::collections::HashSet;
+
+/// World units are feet. Voxel trees use 1-inch blocks; the worm is ~3 inches long.
+const INCH: f32 = 1.0 / 12.0;
+const BLOCK_SIZE: f32 = INCH;
+
+const WORM_LENGTH: f32 = 3.0 * INCH;
+const WORM_EYE_HEIGHT: f32 = 1.5 * INCH;
+
+/// ~2 ft trunk diameter — enormous next to a 3-inch worm.
+const TRUNK_RADIUS_BLOCKS: i32 = 12;
+
+/// Crown leaf blobs at branch tips — pom-pom scale (separate from ground collectibles).
+const FOLIAGE_BLOB_INCHES: i32 = 8;
+const FOLIAGE_BLOB_SIZE: f32 = FOLIAGE_BLOB_INCHES as f32 * INCH;
+
+/// Branches may droop slightly but never more than ~70% of their horizontal reach.
+const MAX_BRANCH_DROOP_RATIO: f32 = 0.7;
 
 #[derive(Component)]
 struct Leaf;
+
+#[derive(Component)]
+struct EucalyptusTree;
 
 #[derive(Component)]
 struct FloatingLeaf {
@@ -40,6 +61,11 @@ fn main() {
             })
         )
         .add_plugins(PlayerPlugin) // Adds WASD + mouse look camera automatically
+        .insert_resource(MovementSettings {
+            sensitivity: 0.00012,
+            speed: 1.8, // Slow crawl — we're a tiny worm
+            ..default()
+        })
         .insert_resource(ClearColor(Color::srgb(0.58, 0.72, 0.88))) // Soft garden sky
         .add_systems(Startup, setup_garden)
         .add_systems(Update, (eat_leaves, animate_floating_leaves))
@@ -63,40 +89,12 @@ fn setup_garden(
         })),
     ));
 
-    // Temporary placeholder objects so the world doesn't feel completely empty.
-    // You will replace these with your own art/models later.
-
     // 3D leaves: extruded from the higher-res pixel art leaf.png with jagged 8-bit outline following the sprite pixels exactly
     // (coffee-coaster scale). The mesh itself is the leaf silhouette; spins/bobs
     // use the same logic as before so placements still look good.
     // (Press E when close to one to eat)
     spawn_textured_leaves(&mut commands, &mut meshes, &mut materials, &asset_server);
-
-    // Rocks / dirt
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(3.0, 1.0, 2.8))),
-        MeshMaterial3d(materials.add(Color::srgb(0.42, 0.36, 0.30))),
-        Transform::from_xyz(-15.0, 0.5, 8.0),
-    ));
-
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(2.2, 0.8, 2.0))),
-        MeshMaterial3d(materials.add(Color::srgb(0.38, 0.33, 0.28))),
-        Transform::from_xyz(18.0, 0.4, -12.0),
-    ));
-
-    // Simple plant stand-ins (tall boxes for now)
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(0.6, 4.0, 0.6))),
-        MeshMaterial3d(materials.add(Color::srgb(0.18, 0.42, 0.16))),
-        Transform::from_xyz(-6.0, 2.0, -9.0),
-    ));
-
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(0.7, 3.2, 0.7))),
-        MeshMaterial3d(materials.add(Color::srgb(0.22, 0.48, 0.20))),
-        Transform::from_xyz(9.0, 1.6, 14.0),
-    ));
+    spawn_procedural_eucalyptus_trees(&mut commands, &mut meshes, &mut materials);
 
     // Sun light
     commands.spawn((
@@ -112,6 +110,448 @@ fn setup_garden(
         color: Color::srgb(0.82, 0.88, 0.95),
         brightness: 70.0,
     });
+}
+
+/// Tiny seeded RNG — stable procedural generation across runs.
+struct GardenRng {
+    state: u64,
+}
+
+impl GardenRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.state >> 32) as u32
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        self.next_u32() as f32 / u32::MAX as f32
+    }
+
+    fn range(&mut self, min: f32, max: f32) -> f32 {
+        min + self.next_f32() * (max - min)
+    }
+
+    fn range_i(&mut self, min: i32, max: i32) -> i32 {
+        min + (self.next_f32() * (max - min + 1) as f32).floor() as i32
+    }
+
+    fn chance(&mut self, probability: f32) -> bool {
+        self.next_f32() < probability
+    }
+
+    fn choice_i(&mut self, options: &[i32]) -> i32 {
+        options[(self.next_f32() * options.len() as f32).floor() as usize % options.len()]
+    }
+}
+
+struct EucalyptusTreeData {
+    bark: HashSet<IVec3>,
+    foliage: HashSet<IVec3>,
+}
+
+fn trunk_centroid_at_y(trunk: &HashSet<IVec3>, y: i32) -> IVec3 {
+    let ring: Vec<IVec3> = trunk.iter().copied().filter(|p| p.y == y).collect();
+    if ring.is_empty() {
+        return IVec3::ZERO;
+    }
+    let cx = ring.iter().map(|p| p.x).sum::<i32>() / ring.len() as i32;
+    let cz = ring.iter().map(|p| p.z).sum::<i32>() / ring.len() as i32;
+    IVec3::new(cx, y, cz)
+}
+
+/// Tall, mostly straight trunk — bare for the lower ~60% like real eucalyptus.
+fn generate_eucalyptus_trunk(rng: &mut GardenRng) -> HashSet<IVec3> {
+    let height_feet = rng.range_i(50, 80);
+    let height_blocks = height_feet * 12;
+    let radius = TRUNK_RADIUS_BLOCKS;
+    let radius_sq = radius * radius;
+
+    let mut center_x = 0i32;
+    let mut center_z = 0i32;
+    let mut trunk = HashSet::new();
+
+    for y in 0..height_blocks {
+        if y > 0 {
+            if rng.chance(0.05) {
+                center_x += rng.choice_i(&[-1, 0, 1]);
+            }
+            if rng.chance(0.05) {
+                center_z += rng.choice_i(&[-1, 0, 1]);
+            }
+            center_x = center_x.clamp(-2, 2);
+            center_z = center_z.clamp(-2, 2);
+        }
+
+        for dx in -radius..=radius {
+            for dz in -radius..=radius {
+                if dx * dx + dz * dz <= radius_sq {
+                    trunk.insert(IVec3::new(center_x + dx, y, center_z + dz));
+                }
+            }
+        }
+    }
+
+    trunk
+}
+
+/// Upward-biased branch direction with limited droop below horizontal.
+fn sample_branch_direction(rng: &mut GardenRng, outward: Vec3) -> Vec3 {
+    let azimuth = rng.range(0.0, std::f32::consts::TAU);
+    let elev_deg = if rng.chance(0.85) {
+        rng.range(12.0, 72.0)
+    } else {
+        rng.range(-28.0, 18.0)
+    };
+    let elev = elev_deg.to_radians();
+
+    let mut dir = Vec3::new(
+        elev.cos() * azimuth.cos(),
+        elev.sin(),
+        elev.cos() * azimuth.sin(),
+    );
+
+    if dir.y < 0.0 {
+        let horizontal = Vec2::new(dir.x, dir.z).length().max(0.05);
+        if dir.y.abs() > MAX_BRANCH_DROOP_RATIO * horizontal {
+            dir.y = -MAX_BRANCH_DROOP_RATIO * horizontal;
+        }
+    }
+
+    if outward.length_squared() > 0.01 {
+        dir = (dir + outward * rng.range(0.25, 0.55)).normalize();
+    } else {
+        dir = dir.normalize();
+    }
+
+    dir
+}
+
+fn rasterize_branch(start: IVec3, dir: Vec3, length_inches: i32) -> Vec<IVec3> {
+    let mut blocks = Vec::with_capacity(length_inches as usize);
+    let mut pos = Vec3::new(
+        start.x as f32 + 0.5,
+        start.y as f32 + 0.5,
+        start.z as f32 + 0.5,
+    );
+    let step = dir.normalize() * 0.55;
+    let mut prev = start;
+    blocks.push(start);
+
+    for _ in 0..length_inches {
+        pos += step;
+        let grid = IVec3::new(
+            pos.x.floor() as i32,
+            pos.y.floor() as i32,
+            pos.z.floor() as i32,
+        );
+        if grid != prev {
+            blocks.push(grid);
+            prev = grid;
+        }
+    }
+
+    blocks
+}
+
+fn inch_to_blob_coord(inch: IVec3) -> IVec3 {
+    IVec3::new(
+        inch.x.div_euclid(FOLIAGE_BLOB_INCHES),
+        inch.y.div_euclid(FOLIAGE_BLOB_INCHES),
+        inch.z.div_euclid(FOLIAGE_BLOB_INCHES),
+    )
+}
+
+/// Pom-pom leaf cloud at a branch tip — large, rounded, slightly irregular.
+fn generate_branch_tip_foliage(rng: &mut GardenRng, tip: IVec3) -> HashSet<IVec3> {
+    let center = inch_to_blob_coord(tip)
+        + IVec3::new(
+            rng.range_i(-1, 1),
+            rng.range_i(0, 2),
+            rng.range_i(-1, 1),
+        );
+
+    let mut blobs = HashSet::new();
+    let radius_x = rng.range(3.2, 5.8);
+    let radius_y = rng.range(2.4, 4.2);
+    let radius_z = rng.range(3.2, 5.8);
+    let puffiness = rng.range(0.68, 0.92);
+
+    for dx in -7..=7 {
+        for dy in -2..=7 {
+            for dz in -7..=7 {
+                let p = center + IVec3::new(dx, dy, dz);
+                let nx = dx as f32 / radius_x;
+                let ny = dy as f32 / radius_y;
+                let nz = dz as f32 / radius_z;
+                let dist_sq = nx * nx + ny * ny + nz * nz;
+                if dist_sq > 1.0 {
+                    continue;
+                }
+
+                let edge_softness = 1.0 - dist_sq;
+                if rng.chance(edge_softness * puffiness) {
+                    blobs.insert(p);
+                }
+            }
+        }
+    }
+
+    blobs
+}
+
+/// Semi-random upward branches from the upper trunk; leaves only at tips.
+fn generate_eucalyptus_branches(
+    rng: &mut GardenRng,
+    trunk: &HashSet<IVec3>,
+) -> (HashSet<IVec3>, HashSet<IVec3>) {
+    let min_y = trunk.iter().map(|p| p.y).min().unwrap_or(0);
+    let max_y = trunk.iter().map(|p| p.y).max().unwrap_or(0);
+    let trunk_height = max_y - min_y;
+    let branch_zone_start = min_y + (trunk_height as f32 * 0.58) as i32;
+
+    let mut branches = HashSet::new();
+    let mut foliage = HashSet::new();
+    let branch_count = rng.range_i(7, 15);
+
+    for _ in 0..branch_count {
+        let attach_y = rng.range_i(branch_zone_start, max_y.saturating_sub(8));
+        let ring: Vec<IVec3> = trunk
+            .iter()
+            .copied()
+            .filter(|p| p.y == attach_y)
+            .collect();
+        if ring.is_empty() {
+            continue;
+        }
+
+        let start = ring[(rng.next_f32() * ring.len() as f32).floor() as usize];
+        let center = trunk_centroid_at_y(trunk, attach_y);
+        let outward = Vec3::new(
+            (start.x - center.x) as f32,
+            0.0,
+            (start.z - center.z) as f32,
+        )
+        .normalize_or_zero();
+
+        let dir = sample_branch_direction(rng, outward);
+        let length_inches = rng.range_i(28, 96);
+        let path = rasterize_branch(start, dir, length_inches);
+
+        let mut tip = None;
+        for block in path {
+            if !trunk.contains(&block) {
+                branches.insert(block);
+                tip = Some(block);
+            }
+        }
+
+        if let Some(tip_pos) = tip {
+            for blob in generate_branch_tip_foliage(rng, tip_pos) {
+                foliage.insert(blob);
+            }
+        }
+    }
+
+    (branches, foliage)
+}
+
+fn generate_eucalyptus_tree(rng: &mut GardenRng) -> EucalyptusTreeData {
+    let trunk = generate_eucalyptus_trunk(rng);
+    let (branches, foliage) = generate_eucalyptus_branches(rng, &trunk);
+    let mut bark = trunk;
+    bark.extend(branches);
+    EucalyptusTreeData { bark, foliage }
+}
+
+/// Merges inch blocks into one mesh, culling hidden interior faces.
+fn build_culled_voxel_mesh(blocks: &HashSet<IVec3>, block_size: f32) -> Mesh {
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    let faces: [(IVec3, [f32; 3], [[f32; 3]; 4]); 6] = [
+        (
+            IVec3::X,
+            [1.0, 0.0, 0.0],
+            [
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 1.0, 1.0],
+                [1.0, 0.0, 1.0],
+            ],
+        ),
+        (
+            IVec3::NEG_X,
+            [-1.0, 0.0, 0.0],
+            [
+                [0.0, 0.0, 1.0],
+                [0.0, 1.0, 1.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+        ),
+        (
+            IVec3::Y,
+            [0.0, 1.0, 0.0],
+            [
+                [0.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+        ),
+        (
+            IVec3::NEG_Y,
+            [0.0, -1.0, 0.0],
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+            ],
+        ),
+        (
+            IVec3::Z,
+            [0.0, 0.0, 1.0],
+            [
+                [1.0, 0.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [0.0, 1.0, 1.0],
+                [0.0, 0.0, 1.0],
+            ],
+        ),
+        (
+            IVec3::NEG_Z,
+            [0.0, 0.0, -1.0],
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ],
+        ),
+    ];
+
+    for block in blocks {
+        let origin = Vec3::new(
+            block.x as f32 * block_size,
+            block.y as f32 * block_size,
+            block.z as f32 * block_size,
+        );
+
+        for (neighbor, normal, corners) in &faces {
+            if blocks.contains(&(*block + *neighbor)) {
+                continue;
+            }
+
+            let base = positions.len() as u32;
+            for corner in corners {
+                let pos = origin + Vec3::new(
+                    corner[0] * block_size,
+                    corner[1] * block_size,
+                    corner[2] * block_size,
+                );
+                positions.push(pos.to_array());
+                normals.push(*normal);
+                uvs.push([corner[0], corner[1]]);
+            }
+
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
+}
+
+fn spawn_procedural_eucalyptus_trees(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+) {
+    let mut rng = GardenRng::new(0xE0CA1E52_2026);
+
+    let garden_half = 40.0;
+    let min_spacing = 18.0;
+    let spawn_clear_radius = 14.0;
+    let target_trees = rng.range_i(10, 18);
+
+    let mut placed: Vec<Vec3> = Vec::new();
+
+    for _ in 0..500 {
+        if placed.len() >= target_trees as usize {
+            break;
+        }
+
+        let x = rng.range(-garden_half, garden_half);
+        let z = rng.range(-garden_half, garden_half);
+        let base = Vec3::new(x, 0.0, z);
+
+        if base.length() < spawn_clear_radius {
+            continue;
+        }
+        if placed.iter().any(|p| p.distance(base) < min_spacing) {
+            continue;
+        }
+
+        let tree = generate_eucalyptus_tree(&mut rng);
+        let bark_mesh = meshes.add(build_culled_voxel_mesh(&tree.bark, BLOCK_SIZE));
+        let foliage_mesh = meshes.add(build_culled_voxel_mesh(&tree.foliage, FOLIAGE_BLOB_SIZE));
+
+        // Light brown bark + blue-green eucalyptus leaf tones, varied per tree.
+        let bark_material = materials.add(StandardMaterial {
+            base_color: Color::srgb(
+                rng.range(0.62, 0.72),
+                rng.range(0.50, 0.58),
+                rng.range(0.36, 0.44),
+            ),
+            ..default()
+        });
+        let foliage_material = materials.add(StandardMaterial {
+            base_color: Color::srgb(
+                rng.range(0.40, 0.50),
+                rng.range(0.58, 0.68),
+                rng.range(0.48, 0.56),
+            ),
+            ..default()
+        });
+
+        commands
+            .spawn((
+                EucalyptusTree,
+                Visibility::default(),
+                Transform::from_translation(base),
+            ))
+            .with_children(|tree_root| {
+                tree_root.spawn((
+                    Mesh3d(bark_mesh),
+                    MeshMaterial3d(bark_material),
+                    Transform::IDENTITY,
+                ));
+                tree_root.spawn((
+                    Mesh3d(foliage_mesh),
+                    MeshMaterial3d(foliage_material),
+                    Transform::IDENTITY,
+                ));
+            });
+
+        placed.push(base);
+    }
 }
 
 /// Spawns your actual 8-bit leaf sprite now as true lightly-extruded 3D leaves.
@@ -139,7 +579,10 @@ fn spawn_textured_leaves(
     // One base mesh (fixed size); we scale instances via Transform so thickness scales too.
     let leaf_mesh = create_extruded_leaf_mesh(meshes);
 
-    // Leaf data: (position, base rotation, scale)
+    // Collectible ground leaves — bigger than the worm, at the original spawn heights.
+    let leaf_scale = (WORM_LENGTH * 3.0) / 0.95;
+
+    // Leaf data: (position, base rotation, scale multiplier)
     let leaf_spawns: [(Vec3, Quat, f32); 7] = [
         (Vec3::new(-3.5, 0.8, -4.2), Quat::from_rotation_x(-0.2), 0.9),
         (Vec3::new(6.2, 0.7, 6.8), Quat::from_rotation_x(-0.15) * Quat::from_rotation_z(-0.4), 1.0),
@@ -161,7 +604,7 @@ fn spawn_textured_leaves(
             Transform {
                 translation: *pos,
                 rotation: *base_rot,
-                scale: Vec3::splat(*scale),
+                scale: Vec3::splat(*scale * leaf_scale),
             },
             Leaf,
             FloatingLeaf {
@@ -237,9 +680,9 @@ fn lower_worm_camera(
     mut query: Query<&mut Transform, With<Camera>>,
 ) {
     for mut transform in &mut query {
-        // Default flycam starts quite high — bring it down to worm level
-        if transform.translation.y > 1.2 {
-            transform.translation.y = 0.65; // nice low worm height
+        // Default flycam starts quite high — bring it down to worm eye level (~1.5 inches).
+        if transform.translation.y > WORM_EYE_HEIGHT * 4.0 {
+            transform.translation.y = WORM_EYE_HEIGHT;
         }
     }
 }
