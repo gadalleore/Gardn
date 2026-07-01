@@ -79,24 +79,99 @@ struct OreVein {
     strength: f32,
 }
 
+/// Dense voxel grid for one chunk column. Replaces the old
+/// `HashMap<BlockType, HashSet<IVec3>>` representation: a flat `Vec` indexed by
+/// (x, y, z) gives O(1) neighbour lookups for face culling instead of millions
+/// of hash probes per chunk. `None` = air.
+pub struct ChunkVoxels {
+    size_x: i32,
+    size_z: i32,
+    y_min: i32,
+    y_max: i32,
+    solid_count: usize,
+    cells: Vec<Option<BlockType>>,
+}
+
+impl ChunkVoxels {
+    fn new(size_x: i32, size_z: i32, y_min: i32, y_max: i32) -> Self {
+        let len = (size_x * size_z * (y_max - y_min + 1)) as usize;
+        Self {
+            size_x,
+            size_z,
+            y_min,
+            y_max,
+            solid_count: 0,
+            cells: vec![None; len],
+        }
+    }
+
+    #[inline(always)]
+    fn index(&self, x: i32, y: i32, z: i32) -> usize {
+        (((y - self.y_min) * self.size_z + z) * self.size_x + x) as usize
+    }
+
+    #[inline(always)]
+    fn in_bounds(&self, x: i32, y: i32, z: i32) -> bool {
+        x >= 0
+            && x < self.size_x
+            && z >= 0
+            && z < self.size_z
+            && y >= self.y_min
+            && y <= self.y_max
+    }
+
+    #[inline(always)]
+    fn set(&mut self, x: i32, y: i32, z: i32, block: BlockType) {
+        let i = self.index(x, y, z);
+        if self.cells[i].is_none() {
+            self.solid_count += 1;
+        }
+        self.cells[i] = Some(block);
+    }
+
+    #[inline(always)]
+    fn get(&self, x: i32, y: i32, z: i32) -> Option<BlockType> {
+        if self.in_bounds(x, y, z) {
+            self.cells[self.index(x, y, z)]
+        } else {
+            None
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.solid_count == 0
+    }
+}
+
 pub fn generate_chunk_blocks(
     coord: IVec2,
     chunk_origin: Vec3,
     terrain_seed: u64,
-) -> HashMap<BlockType, HashSet<IVec3>> {
+) -> ChunkVoxels {
     let mut rng = GardenRng::new(terrain_seed);
     let center_world = chunk_origin + Vec3::new(CHUNK_SIZE * 0.5, 0.0, CHUNK_SIZE * 0.5);
     let profile = biome_profile(center_world.x, center_world.z);
 
+    let mut voxels = ChunkVoxels::new(
+        CHUNK_VOXELS,
+        CHUNK_VOXELS,
+        -CHUNK_DEPTH_VOXELS,
+        SURFACE_VOXEL_Y,
+    );
+
     if profile.biome == AussieBiome::Ocean {
-        return generate_ocean_chunk(&mut rng);
+        fill_ocean_chunk(&mut voxels, &mut rng);
+        return voxels;
     }
 
     let veins = plan_ore_veins(coord, terrain_seed, &profile, &mut rng);
-    let mut columns: HashMap<IVec2, ColumnLayers> = HashMap::new();
 
-    // Sample biome every 8 voxels — smooth enough, 64× cheaper than per-voxel.
+    // Per-column surface layers, sampled every 8 voxels into a flat array
+    // (was a 36k-entry HashMap). Smooth enough, 64× cheaper than per-voxel.
     const STRIDE: i32 = 8;
+    let cols = CHUNK_VOXELS as usize;
+    let mut columns: Vec<ColumnLayers> =
+        vec![column_layers(&mut rng, &profile); cols * cols];
     for lz in (0..CHUNK_VOXELS).step_by(STRIDE as usize) {
         for lx in (0..CHUNK_VOXELS).step_by(STRIDE as usize) {
             let wx = chunk_origin.x + (lx as f32 + 0.5) * VOXEL_SIZE;
@@ -105,27 +180,21 @@ pub fn generate_chunk_blocks(
             let layers = column_layers(&mut rng, &col_profile);
             for dz in 0..STRIDE {
                 for dx in 0..STRIDE {
-                    let px = (lx + dx).min(CHUNK_VOXELS - 1);
-                    let pz = (lz + dz).min(CHUNK_VOXELS - 1);
-                    columns.insert(IVec2::new(px, pz), layers);
+                    let px = (lx + dx).min(CHUNK_VOXELS - 1) as usize;
+                    let pz = (lz + dz).min(CHUNK_VOXELS - 1) as usize;
+                    columns[pz * cols + px] = layers;
                 }
             }
         }
     }
 
-    let mut grouped: HashMap<BlockType, HashSet<IVec3>> = HashMap::new();
-
     for lz in 0..CHUNK_VOXELS {
         for lx in 0..CHUNK_VOXELS {
-            let layers = columns
-                .get(&IVec2::new(lx, lz))
-                .copied()
-                .unwrap_or_else(|| column_layers(&mut rng, &profile));
+            let layers = columns[lz as usize * cols + lx as usize];
             let column_bottom = SURFACE_VOXEL_Y - layers.dirt_depth - layers.soft_depth;
 
             for y in -CHUNK_DEPTH_VOXELS..=SURFACE_VOXEL_Y {
-                let pos = IVec3::new(lx, y, lz);
-                let mut block = if y == SURFACE_VOXEL_Y {
+                let block = if y == SURFACE_VOXEL_Y {
                     layers.surface
                 } else if y > SURFACE_VOXEL_Y - layers.dirt_depth {
                     layers.subsurface
@@ -136,17 +205,16 @@ pub fn generate_chunk_blocks(
                 } else {
                     continue;
                 };
-
-                if let Some(ore) = ore_at(pos, &veins) {
-                    block = ore.to_block();
-                }
-
-                grouped.entry(block).or_default().insert(pos);
+                voxels.set(lx, y, lz, block);
             }
         }
     }
 
-    grouped
+    // Stamp ore veins directly over their bounding boxes instead of testing
+    // every voxel against every vein (was ~25M checks/chunk, all underground).
+    stamp_ore_veins(&mut voxels, &veins);
+
+    voxels
 }
 
 #[derive(Clone, Copy)]
@@ -192,8 +260,7 @@ fn column_layers(rng: &mut GardenRng, profile: &crate::australia::BiomeProfile) 
     }
 }
 
-fn generate_ocean_chunk(rng: &mut GardenRng) -> HashMap<BlockType, HashSet<IVec3>> {
-    let mut grouped: HashMap<BlockType, HashSet<IVec3>> = HashMap::new();
+fn fill_ocean_chunk(voxels: &mut ChunkVoxels, rng: &mut GardenRng) {
     for lz in 0..CHUNK_VOXELS {
         for lx in 0..CHUNK_VOXELS {
             for y in -CHUNK_DEPTH_VOXELS..=SURFACE_VOXEL_Y {
@@ -206,17 +273,13 @@ fn generate_ocean_chunk(rng: &mut GardenRng) -> HashMap<BlockType, HashSet<IVec3
                 } else {
                     continue;
                 };
-                grouped.entry(block).or_default().insert(IVec3::new(lx, y, lz));
+                voxels.set(lx, y, lz, block);
             }
             if rng.chance(0.02) {
-                grouped
-                    .entry(BlockType::Limestone)
-                    .or_default()
-                    .insert(IVec3::new(lx, -8, lz));
+                voxels.set(lx, -8, lz, BlockType::Limestone);
             }
         }
     }
-    grouped
 }
 
 fn plan_ore_veins(
@@ -256,22 +319,55 @@ fn plan_ore_veins(
     veins
 }
 
-fn ore_at(pos: IVec3, veins: &[OreVein]) -> Option<OreType> {
-    let mut best: Option<(OreType, f32)> = None;
+/// Paint ore into solid voxels by walking each vein's bounding box. Where veins
+/// overlap, the strongest score wins (same result as the old per-voxel scan, but
+/// proportional to vein volume rather than chunk volume × vein count).
+fn stamp_ore_veins(voxels: &mut ChunkVoxels, veins: &[OreVein]) {
+    if veins.is_empty() {
+        return;
+    }
+    // Best score per contested cell index — keeps "strongest vein wins".
+    let mut best: HashMap<usize, f32> = HashMap::new();
+
     for (i, vein) in veins.iter().enumerate() {
-        let dx = (pos.x - vein.center.x) as f32 / vein.radius.x.max(1) as f32;
-        let dy = (pos.y - vein.center.y) as f32 / vein.radius.y.max(1) as f32;
-        let dz = (pos.z - vein.center.z) as f32 / vein.radius.z.max(1) as f32;
-        let dist_sq = dx * dx + dy * dy + dz * dz;
-        if dist_sq > 1.0 {
-            continue;
-        }
-        let score = (1.0 - dist_sq) * vein.strength;
-        if score > best.map(|(_, s)| s).unwrap_or(0.0) && block_hash(pos, i as u32) < score {
-            best = Some((vein.ore, score));
+        let rx = vein.radius.x.max(1);
+        let ry = vein.radius.y.max(1);
+        let rz = vein.radius.z.max(1);
+
+        let y0 = (vein.center.y - vein.radius.y).max(voxels.y_min);
+        let y1 = (vein.center.y + vein.radius.y).min(voxels.y_max);
+        let z0 = (vein.center.z - vein.radius.z).max(0);
+        let z1 = (vein.center.z + vein.radius.z).min(voxels.size_z - 1);
+        let x0 = (vein.center.x - vein.radius.x).max(0);
+        let x1 = (vein.center.x + vein.radius.x).min(voxels.size_x - 1);
+
+        for y in y0..=y1 {
+            for z in z0..=z1 {
+                for x in x0..=x1 {
+                    let idx = voxels.index(x, y, z);
+                    // Ore only replaces existing solid ground, never air/caves.
+                    if voxels.cells[idx].is_none() {
+                        continue;
+                    }
+                    let dx = (x - vein.center.x) as f32 / rx as f32;
+                    let dy = (y - vein.center.y) as f32 / ry as f32;
+                    let dz = (z - vein.center.z) as f32 / rz as f32;
+                    let dist_sq = dx * dx + dy * dy + dz * dz;
+                    if dist_sq > 1.0 {
+                        continue;
+                    }
+                    let score = (1.0 - dist_sq) * vein.strength;
+                    if block_hash(IVec3::new(x, y, z), i as u32) >= score {
+                        continue;
+                    }
+                    if score > *best.get(&idx).unwrap_or(&0.0) {
+                        best.insert(idx, score);
+                        voxels.cells[idx] = Some(vein.ore.to_block());
+                    }
+                }
+            }
         }
     }
-    best.map(|(o, _)| o)
 }
 
 fn block_hash(pos: IVec3, salt: u32) -> f32 {
@@ -306,19 +402,11 @@ fn block_color(block: BlockType) -> [f32; 4] {
     [rgb[0], rgb[1], rgb[2], 1.0]
 }
 
-/// One combined mesh per chunk — culls across all block types (fixes duplicate faces + VRAM blow-up).
-pub fn build_colored_terrain_mesh(grouped: &HashMap<BlockType, HashSet<IVec3>>) -> Mesh {
-    let mut occupied = HashSet::new();
-    let mut colors_at = HashMap::new();
-    for (block_type, blocks) in grouped {
-        let color = block_color(*block_type);
-        for pos in blocks {
-            occupied.insert(*pos);
-            colors_at.insert(*pos, color);
-        }
-    }
-
-    let face_estimate = occupied.len() * 2;
+/// One combined mesh per chunk. Iterates the dense grid and emits only faces
+/// whose neighbour is air or out-of-bounds — O(1) neighbour checks, no hashing.
+pub fn build_colored_terrain_mesh(voxels: &ChunkVoxels) -> Mesh {
+    // Upper bound: each solid cell contributes at most ~3 visible faces.
+    let face_estimate = voxels.solid_count * 3;
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(face_estimate * 4);
     let mut normals: Vec<[f32; 3]> = Vec::with_capacity(face_estimate * 4);
     let mut colors: Vec<[f32; 4]> = Vec::with_capacity(face_estimate * 4);
@@ -387,32 +475,50 @@ pub fn build_colored_terrain_mesh(grouped: &HashMap<BlockType, HashSet<IVec3>>) 
         ),
     ];
 
-    for block in &occupied {
-        let origin = Vec3::new(
-            block.x as f32 * VOXEL_SIZE,
-            block.y as f32 * VOXEL_SIZE,
-            block.z as f32 * VOXEL_SIZE,
-        );
-        let color = colors_at[block];
-
-        for (neighbor, normal, corners) in &faces {
-            if occupied.contains(&(*block + *neighbor)) {
-                continue;
-            }
-
-            let base = positions.len() as u32;
-            for corner in corners {
-                let pos = origin + Vec3::new(
-                    corner[0] * VOXEL_SIZE,
-                    corner[1] * VOXEL_SIZE,
-                    corner[2] * VOXEL_SIZE,
+    for y in voxels.y_min..=voxels.y_max {
+        for z in 0..voxels.size_z {
+            for x in 0..voxels.size_x {
+                let Some(block) = voxels.get(x, y, z) else {
+                    continue;
+                };
+                let color = block_color(block);
+                let origin = Vec3::new(
+                    x as f32 * VOXEL_SIZE,
+                    y as f32 * VOXEL_SIZE,
+                    z as f32 * VOXEL_SIZE,
                 );
-                positions.push(pos.to_array());
-                normals.push(*normal);
-                colors.push(color);
-            }
 
-            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                for (neighbor, normal, corners) in &faces {
+                    if voxels
+                        .get(x + neighbor.x, y + neighbor.y, z + neighbor.z)
+                        .is_some()
+                    {
+                        continue;
+                    }
+
+                    let base = positions.len() as u32;
+                    for corner in corners {
+                        let pos = origin
+                            + Vec3::new(
+                                corner[0] * VOXEL_SIZE,
+                                corner[1] * VOXEL_SIZE,
+                                corner[2] * VOXEL_SIZE,
+                            );
+                        positions.push(pos.to_array());
+                        normals.push(*normal);
+                        colors.push(color);
+                    }
+
+                    indices.extend_from_slice(&[
+                        base,
+                        base + 1,
+                        base + 2,
+                        base,
+                        base + 2,
+                        base + 3,
+                    ]);
+                }
+            }
         }
     }
 
@@ -536,13 +642,13 @@ pub fn spawn_terrain_meshes(
     chunk_entity: Entity,
     meshes: &mut Assets<Mesh>,
     materials: &TerrainMaterials,
-    grouped: HashMap<BlockType, HashSet<IVec3>>,
+    voxels: ChunkVoxels,
 ) {
-    if grouped.values().all(|set| set.is_empty()) {
+    if voxels.is_empty() {
         return;
     }
 
-    let mesh = meshes.add(build_colored_terrain_mesh(&grouped));
+    let mesh = meshes.add(build_colored_terrain_mesh(&voxels));
     commands.entity(chunk_entity).with_children(|parent| {
         parent.spawn((
             Mesh3d(mesh),

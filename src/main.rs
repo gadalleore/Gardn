@@ -12,7 +12,9 @@ use bevy::render::settings::{RenderCreation, WgpuSettings};
 use bevy::render::texture::ImagePlugin;
 use bevy_flycam::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use australia::{biome_at_world, biome_display_name, pick_land_spawn};
 use chunk_store::{
     archive_chunk, take_saved_chunk, ChunkArchive, ChunkRecord, ChunkTreeJob, SavedTreeSpecies,
 };
@@ -104,7 +106,16 @@ fn main() {
         .init_resource::<ChunkArchive>()
         .init_resource::<TreeSpawnQueue>()
         .init_resource::<MapOverlay>()
-        .add_systems(Startup, (setup_garden, init_tree_spawn_budget, setup_map_ui))
+        .add_systems(
+            Startup,
+            (
+                choose_spawn_location,
+                setup_garden,
+                init_tree_spawn_budget,
+                setup_map_ui,
+            )
+                .chain(),
+        )
         .add_systems(
             Update,
             (
@@ -150,6 +161,29 @@ fn setup_garden(
         color: Color::srgb(0.82, 0.88, 0.95),
         brightness: 70.0,
     });
+}
+
+/// Pick a fresh random spot on the continent for this launch and pin it to world
+/// origin, so every new game drops the worm into a different (area-weighted)
+/// Australian biome. Must run before any terrain/biome sampling.
+fn choose_spawn_location() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let seed = nanos ^ WORLD_SEED ^ 0x5DEE_CE66_A55A_1234;
+
+    let (lat, lon) = pick_land_spawn(seed);
+    set_spawn_geo_offset(geo_to_world_offset(lat, lon));
+
+    // Now that the offset is set, world origin reports the spawn biome.
+    let biome = biome_at_world(0.0, 0.0);
+    println!(
+        "🌏 New game — the little worm wakes up in {} ({:.2}°S {:.2}°E).",
+        biome_display_name(biome),
+        -lat,
+        lon
+    );
 }
 
 fn init_tree_spawn_budget(mut commands: Commands) {
@@ -909,15 +943,20 @@ fn animate_floating_leaves(
     }
 }
 
-/// Lowers the camera so you're viewing the world as a little worm crawling on the ground.
+/// Places the flycam at world origin (the chosen spawn biome) at worm eye level,
+/// just above the surface voxel so you start crawling on the ground rather than
+/// clipped inside it.
 fn lower_worm_camera(
     mut query: Query<&mut Transform, With<Camera>>,
 ) {
+    // Top of the surface voxel + a worm's eye height above it.
+    let surface_top = (SURFACE_VOXEL_Y + 1) as f32 * VOXEL_SIZE;
+    let eye_y = surface_top + WORM_EYE_HEIGHT;
+
     for mut transform in &mut query {
-        // Default flycam starts quite high — bring it down to worm eye level (~1.5 inches).
-        if transform.translation.y > WORM_EYE_HEIGHT * 4.0 {
-            transform.translation.y = WORM_EYE_HEIGHT;
-        }
+        transform.translation.x = 0.0;
+        transform.translation.z = 0.0;
+        transform.translation.y = eye_y;
     }
 }
 

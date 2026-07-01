@@ -1,5 +1,5 @@
 use crate::terrain::OreType;
-use crate::world::{world_to_geo, AUSTRALIA_CENTER_LAT, AUSTRALIA_CENTER_LON};
+use crate::world::{world_to_geo, GardenRng, AUSTRALIA_CENTER_LAT, AUSTRALIA_CENTER_LON};
 
 /// Simplified climate / ecology zones aligned with real Australian regions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +59,13 @@ pub fn is_land(lat: f32, lon: f32) -> bool {
 
 pub fn biome_at_world(world_x: f32, world_z: f32) -> AussieBiome {
     let (lat, lon) = world_to_geo(world_x, world_z);
+    biome_at_geo(lat, lon)
+}
+
+/// Biome purely from geographic coordinates — used both by world generation
+/// (via [`biome_at_world`]) and by the map overlay, which wants the absolute
+/// continent regardless of where this game's origin was placed.
+pub fn biome_at_geo(lat: f32, lon: f32) -> AussieBiome {
     if !is_land(lat, lon) {
         return AussieBiome::Ocean;
     }
@@ -174,6 +181,24 @@ pub fn biome_profile(world_x: f32, world_z: f32) -> BiomeProfile {
         tree_density: density,
         ore_weights: ores,
     }
+}
+
+/// Rejection-sample a random point on the continent. Uniform over the lat/lon
+/// bounding box then filtered to land, so the result is weighted by how much
+/// land each region covers — i.e. the odds of spawning in a given biome track
+/// its real share of the continent. (Future fauna/flora spawns can layer their
+/// own statistical weights on top of the biome we land in.)
+pub fn pick_land_spawn(seed: u64) -> (f32, f32) {
+    let mut rng = GardenRng::new(seed);
+    for _ in 0..4000 {
+        let lon = rng.range(113.0, 153.5);
+        let lat = rng.range(-43.5, -10.5);
+        if is_land(lat, lon) {
+            return (lat, lon);
+        }
+    }
+    // Astronomically unlikely fallback: dead centre (Simpson Desert).
+    (AUSTRALIA_CENTER_LAT, AUSTRALIA_CENTER_LON)
 }
 
 pub fn biome_display_name(biome: AussieBiome) -> &'static str {

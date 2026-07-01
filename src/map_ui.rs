@@ -1,7 +1,32 @@
 use bevy::prelude::*;
 
-use crate::australia::{biome_at_world, biome_display_name, is_land};
+use crate::australia::{biome_at_geo, biome_at_world, biome_display_name, is_land, AussieBiome};
 use crate::world::{geo_to_normalized, world_to_geo};
+
+/// Grid resolution for the little pixel-art continent (chunky = on theme).
+const MAP_COLS: usize = 42;
+const MAP_ROWS: usize = 34;
+
+/// UI colour for each biome on the overlay silhouette.
+fn biome_map_color(biome: AussieBiome) -> Color {
+    match biome {
+        AussieBiome::Ocean => Color::srgb(0.15, 0.45, 0.72),
+        AussieBiome::TropicalSavanna => Color::srgb(0.62, 0.66, 0.28),
+        AussieBiome::AridOutback => Color::srgb(0.78, 0.44, 0.22),
+        AussieBiome::Pilbara => Color::srgb(0.70, 0.34, 0.24),
+        AussieBiome::Mediterranean => Color::srgb(0.56, 0.60, 0.30),
+        AussieBiome::TemperateForest => Color::srgb(0.26, 0.46, 0.26),
+        AussieBiome::CoastalBush => Color::srgb(0.40, 0.56, 0.30),
+        AussieBiome::Tasmania => Color::srgb(0.32, 0.52, 0.42),
+    }
+}
+
+/// Invert [`geo_to_normalized`] so a grid cell maps back to lat/lon.
+fn cell_to_geo(u: f32, v: f32) -> (f32, f32) {
+    let lon = 113.0 + u * 40.5;
+    let lat = -10.0 - v * 34.5;
+    (lat, lon)
+}
 
 #[derive(Resource)]
 pub struct MapOverlay {
@@ -88,17 +113,33 @@ pub fn setup_map_ui(mut commands: Commands, mut overlay: ResMut<MapOverlay>) {
                         BorderColor(Color::srgb(0.30, 0.55, 0.78)),
                     ))
                     .with_children(|map_box| {
-                        map_box.spawn((
-                            Node {
-                                width: Val::Percent(72.0),
-                                height: Val::Percent(78.0),
-                                position_type: PositionType::Absolute,
-                                left: Val::Percent(14.0),
-                                top: Val::Percent(10.0),
-                                ..default()
-                            },
-                            BackgroundColor(Color::srgb(0.62, 0.48, 0.28)),
-                        ));
+                        // Pixel-art continent: one small cell per land sample,
+                        // coloured by biome. Ocean cells are skipped so the blue
+                        // box shows through as the sea.
+                        let cell_w = 100.0 / MAP_COLS as f32;
+                        let cell_h = 100.0 / MAP_ROWS as f32;
+                        for row in 0..MAP_ROWS {
+                            for col in 0..MAP_COLS {
+                                let u = (col as f32 + 0.5) / MAP_COLS as f32;
+                                let v = (row as f32 + 0.5) / MAP_ROWS as f32;
+                                let (lat, lon) = cell_to_geo(u, v);
+                                if !is_land(lat, lon) {
+                                    continue;
+                                }
+                                let biome = biome_at_geo(lat, lon);
+                                map_box.spawn((
+                                    Node {
+                                        width: Val::Percent(cell_w + 0.4),
+                                        height: Val::Percent(cell_h + 0.4),
+                                        position_type: PositionType::Absolute,
+                                        left: Val::Percent(col as f32 * cell_w),
+                                        top: Val::Percent(row as f32 * cell_h),
+                                        ..default()
+                                    },
+                                    BackgroundColor(biome_map_color(biome)),
+                                ));
+                            }
+                        }
 
                         map_box.spawn((
                             MapPlayerDot,

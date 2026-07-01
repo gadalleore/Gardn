@@ -8,3 +8,12 @@ bevy = { version = "0.15", features = ["jpeg", "png"] }
 bevy_flycam = "0.15"
 wgpu = "23"
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Optimize dependencies even in debug builds, and lightly optimize our own
+# crate. Bevy is roughly 10x slower without this — this is the single biggest
+# runtime win for `cargo run` during testing (compile stays fast).
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

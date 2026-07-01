@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use std::sync::OnceLock;
 
 /// World units are feet. Shared 4-inch voxels match tree trunk blocks.
 pub const INCH: f32 = 1.0 / 12.0;
@@ -99,10 +100,32 @@ pub fn chunk_chebyshev_distance(a: IVec2, b: IVec2) -> i32 {
     d.x.abs().max(d.y.abs())
 }
 
+/// Where world-origin sits on the continent. Set once at startup so each new
+/// game begins in a different, randomly chosen biome — without moving the player
+/// to a far-from-origin world coordinate (which would wreck f32 precision).
+static SPAWN_GEO_OFFSET: OnceLock<Vec2> = OnceLock::new();
+
+pub fn set_spawn_geo_offset(offset: Vec2) {
+    let _ = SPAWN_GEO_OFFSET.set(offset);
+}
+
+fn spawn_geo_offset() -> Vec2 {
+    SPAWN_GEO_OFFSET.get().copied().unwrap_or(Vec2::ZERO)
+}
+
 pub fn world_to_geo(world_x: f32, world_z: f32) -> (f32, f32) {
-    let lon = AUSTRALIA_CENTER_LON + (world_x / AUSTRALIA_WIDTH_FT) * 40.0;
-    let lat = AUSTRALIA_CENTER_LAT - (world_z / AUSTRALIA_HEIGHT_FT) * 34.0;
+    let off = spawn_geo_offset();
+    let lon = AUSTRALIA_CENTER_LON + ((world_x + off.x) / AUSTRALIA_WIDTH_FT) * 40.0;
+    let lat = AUSTRALIA_CENTER_LAT - ((world_z + off.y) / AUSTRALIA_HEIGHT_FT) * 34.0;
     (lat, lon)
+}
+
+/// Inverse of the *unshifted* mapping: the world offset that places a given
+/// lat/lon at world origin. Used to seed [`set_spawn_geo_offset`].
+pub fn geo_to_world_offset(lat: f32, lon: f32) -> Vec2 {
+    let x = (lon - AUSTRALIA_CENTER_LON) / 40.0 * AUSTRALIA_WIDTH_FT;
+    let z = (AUSTRALIA_CENTER_LAT - lat) / 34.0 * AUSTRALIA_HEIGHT_FT;
+    Vec2::new(x, z)
 }
 
 pub fn geo_to_normalized(lat: f32, lon: f32) -> Vec2 {
