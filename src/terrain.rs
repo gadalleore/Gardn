@@ -4,8 +4,9 @@ use bevy::render::mesh::{Indices, PrimitiveTopology};
 use std::collections::{HashMap, HashSet};
 
 use crate::australia::{biome_profile, AussieBiome};
+use crate::topography::surface_height_voxels;
 use crate::world::{
-    GardenRng, CHUNK_DEPTH_VOXELS, CHUNK_SIZE, CHUNK_VOXELS, SURFACE_VOXEL_Y, VOXEL_SIZE,
+    GardenRng, CHUNK_DEPTH_VOXELS, CHUNK_SIZE, CHUNK_VOXELS, SEA_LEVEL_VOXEL_Y, VOXEL_SIZE,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -130,7 +131,7 @@ impl ChunkVoxels {
     }
 
     #[inline(always)]
-    fn get(&self, x: i32, y: i32, z: i32) -> Option<BlockType> {
+    pub fn get(&self, x: i32, y: i32, z: i32) -> Option<BlockType> {
         if self.in_bounds(x, y, z) {
             self.cells[self.index(x, y, z)]
         } else {
@@ -138,8 +139,32 @@ impl ChunkVoxels {
         }
     }
 
+    /// Carve one voxel out (burrowing). No-op if already air or out of bounds.
+    pub fn clear_cell(&mut self, x: i32, y: i32, z: i32) {
+        if self.in_bounds(x, y, z) {
+            let i = self.index(x, y, z);
+            if self.cells[i].is_some() {
+                self.cells[i] = None;
+                self.solid_count -= 1;
+            }
+        }
+    }
+
+    /// Lowest voxel layer — kept as unbreakable bedrock so burrows never open
+    /// into the void below the world.
+    pub fn floor_y(&self) -> i32 {
+        self.y_min
+    }
+
     pub fn is_empty(&self) -> bool {
         self.solid_count == 0
+    }
+}
+
+/// Re-carve every recorded bite into freshly generated chunk voxels.
+pub fn apply_edits(voxels: &mut ChunkVoxels, edits: &HashSet<IVec3>) {
+    for e in edits {
+        voxels.clear_cell(e.x, e.y, e.z);
     }
 }
 
@@ -152,24 +177,67 @@ pub fn generate_chunk_blocks(
     let center_world = chunk_origin + Vec3::new(CHUNK_SIZE * 0.5, 0.0, CHUNK_SIZE * 0.5);
     let profile = biome_profile(center_world.x, center_world.z);
 
-    let mut voxels = ChunkVoxels::new(
-        CHUNK_VOXELS,
-        CHUNK_VOXELS,
-        -CHUNK_DEPTH_VOXELS,
-        SURFACE_VOXEL_Y,
-    );
-
     if profile.biome == AussieBiome::Ocean {
+        let mut voxels = ChunkVoxels::new(
+            CHUNK_VOXELS,
+            CHUNK_VOXELS,
+            -CHUNK_DEPTH_VOXELS,
+            SEA_LEVEL_VOXEL_Y,
+        );
         fill_ocean_chunk(&mut voxels, &mut rng);
         return voxels;
     }
 
-    let veins = plan_ore_veins(coord, terrain_seed, &profile, &mut rng);
+    const STRIDE: i32 = 8;
+    // Height lattice is finer than the layer lattice so worm-scale micro-relief
+    // (5 ft wavelengths) survives the interpolation.
+    const HEIGHT_STRIDE: i32 = 4;
+    let cols = CHUNK_VOXELS as usize;
+
+    // Biome topography: sample the height function on a sparse lattice and
+    // bilinearly interpolate per column — smooth slopes at a fraction of the
+    // noise cost.
+    let gcols = (CHUNK_VOXELS / HEIGHT_STRIDE) as usize + 1;
+    let mut height_grid = vec![0f32; gcols * gcols];
+    for gz in 0..gcols {
+        for gx in 0..gcols {
+            let wx = chunk_origin.x + (gx as i32 * HEIGHT_STRIDE) as f32 * VOXEL_SIZE;
+            let wz = chunk_origin.z + (gz as i32 * HEIGHT_STRIDE) as f32 * VOXEL_SIZE;
+            height_grid[gz * gcols + gx] = surface_height_voxels(wx, wz) as f32;
+        }
+    }
+
+    let mut heights = vec![0i32; cols * cols];
+    let mut min_h = i32::MAX;
+    let mut max_h = i32::MIN;
+    for lz in 0..CHUNK_VOXELS {
+        for lx in 0..CHUNK_VOXELS {
+            let gx = (lx / HEIGHT_STRIDE) as usize;
+            let gz = (lz / HEIGHT_STRIDE) as usize;
+            let tx = (lx % HEIGHT_STRIDE) as f32 / HEIGHT_STRIDE as f32;
+            let tz = (lz % HEIGHT_STRIDE) as f32 / HEIGHT_STRIDE as f32;
+            let a = height_grid[gz * gcols + gx];
+            let b = height_grid[gz * gcols + gx + 1];
+            let c = height_grid[(gz + 1) * gcols + gx];
+            let d = height_grid[(gz + 1) * gcols + gx + 1];
+            let h = (a + (b - a) * tx + (c - a) * tz + (a - b - c + d) * tx * tz).round() as i32;
+            heights[lz as usize * cols + lx as usize] = h;
+            min_h = min_h.min(h);
+            max_h = max_h.max(h);
+        }
+    }
+
+    let mut voxels = ChunkVoxels::new(
+        CHUNK_VOXELS,
+        CHUNK_VOXELS,
+        min_h - CHUNK_DEPTH_VOXELS,
+        max_h,
+    );
+
+    let veins = plan_ore_veins(coord, terrain_seed, &profile, &mut rng, min_h);
 
     // Per-column surface layers, sampled every 8 voxels into a flat array
     // (was a 36k-entry HashMap). Smooth enough, 64× cheaper than per-voxel.
-    const STRIDE: i32 = 8;
-    let cols = CHUNK_VOXELS as usize;
     let mut columns: Vec<ColumnLayers> =
         vec![column_layers(&mut rng, &profile); cols * cols];
     for lz in (0..CHUNK_VOXELS).step_by(STRIDE as usize) {
@@ -188,22 +256,26 @@ pub fn generate_chunk_blocks(
         }
     }
 
+    // Each column's soil stack rides its own surface height. Filled solid down
+    // to the chunk-wide stone floor so even the steepest worm-mountain walls
+    // never expose a hollow core (interior faces are culled away, so the mesh
+    // stays the same size).
+    let chunk_floor = min_h - CHUNK_DEPTH_VOXELS;
     for lz in 0..CHUNK_VOXELS {
         for lx in 0..CHUNK_VOXELS {
+            let h = heights[lz as usize * cols + lx as usize];
             let layers = columns[lz as usize * cols + lx as usize];
-            let column_bottom = SURFACE_VOXEL_Y - layers.dirt_depth - layers.soft_depth;
+            let soft_bottom = h - layers.dirt_depth - layers.soft_depth;
 
-            for y in -CHUNK_DEPTH_VOXELS..=SURFACE_VOXEL_Y {
-                let block = if y == SURFACE_VOXEL_Y {
+            for y in chunk_floor..=h {
+                let block = if y == h {
                     layers.surface
-                } else if y > SURFACE_VOXEL_Y - layers.dirt_depth {
+                } else if y > h - layers.dirt_depth {
                     layers.subsurface
-                } else if y > column_bottom {
+                } else if y > soft_bottom {
                     layers.soft_rock
-                } else if y == -CHUNK_DEPTH_VOXELS {
-                    BlockType::Stone
                 } else {
-                    continue;
+                    BlockType::Stone
                 };
                 voxels.set(lx, y, lz, block);
             }
@@ -263,7 +335,7 @@ fn column_layers(rng: &mut GardenRng, profile: &crate::australia::BiomeProfile) 
 fn fill_ocean_chunk(voxels: &mut ChunkVoxels, rng: &mut GardenRng) {
     for lz in 0..CHUNK_VOXELS {
         for lx in 0..CHUNK_VOXELS {
-            for y in -CHUNK_DEPTH_VOXELS..=SURFACE_VOXEL_Y {
+            for y in -CHUNK_DEPTH_VOXELS..=SEA_LEVEL_VOXEL_Y {
                 let block = if y >= -2 {
                     BlockType::Water
                 } else if y > -6 {
@@ -287,9 +359,15 @@ fn plan_ore_veins(
     terrain_seed: u64,
     profile: &crate::australia::BiomeProfile,
     rng: &mut GardenRng,
+    min_surface_h: i32,
 ) -> Vec<OreVein> {
     let mut veins = Vec::new();
     let total_weight: f32 = profile.ore_weights.iter().map(|(_, w)| w).sum();
+
+    // Keep veins in the rock band below the lowest surface in the chunk so they
+    // stay underground even where the terrain dips.
+    let vein_floor = min_surface_h - CHUNK_DEPTH_VOXELS + 4;
+    let vein_ceiling = (min_surface_h - 2).max(vein_floor);
 
     for (ore, weight) in profile.ore_weights {
         let share = weight / total_weight;
@@ -303,13 +381,13 @@ fn plan_ore_veins(
                 ore,
                 center: IVec3::new(
                     vr.range_i(4, CHUNK_VOXELS - 4),
-                    vr.range_i(-CHUNK_DEPTH_VOXELS + 4, -2),
+                    vr.range_i(vein_floor, vein_ceiling),
                     vr.range_i(4, CHUNK_VOXELS - 4),
                 ),
                 radius: IVec3::new(
-                    vr.range_i(2, 6),
-                    vr.range_i(2, 4),
-                    vr.range_i(2, 6),
+                    vr.range_i(4, 12),
+                    vr.range_i(4, 8),
+                    vr.range_i(4, 12),
                 ),
                 strength: vr.range(0.55, 0.92),
             });
@@ -402,121 +480,151 @@ fn block_color(block: BlockType) -> [f32; 4] {
     [rgb[0], rgb[1], rgb[2], 1.0]
 }
 
-/// One combined mesh per chunk. Iterates the dense grid and emits only faces
-/// whose neighbour is air or out-of-bounds — O(1) neighbour checks, no hashing.
+/// Face table shared by both meshers: (neighbour offset, normal, unit corners,
+/// merge axis). Corners are voxel-unit offsets; when a run of `len` faces is
+/// merged into one quad, the corner component on the merge axis is scaled by
+/// `len`. Top/bottom faces merge along x; side faces merge along y (long
+/// vertical strips on trunk and cliff walls).
+const FACE_DIRS: [(IVec3, [f32; 3], [[i32; 3]; 4], usize); 6] = [
+    (
+        IVec3::X,
+        [1.0, 0.0, 0.0],
+        [[1, 0, 0], [1, 1, 0], [1, 1, 1], [1, 0, 1]],
+        1,
+    ),
+    (
+        IVec3::NEG_X,
+        [-1.0, 0.0, 0.0],
+        [[0, 0, 1], [0, 1, 1], [0, 1, 0], [0, 0, 0]],
+        1,
+    ),
+    (
+        IVec3::Y,
+        [0.0, 1.0, 0.0],
+        [[0, 1, 1], [1, 1, 1], [1, 1, 0], [0, 1, 0]],
+        0,
+    ),
+    (
+        IVec3::NEG_Y,
+        [0.0, -1.0, 0.0],
+        [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
+        0,
+    ),
+    (
+        IVec3::Z,
+        [0.0, 0.0, 1.0],
+        [[1, 0, 1], [1, 1, 1], [0, 1, 1], [0, 0, 1]],
+        1,
+    ),
+    (
+        IVec3::NEG_Z,
+        [0.0, 0.0, -1.0],
+        [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
+        1,
+    ),
+];
+
+fn push_merged_quad(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    indices: &mut Vec<u32>,
+    normal: [f32; 3],
+    corners: [[i32; 3]; 4],
+    base: [i32; 3],
+    len: i32,
+    merge_axis: usize,
+    cell_size: f32,
+) {
+    let idx0 = positions.len() as u32;
+    for corner in corners {
+        let mut p = [0f32; 3];
+        for k in 0..3 {
+            let c = if k == merge_axis { corner[k] * len } else { corner[k] };
+            p[k] = (base[k] + c) as f32 * cell_size;
+        }
+        positions.push(p);
+        normals.push(normal);
+    }
+    indices.extend_from_slice(&[idx0, idx0 + 1, idx0 + 2, idx0, idx0 + 2, idx0 + 3]);
+}
+
+/// One combined mesh per chunk. Visible faces (neighbour is air/out-of-bounds)
+/// are merged into strips along one axis — at 2-inch voxels this collapses flat
+/// ground into long quads and keeps vertex counts sane.
 pub fn build_colored_terrain_mesh(voxels: &ChunkVoxels) -> Mesh {
-    // Upper bound: each solid cell contributes at most ~3 visible faces.
-    let face_estimate = voxels.solid_count * 3;
-    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(face_estimate * 4);
-    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(face_estimate * 4);
-    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(face_estimate * 4);
-    let mut indices: Vec<u32> = Vec::with_capacity(face_estimate * 6);
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut colors: Vec<[f32; 4]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
 
-    let faces: [(IVec3, [f32; 3], [[f32; 3]; 4]); 6] = [
-        (
-            IVec3::X,
-            [1.0, 0.0, 0.0],
-            [
-                [1.0, 0.0, 0.0],
-                [1.0, 1.0, 0.0],
-                [1.0, 1.0, 1.0],
-                [1.0, 0.0, 1.0],
-            ],
-        ),
-        (
-            IVec3::NEG_X,
-            [-1.0, 0.0, 0.0],
-            [
-                [0.0, 0.0, 1.0],
-                [0.0, 1.0, 1.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0],
-            ],
-        ),
-        (
-            IVec3::Y,
-            [0.0, 1.0, 0.0],
-            [
-                [0.0, 1.0, 1.0],
-                [1.0, 1.0, 1.0],
-                [1.0, 1.0, 0.0],
-                [0.0, 1.0, 0.0],
-            ],
-        ),
-        (
-            IVec3::NEG_Y,
-            [0.0, -1.0, 0.0],
-            [
-                [0.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0],
-                [1.0, 0.0, 1.0],
-                [0.0, 0.0, 1.0],
-            ],
-        ),
-        (
-            IVec3::Z,
-            [0.0, 0.0, 1.0],
-            [
-                [1.0, 0.0, 1.0],
-                [1.0, 1.0, 1.0],
-                [0.0, 1.0, 1.0],
-                [0.0, 0.0, 1.0],
-            ],
-        ),
-        (
-            IVec3::NEG_Z,
-            [0.0, 0.0, -1.0],
-            [
-                [0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [1.0, 1.0, 0.0],
-                [1.0, 0.0, 0.0],
-            ],
-        ),
+    let lens = [
+        voxels.size_x,
+        voxels.y_max - voxels.y_min + 1,
+        voxels.size_z,
     ];
+    let offs = [0, voxels.y_min, 0];
 
-    for y in voxels.y_min..=voxels.y_max {
-        for z in 0..voxels.size_z {
-            for x in 0..voxels.size_x {
-                let Some(block) = voxels.get(x, y, z) else {
-                    continue;
-                };
-                let color = block_color(block);
-                let origin = Vec3::new(
-                    x as f32 * VOXEL_SIZE,
-                    y as f32 * VOXEL_SIZE,
-                    z as f32 * VOXEL_SIZE,
-                );
+    for (neighbor, normal, corners, merge_axis) in FACE_DIRS {
+        let (o1_axis, o2_axis) = match merge_axis {
+            0 => (1, 2),
+            1 => (0, 2),
+            _ => (0, 1),
+        };
 
-                for (neighbor, normal, corners) in &faces {
-                    if voxels
-                        .get(x + neighbor.x, y + neighbor.y, z + neighbor.z)
-                        .is_some()
-                    {
+        let face_of = |cell: [i32; 3]| -> Option<BlockType> {
+            let b = voxels.get(cell[0], cell[1], cell[2])?;
+            if voxels
+                .get(
+                    cell[0] + neighbor.x,
+                    cell[1] + neighbor.y,
+                    cell[2] + neighbor.z,
+                )
+                .is_some()
+            {
+                None
+            } else {
+                Some(b)
+            }
+        };
+
+        for i in 0..lens[o1_axis] {
+            for j in 0..lens[o2_axis] {
+                let mut w = 0;
+                while w < lens[merge_axis] {
+                    let mut cell = [0i32; 3];
+                    cell[o1_axis] = i + offs[o1_axis];
+                    cell[o2_axis] = j + offs[o2_axis];
+                    cell[merge_axis] = w + offs[merge_axis];
+
+                    let Some(block) = face_of(cell) else {
+                        w += 1;
                         continue;
+                    };
+
+                    let mut len = 1;
+                    while w + len < lens[merge_axis] {
+                        let mut next = cell;
+                        next[merge_axis] = w + len + offs[merge_axis];
+                        match face_of(next) {
+                            Some(b) if b == block => len += 1,
+                            _ => break,
+                        }
                     }
 
-                    let base = positions.len() as u32;
-                    for corner in corners {
-                        let pos = origin
-                            + Vec3::new(
-                                corner[0] * VOXEL_SIZE,
-                                corner[1] * VOXEL_SIZE,
-                                corner[2] * VOXEL_SIZE,
-                            );
-                        positions.push(pos.to_array());
-                        normals.push(*normal);
-                        colors.push(color);
-                    }
+                    push_merged_quad(
+                        &mut positions,
+                        &mut normals,
+                        &mut indices,
+                        normal,
+                        corners,
+                        cell,
+                        len,
+                        merge_axis,
+                        VOXEL_SIZE,
+                    );
+                    colors.extend([block_color(block); 4]);
 
-                    indices.extend_from_slice(&[
-                        base,
-                        base + 1,
-                        base + 2,
-                        base,
-                        base + 2,
-                        base + 3,
-                    ]);
+                    w += len;
                 }
             }
         }
@@ -530,112 +638,68 @@ pub fn build_colored_terrain_mesh(voxels: &ChunkVoxels) -> Mesh {
     mesh
 }
 
-/// Used by voxel trees (material color comes from StandardMaterial, not vertex colors).
+/// Used by voxel trees (material colour comes from StandardMaterial, so no
+/// vertex colours or UVs). Same strip merging as the terrain mesher — trunk
+/// walls collapse into long vertical quads.
 pub fn build_culled_voxel_mesh(blocks: &HashSet<IVec3>, block_size: f32) -> Mesh {
-    let face_estimate = blocks.len() * 3;
-    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(face_estimate * 4);
-    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(face_estimate * 4);
-    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(face_estimate * 4);
-    let mut indices: Vec<u32> = Vec::with_capacity(face_estimate * 6);
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
 
-    let faces: [(IVec3, [f32; 3], [[f32; 3]; 4]); 6] = [
-        (
-            IVec3::X,
-            [1.0, 0.0, 0.0],
-            [
-                [1.0, 0.0, 0.0],
-                [1.0, 1.0, 0.0],
-                [1.0, 1.0, 1.0],
-                [1.0, 0.0, 1.0],
-            ],
-        ),
-        (
-            IVec3::NEG_X,
-            [-1.0, 0.0, 0.0],
-            [
-                [0.0, 0.0, 1.0],
-                [0.0, 1.0, 1.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0],
-            ],
-        ),
-        (
-            IVec3::Y,
-            [0.0, 1.0, 0.0],
-            [
-                [0.0, 1.0, 1.0],
-                [1.0, 1.0, 1.0],
-                [1.0, 1.0, 0.0],
-                [0.0, 1.0, 0.0],
-            ],
-        ),
-        (
-            IVec3::NEG_Y,
-            [0.0, -1.0, 0.0],
-            [
-                [0.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0],
-                [1.0, 0.0, 1.0],
-                [0.0, 0.0, 1.0],
-            ],
-        ),
-        (
-            IVec3::Z,
-            [0.0, 0.0, 1.0],
-            [
-                [1.0, 0.0, 1.0],
-                [1.0, 1.0, 1.0],
-                [0.0, 1.0, 1.0],
-                [0.0, 0.0, 1.0],
-            ],
-        ),
-        (
-            IVec3::NEG_Z,
-            [0.0, 0.0, -1.0],
-            [
-                [0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [1.0, 1.0, 0.0],
-                [1.0, 0.0, 0.0],
-            ],
-        ),
-    ];
+    for (neighbor, normal, corners, merge_axis) in FACE_DIRS {
+        let mut faces: Vec<IVec3> = blocks
+            .iter()
+            .copied()
+            .filter(|b| !blocks.contains(&(*b + neighbor)))
+            .collect();
 
-    for block in blocks {
-        let origin = Vec3::new(
-            block.x as f32 * block_size,
-            block.y as f32 * block_size,
-            block.z as f32 * block_size,
-        );
+        // Sort so cells that can merge (same coords on the other two axes,
+        // consecutive on the merge axis) end up adjacent.
+        faces.sort_unstable_by_key(|p| match merge_axis {
+            0 => (p.y, p.z, p.x),
+            1 => (p.x, p.z, p.y),
+            _ => (p.x, p.y, p.z),
+        });
+        let step = match merge_axis {
+            0 => IVec3::X,
+            1 => IVec3::Y,
+            _ => IVec3::Z,
+        };
 
-        for (neighbor, normal, corners) in &faces {
-            if blocks.contains(&(*block + *neighbor)) {
-                continue;
+        let mut i = 0;
+        while i < faces.len() {
+            let start = faces[i];
+            let mut len = 1i32;
+            while i + (len as usize) < faces.len() && faces[i + len as usize] == start + step * len {
+                len += 1;
             }
 
-            let base = positions.len() as u32;
-            for corner in corners {
-                let pos = origin + Vec3::new(
-                    corner[0] * block_size,
-                    corner[1] * block_size,
-                    corner[2] * block_size,
-                );
-                positions.push(pos.to_array());
-                normals.push(*normal);
-                uvs.push([corner[0], corner[1]]);
-            }
+            push_merged_quad(
+                &mut positions,
+                &mut normals,
+                &mut indices,
+                normal,
+                corners,
+                [start.x, start.y, start.z],
+                len,
+                merge_axis,
+                block_size,
+            );
 
-            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            i += len as usize;
         }
     }
 
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_indices(Indices::U32(indices));
     mesh
 }
+
+/// Marks a chunk's terrain mesh child — burrowing despawns and rebuilds it.
+#[derive(Component)]
+pub struct TerrainSurface;
 
 pub fn spawn_terrain_meshes(
     commands: &mut Commands,
@@ -654,6 +718,7 @@ pub fn spawn_terrain_meshes(
             Mesh3d(mesh),
             MeshMaterial3d(materials.vertex_color_terrain.clone()),
             Transform::IDENTITY,
+            TerrainSurface,
         ));
     });
 }

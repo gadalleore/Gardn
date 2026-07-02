@@ -1,45 +1,52 @@
 mod australia;
 mod chunk_store;
 mod map_ui;
+mod silhouettes;
 mod terrain;
+mod topography;
+mod trees;
 mod world;
 
 use bevy::prelude::*;
 use bevy::asset::RenderAssetUsages;
+use bevy::pbr::{CascadeShadowConfigBuilder, DistanceFog, FogFalloff};
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::RenderPlugin;
 use bevy::render::settings::{RenderCreation, WgpuSettings};
 use bevy::render::texture::ImagePlugin;
+use bevy::tasks::futures_lite::future;
+use bevy::tasks::{block_on, AsyncComputeTaskPool, Task};
 use bevy_flycam::prelude::*;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use australia::{biome_at_world, biome_display_name, pick_land_spawn};
+use australia::{biome_at_world, biome_display_name, biome_profile, pick_coastal_spawn, AussieBiome};
 use chunk_store::{
-    archive_chunk, take_saved_chunk, ChunkArchive, ChunkRecord, ChunkTreeJob, SavedTreeSpecies,
+    archive_chunk, take_saved_chunk, ChunkArchive, ChunkRecord, ChunkTreeJob,
 };
 use map_ui::{setup_map_ui, toggle_map_ui, update_map_ui, MapOverlay};
-use terrain::{
-    build_culled_voxel_mesh, generate_chunk_blocks, spawn_terrain_meshes, TerrainMaterials,
+use silhouettes::{
+    billboard_silhouettes, plan_tree_silhouettes, process_silhouette_queue,
+    setup_silhouette_assets, SilhouetteWorld,
 };
+use terrain::{
+    apply_edits, build_culled_voxel_mesh, generate_chunk_blocks, spawn_terrain_meshes, BlockType,
+    ChunkVoxels, TerrainMaterials, TerrainSurface,
+};
+use topography::surface_top_world_y;
+use trees::{generate_tree, TreeSpecies, VoxelTreeData};
 use world::*;
-
-/// ~2 ft trunk diameter — enormous next to a 3-inch worm.
-const TRUNK_RADIUS_INCHES: i32 = 12;
-const TRUNK_RADIUS_VOXELS: i32 = TRUNK_RADIUS_INCHES / VOXEL_INCHES;
-const FOLIAGE_BLOB_INCHES: i32 = 8;
-const FOLIAGE_BLOB_VOXELS: i32 = FOLIAGE_BLOB_INCHES / VOXEL_INCHES;
-const FOLIAGE_BLOB_WORLD_SIZE: f32 = FOLIAGE_BLOB_VOXELS as f32 * VOXEL_SIZE;
-const MAX_BRANCH_DROOP_RATIO: f32 = 0.7;
 
 #[derive(Component)]
 struct Leaf;
 
+/// Any procedurally generated native tree; species recorded for future
+/// fauna/food interactions.
 #[derive(Component)]
-struct EucalyptusTree;
-
-#[derive(Component)]
-struct AcaciaTree;
+struct WildTree {
+    #[allow(dead_code)]
+    species: TreeSpecies,
+}
 
 #[derive(Component)]
 struct FloatingLeaf {
@@ -69,9 +76,50 @@ struct ChunkWorld {
 #[derive(Resource, Default)]
 struct TreeSpawnQueue(VecDeque<ChunkTreeJob>);
 
+/// Shared handles for the extruded-PNG leaf so every chunk can scatter copies.
 #[derive(Resource)]
-struct TreeSpawnBudget {
-    timer: Timer,
+struct LeafAssets {
+    mesh: Handle<Mesh>,
+    material: Handle<StandardMaterial>,
+}
+
+#[derive(Resource)]
+struct GameSounds {
+    munch: Handle<AudioSource>,
+}
+
+/// Everything the render world needs for one finished tree, produced on a
+/// background compute thread so 650-ft giants never hitch the frame.
+struct BuiltTree {
+    bark_mesh: Mesh,
+    foliage_mesh: Mesh,
+    bark_color: Color,
+    foliage_color: Color,
+}
+
+/// An in-flight background tree build; resolved by [`finish_tree_build_tasks`].
+#[derive(Component)]
+struct PendingTree {
+    task: Task<BuiltTree>,
+    chunk_entity: Entity,
+    local_base: Vec3,
+    species: TreeSpecies,
+}
+
+/// A completed bite: which voxel came out of which chunk, plus the freshly
+/// rebuilt terrain mesh, all computed off the main thread.
+struct BurrowResult {
+    coord: IVec2,
+    local: IVec3,
+    block: BlockType,
+    mesh: Mesh,
+}
+
+/// An in-flight burrow (probe + carve + remesh) on the async pool. Only one at
+/// a time — a second `E` while chewing is ignored.
+#[derive(Component)]
+struct PendingBurrow {
+    task: Task<Option<BurrowResult>>,
 }
 
 fn main() {
@@ -105,26 +153,42 @@ fn main() {
         .init_resource::<ChunkWorld>()
         .init_resource::<ChunkArchive>()
         .init_resource::<TreeSpawnQueue>()
+        .init_resource::<SilhouetteWorld>()
         .init_resource::<MapOverlay>()
         .add_systems(
             Startup,
             (
                 choose_spawn_location,
                 setup_garden,
-                init_tree_spawn_budget,
+                setup_silhouette_assets,
                 setup_map_ui,
+            )
+                .chain(),
+        )
+        // The world-structure systems are chained: each one then sees the
+        // previous one's spawns/despawns actually applied. Unordered, a chunk
+        // unload could race an eat/tree-finish touching entities in that chunk
+        // and double-despawn them (Bevy's B0003 warning).
+        .add_systems(
+            Update,
+            (
+                plan_chunk_streaming,
+                process_chunk_load_queue,
+                start_tree_build_tasks,
+                finish_tree_build_tasks,
+                plan_tree_silhouettes,
+                process_silhouette_queue,
+                eat_leaves,
+                finish_burrow_tasks,
             )
                 .chain(),
         )
         .add_systems(
             Update,
             (
-                plan_chunk_streaming,
-                process_chunk_load_queue,
-                process_tree_spawn_queue,
+                billboard_silhouettes,
                 toggle_map_ui,
                 update_map_ui,
-                eat_leaves,
                 animate_floating_leaves,
             ),
         )
@@ -145,15 +209,41 @@ fn setup_garden(
     // (coffee-coaster scale). The mesh itself is the leaf silhouette; spins/bobs
     // use the same logic as before so placements still look good.
     // (Press E when close to one to eat)
-    spawn_textured_leaves(&mut commands, &mut meshes, &mut materials, &asset_server);
+    let leaf_texture = asset_server.load("leaf.png");
+    let leaf_assets = LeafAssets {
+        material: materials.add(StandardMaterial {
+            base_color_texture: Some(leaf_texture),
+            // The mesh geometry *is* the leaf outline now — no need for alpha
+            // cutout. Opaque is cleanest + cheapest.
+            alpha_mode: AlphaMode::Opaque,
+            double_sided: true,
+            ..default()
+        }),
+        mesh: create_extruded_leaf_mesh(&mut meshes),
+    };
+    spawn_textured_leaves(&mut commands, &leaf_assets);
+    commands.insert_resource(leaf_assets);
 
-    // Sun light
+    commands.insert_resource(GameSounds {
+        munch: asset_server.load("sounds/munch.wav"),
+    });
+
+    // Sun light — shadows on, so open canopies throw dappled light shafts onto
+    // the forest floor. Tight first cascade keeps shadow detail crisp at worm
+    // eye level; the far cascades cover the giants overhead.
     commands.spawn((
         DirectionalLight {
             illuminance: 11_000.0,
-            shadows_enabled: false,
+            shadows_enabled: true,
             ..default()
         },
+        CascadeShadowConfigBuilder {
+            num_cascades: 4,
+            first_cascade_far_bound: 12.0,
+            maximum_distance: 350.0,
+            ..default()
+        }
+        .build(),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.9, 0.7, 0.0)),
     ));
 
@@ -161,11 +251,17 @@ fn setup_garden(
         color: Color::srgb(0.82, 0.88, 0.95),
         brightness: 70.0,
     });
+
+    // Background music, looping for the whole session.
+    commands.spawn((
+        AudioPlayer::new(asset_server.load("music/gardnr.mp3")),
+        PlaybackSettings::LOOP,
+    ));
 }
 
-/// Pick a fresh random spot on the continent for this launch and pin it to world
-/// origin, so every new game drops the worm into a different (area-weighted)
-/// Australian biome. Must run before any terrain/biome sampling.
+/// Pick a fresh spot on a green stretch of coastline for this launch and pin it
+/// to world origin — every new game starts on a different beach with the ocean
+/// in view. Must run before any terrain/biome sampling.
 fn choose_spawn_location() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -173,480 +269,139 @@ fn choose_spawn_location() {
         .unwrap_or(0);
     let seed = nanos ^ WORLD_SEED ^ 0x5DEE_CE66_A55A_1234;
 
-    let (lat, lon) = pick_land_spawn(seed);
+    let (lat, lon) = pick_coastal_spawn(seed);
     set_spawn_geo_offset(geo_to_world_offset(lat, lon));
 
     // Now that the offset is set, world origin reports the spawn biome.
     let biome = biome_at_world(0.0, 0.0);
     println!(
-        "🌏 New game — the little worm wakes up in {} ({:.2}°S {:.2}°E).",
+        "🌏 New game — the little worm washes up on the {} coast ({:.2}°S {:.2}°E).",
         biome_display_name(biome),
         -lat,
         lon
     );
 }
 
-fn init_tree_spawn_budget(mut commands: Commands) {
-    commands.insert_resource(TreeSpawnBudget {
-        timer: Timer::from_seconds(TREE_SPAWN_INTERVAL_SECS, TimerMode::Repeating),
-    });
-}
-
-struct VoxelTreeData {
-    bark: HashSet<IVec3>,
-    foliage: HashSet<IVec3>,
-}
-
-fn trunk_centroid_at_y(trunk: &HashSet<IVec3>, y: i32) -> IVec3 {
-    let mut count = 0i32;
-    let mut cx = 0i32;
-    let mut cz = 0i32;
-    for p in trunk.iter().filter(|p| p.y == y) {
-        cx += p.x;
-        cz += p.z;
-        count += 1;
-    }
-    if count == 0 {
-        return IVec3::ZERO;
-    }
-    IVec3::new(cx / count, y, cz / count)
-}
-
-/// Tall, mostly straight trunk — bare for the lower ~60% like real eucalyptus.
-fn generate_eucalyptus_trunk(rng: &mut GardenRng) -> HashSet<IVec3> {
-    let height_feet = rng.range_i(50, 80);
-    let height_voxels = height_feet * VOXELS_PER_FOOT;
-    let radius = TRUNK_RADIUS_VOXELS;
-    let radius_sq = radius * radius;
-
-    let mut center_x = 0i32;
-    let mut center_z = 0i32;
-    let mut trunk = HashSet::new();
-
-    for y in 0..height_voxels {
-        if y > 0 {
-            if rng.chance(0.05) {
-                center_x += rng.choice_i(&[-1, 0, 1]);
-            }
-            if rng.chance(0.05) {
-                center_z += rng.choice_i(&[-1, 0, 1]);
-            }
-            center_x = center_x.clamp(-2, 2);
-            center_z = center_z.clamp(-2, 2);
-        }
-
-        for dx in -radius..=radius {
-            for dz in -radius..=radius {
-                if dx * dx + dz * dz <= radius_sq {
-                    trunk.insert(IVec3::new(center_x + dx, y, center_z + dz));
-                }
-            }
-        }
-    }
-
-    trunk
-}
-
-/// Upward-biased branch direction with limited droop below horizontal.
-fn sample_branch_direction(rng: &mut GardenRng, outward: Vec3) -> Vec3 {
-    let azimuth = rng.range(0.0, std::f32::consts::TAU);
-    let elev_deg = if rng.chance(0.85) {
-        rng.range(12.0, 72.0)
-    } else {
-        rng.range(-28.0, 18.0)
-    };
-    let elev = elev_deg.to_radians();
-
-    let mut dir = Vec3::new(
-        elev.cos() * azimuth.cos(),
-        elev.sin(),
-        elev.cos() * azimuth.sin(),
-    );
-
-    if dir.y < 0.0 {
-        let horizontal = Vec2::new(dir.x, dir.z).length().max(0.05);
-        if dir.y.abs() > MAX_BRANCH_DROOP_RATIO * horizontal {
-            dir.y = -MAX_BRANCH_DROOP_RATIO * horizontal;
-        }
-    }
-
-    if outward.length_squared() > 0.01 {
-        dir = (dir + outward * rng.range(0.25, 0.55)).normalize();
-    } else {
-        dir = dir.normalize();
-    }
-
-    dir
-}
-
-fn rasterize_branch(start: IVec3, dir: Vec3, length_voxels: i32) -> Vec<IVec3> {
-    let mut blocks = Vec::with_capacity(length_voxels as usize);
-    let mut pos = Vec3::new(
-        start.x as f32 + 0.5,
-        start.y as f32 + 0.5,
-        start.z as f32 + 0.5,
-    );
-    let step = dir.normalize() * 0.55;
-    let mut prev = start;
-    blocks.push(start);
-
-    for _ in 0..length_voxels {
-        pos += step;
-        let grid = IVec3::new(
-            pos.x.floor() as i32,
-            pos.y.floor() as i32,
-            pos.z.floor() as i32,
-        );
-        if grid != prev {
-            blocks.push(grid);
-            prev = grid;
-        }
-    }
-
-    blocks
-}
-
-fn voxel_to_blob_coord(voxel: IVec3) -> IVec3 {
-    IVec3::new(
-        voxel.x.div_euclid(FOLIAGE_BLOB_VOXELS),
-        voxel.y.div_euclid(FOLIAGE_BLOB_VOXELS),
-        voxel.z.div_euclid(FOLIAGE_BLOB_VOXELS),
-    )
-}
-
-/// Pom-pom leaf cloud at a branch tip — large, rounded, slightly irregular.
-fn generate_branch_tip_foliage(rng: &mut GardenRng, tip: IVec3) -> HashSet<IVec3> {
-    let center = voxel_to_blob_coord(tip)
-        + IVec3::new(
-            rng.range_i(-1, 1),
-            rng.range_i(0, 2),
-            rng.range_i(-1, 1),
-        );
-
-    let mut blobs = HashSet::new();
-    let radius_x = rng.range(3.2, 5.8);
-    let radius_y = rng.range(2.4, 4.2);
-    let radius_z = rng.range(3.2, 5.8);
-    let puffiness = rng.range(0.68, 0.92);
-
-    for dx in -7..=7 {
-        for dy in -2..=7 {
-            for dz in -7..=7 {
-                let p = center + IVec3::new(dx, dy, dz);
-                let nx = dx as f32 / radius_x;
-                let ny = dy as f32 / radius_y;
-                let nz = dz as f32 / radius_z;
-                let dist_sq = nx * nx + ny * ny + nz * nz;
-                if dist_sq > 1.0 {
-                    continue;
-                }
-
-                let edge_softness = 1.0 - dist_sq;
-                if rng.chance(edge_softness * puffiness) {
-                    blobs.insert(p);
-                }
-            }
-        }
-    }
-
-    blobs
-}
-
-/// Semi-random upward branches from the upper trunk; leaves only at tips.
-fn generate_eucalyptus_branches(
-    rng: &mut GardenRng,
-    trunk: &HashSet<IVec3>,
-) -> (HashSet<IVec3>, HashSet<IVec3>) {
-    let min_y = trunk.iter().map(|p| p.y).min().unwrap_or(0);
-    let max_y = trunk.iter().map(|p| p.y).max().unwrap_or(0);
-    let trunk_height = max_y - min_y;
-    let branch_zone_start = min_y + (trunk_height as f32 * 0.58) as i32;
-
-    let mut branches = HashSet::new();
-    let mut foliage = HashSet::new();
-    let branch_count = rng.range_i(5, 9);
-
-    for _ in 0..branch_count {
-        let attach_y = rng.range_i(branch_zone_start, max_y.saturating_sub(2));
-        let ring: Vec<IVec3> = trunk
-            .iter()
-            .copied()
-            .filter(|p| p.y == attach_y)
-            .collect();
-        if ring.is_empty() {
-            continue;
-        }
-
-        let start = ring[(rng.next_f32() * ring.len() as f32).floor() as usize];
-        let center = trunk_centroid_at_y(trunk, attach_y);
-        let outward = Vec3::new(
-            (start.x - center.x) as f32,
-            0.0,
-            (start.z - center.z) as f32,
-        )
-        .normalize_or_zero();
-
-        let dir = sample_branch_direction(rng, outward);
-        let length_voxels = rng.range_i(28, 96) / VOXEL_INCHES;
-        let path = rasterize_branch(start, dir, length_voxels);
-
-        let mut tip = None;
-        for block in path {
-            if !trunk.contains(&block) {
-                branches.insert(block);
-                tip = Some(block);
-            }
-        }
-
-        if let Some(tip_pos) = tip {
-            for blob in generate_branch_tip_foliage(rng, tip_pos) {
-                foliage.insert(blob);
-            }
-        }
-    }
-
-    (branches, foliage)
-}
-
-fn generate_eucalyptus_tree(rng: &mut GardenRng) -> VoxelTreeData {
-    let trunk = generate_eucalyptus_trunk(rng);
-    let (branches, foliage) = generate_eucalyptus_branches(rng, &trunk);
-    let mut bark = trunk;
-    bark.extend(branches);
-    VoxelTreeData { bark, foliage }
-}
-
-/// Spreading, multi-stemmed trunk — bushier and more gnarled than eucalyptus.
-fn generate_acacia_trunk(rng: &mut GardenRng) -> HashSet<IVec3> {
-    let height_feet = rng.range_i(40, 70);
-    let height_voxels = height_feet * VOXELS_PER_FOOT;
-    let radius = TRUNK_RADIUS_VOXELS;
-
-    let mut center_x = 0i32;
-    let mut center_z = 0i32;
-    let mut trunk = HashSet::new();
-
-    for y in 0..height_voxels {
-        if y > 0 {
-            if rng.chance(0.12) {
-                center_x += rng.choice_i(&[-1, 0, 1]);
-            }
-            if rng.chance(0.12) {
-                center_z += rng.choice_i(&[-1, 0, 1]);
-            }
-            center_x = center_x.clamp(-4, 4);
-            center_z = center_z.clamp(-4, 4);
-        }
-
-        let taper = if y > height_voxels * 3 / 4 {
-            let t = (y - height_voxels * 3 / 4) as f32 / (height_voxels / 4).max(1) as f32;
-            (radius as f32 * (1.0 - t * 0.45)).max(1.0) as i32
-        } else {
-            radius
-        };
-        let taper_sq = taper * taper;
-
-        for dx in -taper..=taper {
-            for dz in -taper..=taper {
-                if dx * dx + dz * dz <= taper_sq {
-                    trunk.insert(IVec3::new(center_x + dx, y, center_z + dz));
-                }
-            }
-        }
-    }
-
-    // Fork into 2–3 main stems near the crown — classic wattle silhouette.
-    let fork_count = rng.range_i(2, 3);
-    let fork_start = height_voxels * 7 / 10;
-    for _ in 0..fork_count {
-        let mut fx = center_x;
-        let mut fz = center_z;
-        let fork_dx = rng.choice_i(&[-1, 1]);
-        let fork_dz = rng.choice_i(&[-1, 1]);
-        let fork_len = rng.range_i(18, 42) / VOXEL_INCHES;
-
-        for i in 0..fork_len {
-            let y = fork_start + i;
-            fx += if i > 0 && rng.chance(0.35) { fork_dx.signum() } else { 0 };
-            fz += if i > 0 && rng.chance(0.35) { fork_dz.signum() } else { 0 };
-
-            let stem_r = rng.range_i(1, 2);
-            let stem_r_sq = stem_r * stem_r;
-            for dx in -stem_r..=stem_r {
-                for dz in -stem_r..=stem_r {
-                    if dx * dx + dz * dz <= stem_r_sq {
-                        trunk.insert(IVec3::new(fx + dx, y, fz + dz));
-                    }
-                }
-            }
-        }
-    }
-
-    trunk
-}
-
-/// Outward-spreading branches with foliage along the crown, not just at tips.
-fn sample_acacia_branch_direction(rng: &mut GardenRng, outward: Vec3) -> Vec3 {
-    let azimuth = rng.range(0.0, std::f32::consts::TAU);
-    let elev_deg = if rng.chance(0.75) {
-        rng.range(4.0, 48.0)
-    } else {
-        rng.range(-18.0, 22.0)
-    };
-    let elev = elev_deg.to_radians();
-
-    let mut dir = Vec3::new(
-        elev.cos() * azimuth.cos(),
-        elev.sin(),
-        elev.cos() * azimuth.sin(),
-    );
-
-    if dir.y < 0.0 {
-        let horizontal = Vec2::new(dir.x, dir.z).length().max(0.05);
-        if dir.y.abs() > MAX_BRANCH_DROOP_RATIO * horizontal {
-            dir.y = -MAX_BRANCH_DROOP_RATIO * horizontal;
-        }
-    }
-
-    if outward.length_squared() > 0.01 {
-        dir = (dir + outward * rng.range(0.45, 0.75)).normalize();
-    } else {
-        dir = dir.normalize();
-    }
-
-    dir
-}
-
-fn generate_acacia_branches(
-    rng: &mut GardenRng,
-    trunk: &HashSet<IVec3>,
-) -> (HashSet<IVec3>, HashSet<IVec3>) {
-    let min_y = trunk.iter().map(|p| p.y).min().unwrap_or(0);
-    let max_y = trunk.iter().map(|p| p.y).max().unwrap_or(0);
-    let trunk_height = max_y - min_y;
-    let branch_zone_start = min_y + (trunk_height as f32 * 0.22) as i32;
-
-    let mut branches = HashSet::new();
-    let mut foliage = HashSet::new();
-    let branch_count = rng.range_i(8, 14);
-
-    for _ in 0..branch_count {
-        let attach_y = rng.range_i(branch_zone_start, max_y.saturating_sub(1));
-        let ring: Vec<IVec3> = trunk
-            .iter()
-            .copied()
-            .filter(|p| p.y == attach_y)
-            .collect();
-        if ring.is_empty() {
-            continue;
-        }
-
-        let start = ring[(rng.next_f32() * ring.len() as f32).floor() as usize];
-        let center = trunk_centroid_at_y(trunk, attach_y);
-        let outward = Vec3::new(
-            (start.x - center.x) as f32,
-            0.0,
-            (start.z - center.z) as f32,
-        )
-        .normalize_or_zero();
-
-        let dir = sample_acacia_branch_direction(rng, outward);
-        let length_voxels = rng.range_i(20, 72) / VOXEL_INCHES;
-        let path = rasterize_branch(start, dir, length_voxels);
-
-        let mut tip = None;
-        for (i, block) in path.iter().enumerate() {
-            if !trunk.contains(block) {
-                branches.insert(*block);
-                tip = Some(*block);
-
-                if i > 2 && rng.chance(0.22) {
-                    for blob in generate_branch_tip_foliage(rng, *block) {
-                        foliage.insert(blob);
-                    }
-                }
-            }
-        }
-
-        if let Some(tip_pos) = tip {
-            for blob in generate_branch_tip_foliage(rng, tip_pos) {
-                foliage.insert(blob);
-            }
-        }
-    }
-
-    (branches, foliage)
-}
-
-fn generate_acacia_tree(rng: &mut GardenRng) -> VoxelTreeData {
-    let trunk = generate_acacia_trunk(rng);
-    let (branches, foliage) = generate_acacia_branches(rng, &trunk);
-    let mut bark = trunk;
-    bark.extend(branches);
-    VoxelTreeData { bark, foliage }
-}
-
-fn spawn_voxel_tree(
-    commands: &mut Commands,
-    parent: Entity,
-    meshes: &mut ResMut<Assets<Mesh>>,
-    materials: &mut ResMut<Assets<StandardMaterial>>,
-    rng: &mut GardenRng,
-    local_base: Vec3,
-    tree: VoxelTreeData,
-    bark_color: (f32, f32, f32),
-    foliage_color: (f32, f32, f32),
-    marker: impl Bundle,
+/// Kick queued tree jobs onto the async compute pool. Voxel generation and mesh
+/// building for a giant can take a good chunk of a frame, so it all happens off
+/// the main thread; only asset registration and entity spawning stay on it.
+fn start_tree_build_tasks(
+    mut commands: Commands,
+    mut tree_queue: ResMut<TreeSpawnQueue>,
+    pending: Query<(), With<PendingTree>>,
 ) {
-    let bark_mesh = meshes.add(build_culled_voxel_mesh(&tree.bark, VOXEL_SIZE));
-    let foliage_mesh = meshes.add(build_culled_voxel_mesh(&tree.foliage, FOLIAGE_BLOB_WORLD_SIZE));
+    let mut in_flight = pending.iter().count();
+    if in_flight >= MAX_CONCURRENT_TREE_BUILDS {
+        return;
+    }
+    let pool = AsyncComputeTaskPool::get();
 
-    let bark_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(
-            rng.range(bark_color.0 - 0.05, bark_color.0 + 0.05),
-            rng.range(bark_color.1 - 0.05, bark_color.1 + 0.05),
-            rng.range(bark_color.2 - 0.05, bark_color.2 + 0.05),
-        ),
-        ..default()
-    });
-    let foliage_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(
-            rng.range(foliage_color.0 - 0.05, foliage_color.0 + 0.05),
-            rng.range(foliage_color.1 - 0.05, foliage_color.1 + 0.05),
-            rng.range(foliage_color.2 - 0.05, foliage_color.2 + 0.05),
-        ),
-        ..default()
-    });
+    while in_flight < MAX_CONCURRENT_TREE_BUILDS {
+        let Some(job) = tree_queue.0.pop_front() else {
+            break;
+        };
 
-    commands.entity(parent).with_children(|trees| {
-        trees
-            .spawn((
-                marker,
-                Visibility::default(),
-                Transform::from_translation(local_base),
-            ))
-            .with_children(|tree_root| {
-                tree_root.spawn((
-                    Mesh3d(bark_mesh),
-                    MeshMaterial3d(bark_material),
-                    Transform::IDENTITY,
-                ));
-                tree_root.spawn((
-                    Mesh3d(foliage_mesh),
-                    MeshMaterial3d(foliage_material),
-                    Transform::IDENTITY,
-                ));
+        let species = job.species;
+        let tree_seed = job.tree_seed;
+        let bark = job.bark_color;
+        let foliage = job.foliage_color;
+
+        let task = pool.spawn(async move {
+            let mut rng = GardenRng::new(tree_seed);
+            let tree: VoxelTreeData = generate_tree(species, &mut rng);
+            // Bark and foliage are both rasterised on the world voxel grid —
+            // one block size for the whole world.
+            let bark_mesh = build_culled_voxel_mesh(&tree.bark, VOXEL_SIZE);
+            let foliage_mesh = build_culled_voxel_mesh(&tree.foliage, VOXEL_SIZE);
+            let bark_color = Color::srgb(
+                rng.range(bark.0 - 0.05, bark.0 + 0.05),
+                rng.range(bark.1 - 0.05, bark.1 + 0.05),
+                rng.range(bark.2 - 0.05, bark.2 + 0.05),
+            );
+            let foliage_color = Color::srgb(
+                rng.range(foliage.0 - 0.05, foliage.0 + 0.05),
+                rng.range(foliage.1 - 0.05, foliage.1 + 0.05),
+                rng.range(foliage.2 - 0.05, foliage.2 + 0.05),
+            );
+            BuiltTree {
+                bark_mesh,
+                foliage_mesh,
+                bark_color,
+                foliage_color,
+            }
+        });
+
+        commands.spawn(PendingTree {
+            task,
+            chunk_entity: job.chunk_entity,
+            local_base: job.local_base,
+            species,
+        });
+        in_flight += 1;
+    }
+}
+
+/// Collect finished background builds and stand the trees up in the world.
+fn finish_tree_build_tasks(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut pending_q: Query<(Entity, &mut PendingTree)>,
+    live_chunks: Query<(), With<WorldChunk>>,
+) {
+    for (holder, mut pending) in &mut pending_q {
+        let Some(built) = block_on(future::poll_once(&mut pending.task)) else {
+            continue;
+        };
+
+        // The chunk may have streamed out while the tree was building.
+        if live_chunks.get(pending.chunk_entity).is_ok() {
+            let bark_mesh = meshes.add(built.bark_mesh);
+            let foliage_mesh = meshes.add(built.foliage_mesh);
+            let bark_material = materials.add(StandardMaterial {
+                base_color: built.bark_color,
+                ..default()
             });
-    });
+            let foliage_material = materials.add(StandardMaterial {
+                base_color: built.foliage_color,
+                ..default()
+            });
+
+            let species = pending.species;
+            let local_base = pending.local_base;
+            commands.entity(pending.chunk_entity).with_children(|trees| {
+                trees
+                    .spawn((
+                        WildTree { species },
+                        Visibility::default(),
+                        Transform::from_translation(local_base),
+                    ))
+                    .with_children(|tree_root| {
+                        tree_root.spawn((
+                            Mesh3d(bark_mesh),
+                            MeshMaterial3d(bark_material),
+                            Transform::IDENTITY,
+                        ));
+                        tree_root.spawn((
+                            Mesh3d(foliage_mesh),
+                            MeshMaterial3d(foliage_material),
+                            Transform::IDENTITY,
+                        ));
+                    });
+            });
+        }
+
+        commands.entity(holder).despawn();
+    }
 }
 
 fn load_chunk(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     terrain_materials: &TerrainMaterials,
-    coord: IVec2,
-    terrain_seed: u64,
+    record: &ChunkRecord,
 ) -> Entity {
+    let coord = record.coord;
     let origin = chunk_world_origin(coord);
 
     let chunk_entity = commands
@@ -657,70 +412,18 @@ fn load_chunk(
         ))
         .id();
 
-    let blocks = generate_chunk_blocks(coord, origin, terrain_seed);
+    let mut blocks = generate_chunk_blocks(coord, origin, record.terrain_seed);
+    // Re-open any burrows the worm has eaten here on previous visits.
+    apply_edits(&mut blocks, &record.edits);
     spawn_terrain_meshes(commands, chunk_entity, meshes, terrain_materials, blocks);
 
     chunk_entity
 }
 
-fn process_tree_spawn_queue(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut tree_queue: ResMut<TreeSpawnQueue>,
-    time: Res<Time>,
-    mut budget: ResMut<TreeSpawnBudget>,
-    live_chunks: Query<(), With<WorldChunk>>,
-) {
-    if !budget.timer.tick(time.delta()).just_finished() {
-        return;
-    }
-
-    let Some(job) = tree_queue.0.pop_front() else {
-        return;
-    };
-
-    if live_chunks.get(job.chunk_entity).is_err() {
-        return;
-    }
-
-    let mut rng = GardenRng::new(job.tree_seed);
-    match job.species {
-        SavedTreeSpecies::Eucalyptus => {
-            let tree = generate_eucalyptus_tree(&mut rng);
-            spawn_voxel_tree(
-                &mut commands,
-                job.chunk_entity,
-                &mut meshes,
-                &mut materials,
-                &mut rng,
-                job.local_base,
-                tree,
-                job.bark_color,
-                job.foliage_color,
-                EucalyptusTree,
-            );
-        }
-        SavedTreeSpecies::Acacia => {
-            let tree = generate_acacia_tree(&mut rng);
-            spawn_voxel_tree(
-                &mut commands,
-                job.chunk_entity,
-                &mut meshes,
-                &mut materials,
-                &mut rng,
-                job.local_base,
-                tree,
-                job.bark_color,
-                job.foliage_color,
-                AcaciaTree,
-            );
-        }
-    }
-}
-
 fn despawn_entity_tree(entity: Entity, commands: &mut Commands) {
-    commands.entity(entity).despawn();
+    // Chunks own terrain meshes and trees as children — in Bevy 0.15 a plain
+    // despawn would orphan them and leave ghost geometry behind.
+    commands.entity(entity).despawn_recursive();
 }
 
 fn chunk_is_queued(chunk_world: &ChunkWorld, coord: IVec2) -> bool {
@@ -792,6 +495,7 @@ fn process_chunk_load_queue(
     mut archive: ResMut<ChunkArchive>,
     mut tree_queue: ResMut<TreeSpawnQueue>,
     terrain_materials: Res<TerrainMaterials>,
+    leaf_assets: Res<LeafAssets>,
 ) {
     for _ in 0..CHUNKS_PER_FRAME {
         let Some(coord) = chunk_world.load_queue.pop_front() else {
@@ -809,46 +513,21 @@ fn process_chunk_load_queue(
         let record =
             take_saved_chunk(&mut archive, coord).unwrap_or_else(|| ChunkRecord::generate(coord));
 
-        let entity = load_chunk(
-            &mut commands,
-            &mut meshes,
-            &terrain_materials,
-            coord,
-            record.terrain_seed,
-        );
+        let entity = load_chunk(&mut commands, &mut meshes, &terrain_materials, &record);
+        scatter_chunk_leaves(&mut commands, entity, coord, &leaf_assets);
         chunk_world.active_records.insert(coord, record.clone());
         tree_queue.0.extend(record.tree_jobs(entity));
         chunk_world.loaded.insert(coord, entity);
     }
 }
 
-/// Spawns your actual 8-bit leaf sprite now as true lightly-extruded 3D leaves.
-/// Each has a small constant thickness (~coffee coaster) so the silhouette is
-/// the real leaf shape (no more alpha card) and edges catch light when spinning.
-fn spawn_textured_leaves(
-    commands: &mut Commands,
-    meshes: &mut ResMut<Assets<Mesh>>,
-    materials: &mut ResMut<Assets<StandardMaterial>>,
-    asset_server: &Res<AssetServer>,
-) {
-    // Load the high-res leaf PNG. The UV inset on boundary + green-only silhouette + strip triangulation
-    // ensure the 2D art appears correct (just the green on edges, no mangled black lines, exact jagged outline).
-    let leaf_texture = asset_server.load("leaf.png");
+/// A collectible leaf is ~3 worm-lengths across.
+const LEAF_BASE_SCALE: f32 = (WORM_LENGTH * 3.0) / 0.95;
 
-    let leaf_material = materials.add(StandardMaterial {
-        base_color_texture: Some(leaf_texture),
-        // The mesh geometry *is* the leaf outline now — no need for alpha cutout.
-        // Opaque is cleanest + cheapest (the PNG color still gives the details/veins).
-        alpha_mode: AlphaMode::Opaque,
-        double_sided: true,
-        ..default()
-    });
-
-    // One base mesh (fixed size); we scale instances via Transform so thickness scales too.
-    let leaf_mesh = create_extruded_leaf_mesh(meshes);
-
-    // Collectible ground leaves — bigger than the worm, at the original spawn heights.
-    let leaf_scale = (WORM_LENGTH * 3.0) / 0.95;
+/// Spawns the hand-placed welcome leaves around the starting beach.
+/// (Chunk streaming scatters many more everywhere — see [`scatter_chunk_leaves`].)
+fn spawn_textured_leaves(commands: &mut Commands, leaf_assets: &LeafAssets) {
+    let leaf_scale = LEAF_BASE_SCALE;
 
     // Leaf data: (position, base rotation, scale multiplier)
     let leaf_spawns: [(Vec3, Quat, f32); 7] = [
@@ -866,11 +545,15 @@ fn spawn_textured_leaves(
         let bob_speed = 1.8 + (i as f32 * 0.07);
         let spin_speed = 0.85 + (i as f32 * 0.1);
 
+        // Original hover heights were authored against flat ground — ride the
+        // local terrain surface instead.
+        let pos = Vec3::new(pos.x, surface_top_world_y(pos.x, pos.z) + pos.y, pos.z);
+
         commands.spawn((
-            Mesh3d(leaf_mesh.clone()),
-            MeshMaterial3d(leaf_material.clone()),
+            Mesh3d(leaf_assets.mesh.clone()),
+            MeshMaterial3d(leaf_assets.material.clone()),
             Transform {
-                translation: *pos,
+                translation: pos,
                 rotation: *base_rot,
                 scale: Vec3::splat(*scale * leaf_scale),
             },
@@ -886,13 +569,71 @@ fn spawn_textured_leaves(
     }
 }
 
-/// Little guy (the flycam) can eat leaves when close enough.
-/// Fly near one and tap E. Simple distance check + despawn.
+/// Litter every land chunk with bobbing leaves — deterministic per chunk, count
+/// scaled by how wooded the biome is, each riding the local terrain surface.
+fn scatter_chunk_leaves(
+    commands: &mut Commands,
+    chunk_entity: Entity,
+    coord: IVec2,
+    leaf_assets: &LeafAssets,
+) {
+    let origin = chunk_world_origin(coord);
+    let center = origin + Vec3::new(CHUNK_SIZE * 0.5, 0.0, CHUNK_SIZE * 0.5);
+    let profile = biome_profile(center.x, center.z);
+    if profile.biome == AussieBiome::Ocean {
+        return;
+    }
+
+    let mut rng = GardenRng::new(chunk_seed(WORLD_SEED, coord) ^ 0x1EAF_1EAF);
+    let count = (rng.range(3.0, 7.0) * (0.4 + profile.tree_density * 0.5)).round() as i32;
+
+    commands.entity(chunk_entity).with_children(|chunk| {
+        for _ in 0..count {
+            let lx = rng.range(1.5, CHUNK_SIZE - 1.5);
+            let lz = rng.range(1.5, CHUNK_SIZE - 1.5);
+            let ground = surface_top_world_y(origin.x + lx, origin.z + lz);
+            let y = ground + rng.range(0.4, 2.2);
+
+            let base_rot = Quat::from_euler(
+                EulerRot::XYZ,
+                rng.range(-1.0, 0.2),
+                rng.range(0.0, std::f32::consts::TAU),
+                rng.range(-0.4, 0.4),
+            );
+
+            chunk.spawn((
+                Mesh3d(leaf_assets.mesh.clone()),
+                MeshMaterial3d(leaf_assets.material.clone()),
+                Transform {
+                    translation: Vec3::new(lx, y, lz),
+                    rotation: base_rot,
+                    scale: Vec3::splat(LEAF_BASE_SCALE * rng.range(0.65, 1.15)),
+                },
+                Leaf,
+                FloatingLeaf {
+                    base_y: y,
+                    phase: rng.range(0.0, std::f32::consts::TAU),
+                    bob_speed: rng.range(1.2, 2.4),
+                    spin_speed: rng.range(0.45, 1.3),
+                    base_rotation: base_rot,
+                },
+            ));
+        }
+    });
+}
+
+/// Little guy (the flycam) eats with `E`. Leaves take priority when one is in
+/// range; otherwise the worm BURROWS — the voxel it's facing (or the ground
+/// under it) is eaten out of the world for real, the chunk remeshes on a
+/// background thread, and the bite is remembered so tunnels survive streaming.
 fn eat_leaves(
     mut commands: Commands,
     keyboard: Res<ButtonInput<KeyCode>>,
+    sounds: Res<GameSounds>,
+    chunk_world: Res<ChunkWorld>,
     cam_q: Query<&Transform, With<Camera>>,
-    leaf_q: Query<(Entity, &Transform), With<Leaf>>,
+    leaf_q: Query<(Entity, &GlobalTransform), With<Leaf>>,
+    pending_q: Query<(), With<PendingBurrow>>,
 ) {
     if !keyboard.just_pressed(KeyCode::KeyE) {
         return;
@@ -903,18 +644,166 @@ fn eat_leaves(
 
     let mut closest: Option<(Entity, f32)> = None;
 
+    // Leaves may be chunk children, so measure in world space.
     for (ent, tf) in &leaf_q {
-        let d = cam_pos.distance(tf.translation);
+        let d = cam_pos.distance(tf.translation());
         if d < 2.8 && closest.map_or(true, |(_, cd)| d < cd) {
             closest = Some((ent, d));
         }
     }
 
+    fn munch(commands: &mut Commands, sounds: &GameSounds) {
+        commands.spawn((
+            AudioPlayer::new(sounds.munch.clone()),
+            PlaybackSettings::DESPAWN,
+        ));
+    }
+
     if let Some((ent, d)) = closest {
         commands.entity(ent).despawn();
+        munch(&mut commands, &sounds);
         println!("🍃 Yum! Little guy devoured a leaf (dist: {:.1})", d);
-    } else {
-        println!("No tasty leaf within eating range (fly closer + press E)");
+        return;
+    }
+
+    // No leaf — burrow, off the main thread. Snapshot the nearby chunk records
+    // and hand the probe + carve + remesh to the compute pool; the frame never
+    // waits. One bite in flight at a time.
+    if !pending_q.is_empty() {
+        return;
+    }
+
+    let player_chunk = world_to_chunk(cam_pos.x, cam_pos.z);
+    let mut records: Vec<(IVec2, u64, std::collections::HashSet<IVec3>)> = Vec::new();
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            let coord = player_chunk + IVec2::new(dx, dz);
+            if !chunk_world.loaded.contains_key(&coord) {
+                continue;
+            }
+            if let Some(record) = chunk_world.active_records.get(&coord) {
+                records.push((coord, record.terrain_seed, record.edits.clone()));
+            }
+        }
+    }
+
+    let forward = *cam.forward();
+    let pool = AsyncComputeTaskPool::get();
+    let task = pool.spawn(async move { probe_and_carve(cam_pos, forward, &records) });
+    commands.spawn(PendingBurrow { task });
+}
+
+/// Probe along the look direction, then straight down, against the same
+/// deterministic generation (plus recorded bites) that built the chunk meshes.
+/// On a hit, carve the voxel and rebuild that chunk's terrain mesh — all pure
+/// CPU work, safe to run on a background thread.
+fn probe_and_carve(
+    cam_pos: Vec3,
+    forward: Vec3,
+    records: &[(IVec2, u64, std::collections::HashSet<IVec3>)],
+) -> Option<BurrowResult> {
+    let mut voxel_cache: HashMap<IVec2, ChunkVoxels> = HashMap::new();
+    let mut hit: Option<(IVec2, IVec3, BlockType)> = None;
+
+    'rays: for dir in [forward, Vec3::NEG_Y] {
+        for step in 0..16 {
+            let p = cam_pos + dir * (step as f32 * VOXEL_SIZE * 0.5);
+            let vx = (p.x / VOXEL_SIZE).floor() as i32;
+            let vy = (p.y / VOXEL_SIZE).floor() as i32;
+            let vz = (p.z / VOXEL_SIZE).floor() as i32;
+            let coord = IVec2::new(vx.div_euclid(CHUNK_VOXELS), vz.div_euclid(CHUNK_VOXELS));
+            let Some((_, seed, edits)) = records.iter().find(|(c, _, _)| *c == coord) else {
+                continue;
+            };
+
+            let voxels = voxel_cache.entry(coord).or_insert_with(|| {
+                let mut v = generate_chunk_blocks(coord, chunk_world_origin(coord), *seed);
+                apply_edits(&mut v, edits);
+                v
+            });
+
+            let local = IVec3::new(vx.rem_euclid(CHUNK_VOXELS), vy, vz.rem_euclid(CHUNK_VOXELS));
+            if let Some(block) = voxels.get(local.x, local.y, local.z) {
+                // Water isn't food, and the bottom layer is bedrock.
+                if block != BlockType::Water && local.y > voxels.floor_y() {
+                    hit = Some((coord, local, block));
+                }
+                break 'rays;
+            }
+        }
+    }
+
+    let (coord, local, block) = hit?;
+    let mut voxels = voxel_cache.remove(&coord).expect("probed chunk is cached");
+    voxels.clear_cell(local.x, local.y, local.z);
+
+    Some(BurrowResult {
+        coord,
+        local,
+        block,
+        mesh: terrain::build_colored_terrain_mesh(&voxels),
+    })
+}
+
+/// Land finished bites: record the edit, swap the chunk's terrain mesh, munch.
+fn finish_burrow_tasks(
+    mut commands: Commands,
+    sounds: Res<GameSounds>,
+    mut chunk_world: ResMut<ChunkWorld>,
+    mut archive: ResMut<ChunkArchive>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    terrain_materials: Res<TerrainMaterials>,
+    mut pending_q: Query<(Entity, &mut PendingBurrow)>,
+    children_q: Query<&Children>,
+    surface_q: Query<(), With<TerrainSurface>>,
+) {
+    for (holder, mut pending) in &mut pending_q {
+        let Some(result) = block_on(future::poll_once(&mut pending.task)) else {
+            continue;
+        };
+        commands.entity(holder).despawn();
+
+        let Some(result) = result else {
+            println!("Nothing edible in range (get near a leaf or up against soil + press E)");
+            continue;
+        };
+
+        // Persist the bite wherever the chunk lives now (it may have streamed
+        // out mid-chew — the tunnel still has to be there on revisit).
+        if let Some(record) = chunk_world.active_records.get_mut(&result.coord) {
+            record.edits.insert(result.local);
+        } else if let Some(record) = archive.saved.get_mut(&result.coord) {
+            record.edits.insert(result.local);
+            continue; // No live mesh to swap.
+        } else {
+            continue;
+        }
+
+        let Some(&chunk_entity) = chunk_world.loaded.get(&result.coord) else {
+            continue;
+        };
+        if let Ok(children) = children_q.get(chunk_entity) {
+            for child in children {
+                if surface_q.get(*child).is_ok() {
+                    commands.entity(*child).despawn();
+                }
+            }
+        }
+        let mesh = meshes.add(result.mesh);
+        commands.entity(chunk_entity).with_children(|chunk| {
+            chunk.spawn((
+                Mesh3d(mesh),
+                MeshMaterial3d(terrain_materials.vertex_color_terrain.clone()),
+                Transform::IDENTITY,
+                TerrainSurface,
+            ));
+        });
+
+        commands.spawn((
+            AudioPlayer::new(sounds.munch.clone()),
+            PlaybackSettings::DESPAWN,
+        ));
+        println!("🪱 Burrowed through a mouthful of {:?}.", result.block);
     }
 }
 
@@ -945,18 +834,42 @@ fn animate_floating_leaves(
 
 /// Places the flycam at world origin (the chosen spawn biome) at worm eye level,
 /// just above the surface voxel so you start crawling on the ground rather than
-/// clipped inside it.
+/// clipped inside it. Also dresses the camera with distance fog so faraway
+/// giants haze out into the sky instead of rendering pin-sharp.
 fn lower_worm_camera(
-    mut query: Query<&mut Transform, With<Camera>>,
+    mut commands: Commands,
+    mut query: Query<(Entity, &mut Transform), With<Camera>>,
 ) {
-    // Top of the surface voxel + a worm's eye height above it.
-    let surface_top = (SURFACE_VOXEL_Y + 1) as f32 * VOXEL_SIZE;
-    let eye_y = surface_top + WORM_EYE_HEIGHT;
+    // Top of the local surface voxel + a worm's eye height above it.
+    let surface_top = surface_top_world_y(0.0, 0.0);
+    let mut eye_y = surface_top + WORM_EYE_HEIGHT;
 
-    for mut transform in &mut query {
+    // Debug only: GARDN_HIGH=<feet> starts the camera up in the air, for
+    // inspecting distant terrain/silhouette rendering without a slow climb.
+    // Requires an explicit number — a stray/empty value changes nothing, so a
+    // normal launch always starts on the ground.
+    if let Ok(alt) = std::env::var("GARDN_HIGH") {
+        if let Ok(feet) = alt.trim().parse::<f32>() {
+            println!("🔧 GARDN_HIGH debug: starting the camera {feet} ft up.");
+            eye_y += feet;
+        }
+    }
+
+    for (entity, mut transform) in &mut query {
         transform.translation.x = 0.0;
         transform.translation.z = 0.0;
         transform.translation.y = eye_y;
+
+        commands.entity(entity).insert(DistanceFog {
+            // Matches the clear colour so fogged geometry melts into the sky.
+            color: Color::srgb(0.58, 0.72, 0.88),
+            directional_light_color: Color::srgba(1.0, 0.95, 0.85, 0.6),
+            directional_light_exponent: 40.0,
+            falloff: FogFalloff::Linear {
+                start: 120.0,
+                end: 680.0,
+            },
+        });
     }
 }
 

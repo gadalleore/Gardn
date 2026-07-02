@@ -1,0 +1,282 @@
+use crate::australia::{biome_at_world, is_land, AussieBiome};
+use crate::world::{
+    world_to_continental, world_to_geo, MAX_SURFACE_VOXEL_Y, VOXELS_PER_FOOT, VOXEL_SIZE,
+    WORLD_SEED,
+};
+
+/// Deterministic per-biome surface heights. Sampled in continent-space feet so
+/// the same square of Australia always has the same landforms regardless of
+/// where a given run's spawn offset placed world origin.
+///
+/// Two scales stack:
+/// - **Regional forms** (hundreds of feet): dunes in the red centre, mesas in
+///   the Pilbara, ridge-and-valley grain in the SE and Tasmania.
+/// - **Micro-relief** (5–25 ft): the terrain a worm actually lives in — mounds,
+///   hummocks, and rocky ribs a foot or three tall, i.e. mountains at worm scale.
+///
+/// All amplitudes are authored in feet and converted to voxels at the end, so
+/// changing the voxel size never flattens the world.
+pub fn surface_height_voxels(world_x: f32, world_z: f32) -> i32 {
+    let biome = biome_at_world(world_x, world_z);
+    if biome == AussieBiome::Ocean {
+        return 0;
+    }
+
+    let c = world_to_continental(world_x, world_z);
+    let x = c.x;
+    let z = c.y;
+
+    // Regional landforms, in feet.
+    let regional_ft = match biome {
+        AussieBiome::Ocean => 0.0,
+        // Top End: near-flat floodplains broken by abrupt sandstone escarpments
+        // (Arnhem Land "stone country" plateaus).
+        AussieBiome::TropicalSavanna => {
+            let plain = 0.7 + fbm(x / 900.0, z / 900.0, seed(1), 3) * 1.0;
+            let plateau_t = fbm01(x / 2600.0, z / 2600.0, seed(2), 3);
+            plain + smoothstep(0.55, 0.66, plateau_t) * 3.7
+        }
+        // Longitudinal dune fields: parallel NNW–SSE ridges with wide swales,
+        // amplitude wandering so some corridors are dune-free gibber plain.
+        AussieBiome::AridOutback => {
+            let across = x * 0.38 + z * 0.92;
+            let phase_wiggle = fbm(x / 2000.0, z / 2000.0, seed(3), 2) * 1.5;
+            let wave = (across / 1400.0 * std::f32::consts::TAU + phase_wiggle).sin();
+            let crest = ((wave + 1.0) * 0.5).powf(2.0);
+            let dune_amp = 1.7 * (0.5 + 0.5 * fbm01(x / 3200.0, z / 3200.0, seed(4), 2));
+            0.5 + crest * dune_amp + fbm(x / 700.0, z / 700.0, seed(5), 2) * 0.5
+        }
+        // Iron country: rolling spinifex base with flat-topped mesas and
+        // rocky ridge lines.
+        AussieBiome::Pilbara => {
+            let base = 0.7 + fbm(x / 800.0, z / 800.0, seed(6), 3) * 1.0;
+            let mesa_t = fbm01(x / 2200.0, z / 2200.0, seed(7), 3);
+            let mesa = smoothstep(0.52, 0.60, mesa_t) * 5.3;
+            base + mesa + ridged(x / 500.0, z / 500.0, seed(8), 2) * 1.0
+        }
+        // Gently undulating jarrah/karri plateau of the SW.
+        AussieBiome::Mediterranean => 0.8 + fbm(x / 850.0, z / 850.0, seed(9), 3) * 1.7,
+        // Great Dividing Range foothills: long ridge-and-valley grain.
+        AussieBiome::TemperateForest => {
+            1.0 + ridged(x / 1800.0, z / 1800.0, seed(10), 3) * 6.0
+                + fbm(x / 420.0, z / 420.0, seed(11), 2) * 1.3
+        }
+        // Littoral strip: rolling hills and old dune ridges.
+        AussieBiome::CoastalBush => 0.7 + fbm(x / 650.0, z / 650.0, seed(12), 3) * 2.0,
+        // Rugged cool-temperate highlands.
+        AussieBiome::Tasmania => {
+            1.0 + ridged(x / 1500.0, z / 1500.0, seed(13), 3) * 7.3
+                + fbm(x / 300.0, z / 300.0, seed(14), 2) * 1.7
+        }
+    };
+
+    // Worm-mountain micro-relief, in feet: (amplitude, rocky ridges?). These
+    // read as serious mountain ranges from 1.5 inches off the ground — a 2 ft
+    // mound is ~16 worm-lengths tall.
+    let (micro_amp_ft, rocky) = match biome {
+        AussieBiome::Ocean => (0.0, false),
+        AussieBiome::TropicalSavanna => (1.0, false), // cracked floodplain hummocks
+        AussieBiome::AridOutback => (1.6, false),     // sand ripples and gibber mounds
+        AussieBiome::Pilbara => (2.4, true),          // ironstone rubble and ribs
+        AussieBiome::Mediterranean => (1.4, false),   // laterite gravel rises
+        AussieBiome::TemperateForest => (2.0, false), // root mounds and gully lips
+        AussieBiome::CoastalBush => (1.6, false),     // hind-dune hummocks
+        AussieBiome::Tasmania => (2.8, true),         // boulder and button-grass mounds
+    };
+    let micro_ft = if rocky {
+        (ridged(x / 24.0, z / 24.0, seed(20), 3) - 0.35) * 2.0 * micro_amp_ft
+    } else {
+        // fbm concentrates around 0 — stretch it so full-amplitude mounds
+        // actually occur in the landscape, then soft-clip the extremes.
+        (fbm(x / 24.0, z / 24.0, seed(21), 3) * 1.8).clamp(-1.0, 1.0) * micro_amp_ft
+    };
+    // Inch-scale roughness everywhere — soil is never billiard-flat to a worm.
+    let fine_ft = fbm(x / 3.5, z / 3.5, seed(22), 2) * 0.2;
+
+    let h_ft = (regional_ft + micro_ft + fine_ft) * coast_openness(world_x, world_z);
+    ((h_ft * VOXELS_PER_FOOT as f32).round() as i32).clamp(1, MAX_SURFACE_VOXEL_Y)
+}
+
+/// World-space Y of the top face of the surface voxel at (x, z).
+pub fn surface_top_world_y(world_x: f32, world_z: f32) -> f32 {
+    (surface_height_voxels(world_x, world_z) + 1) as f32 * VOXEL_SIZE
+}
+
+/// Fade relief toward sea level near the coastline so beaches slope into the
+/// water instead of ending in a cliff. Samples the land mask ~1500 ft out in
+/// four directions; fully inland columns are unaffected.
+fn coast_openness(world_x: f32, world_z: f32) -> f32 {
+    const R: f32 = 1500.0;
+    let mut land = 0;
+    for (dx, dz) in [(R, 0.0), (-R, 0.0), (0.0, R), (0.0, -R)] {
+        let (lat, lon) = world_to_geo(world_x + dx, world_z + dz);
+        if is_land(lat, lon) {
+            land += 1;
+        }
+    }
+    0.2 + 0.8 * (land as f32 / 4.0)
+}
+
+fn seed(n: u32) -> u32 {
+    (WORLD_SEED as u32).wrapping_mul(0x9E37_79B9) ^ n.wrapping_mul(0x85EB_CA6B)
+}
+
+fn lattice_hash(ix: i32, iz: i32, seed: u32) -> f32 {
+    let mut h = (ix as u32).wrapping_mul(0x8DA6_B343)
+        ^ (iz as u32).wrapping_mul(0xD816_3841)
+        ^ seed.wrapping_mul(0xCB1A_B31F);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x7FEB_352D);
+    h ^= h >> 15;
+    h as f32 / u32::MAX as f32
+}
+
+fn smooth(t: f32) -> f32 {
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Smoothly interpolated lattice value noise in [0, 1].
+fn value_noise(x: f32, z: f32, seed: u32) -> f32 {
+    let x0 = x.floor();
+    let z0 = z.floor();
+    let tx = smooth(x - x0);
+    let tz = smooth(z - z0);
+    let ix = x0 as i32;
+    let iz = z0 as i32;
+    let a = lattice_hash(ix, iz, seed);
+    let b = lattice_hash(ix + 1, iz, seed);
+    let c = lattice_hash(ix, iz + 1, seed);
+    let d = lattice_hash(ix + 1, iz + 1, seed);
+    a + (b - a) * tx + (c - a) * tz + (a - b - c + d) * tx * tz
+}
+
+/// Fractal value noise in [0, 1].
+fn fbm01(x: f32, z: f32, seed: u32, octaves: u32) -> f32 {
+    let mut sum = 0.0;
+    let mut amp = 1.0;
+    let mut norm = 0.0;
+    let mut fx = x;
+    let mut fz = z;
+    for o in 0..octaves {
+        sum += value_noise(fx, fz, seed.wrapping_add(o * 101)) * amp;
+        norm += amp;
+        amp *= 0.5;
+        fx *= 2.0;
+        fz *= 2.0;
+    }
+    sum / norm
+}
+
+/// Fractal value noise in [-1, 1].
+fn fbm(x: f32, z: f32, seed: u32, octaves: u32) -> f32 {
+    fbm01(x, z, seed, octaves) * 2.0 - 1.0
+}
+
+/// Ridged fractal noise in [0, 1] — sharp crests, broad valleys.
+fn ridged(x: f32, z: f32, seed: u32, octaves: u32) -> f32 {
+    let mut sum = 0.0;
+    let mut amp = 1.0;
+    let mut norm = 0.0;
+    let mut fx = x;
+    let mut fz = z;
+    for o in 0..octaves {
+        let n = value_noise(fx, fz, seed.wrapping_add(o * 131));
+        sum += (1.0 - (n * 2.0 - 1.0).abs()) * amp;
+        norm += amp;
+        amp *= 0.5;
+        fx *= 2.0;
+        fz *= 2.0;
+    }
+    let r = sum / norm;
+    r * r
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::geo_to_world_offset;
+
+    /// Every biome's height program stays inside the legal band, and ocean is
+    /// flat sea level. Uses the unshifted geo mapping (no spawn offset in tests)
+    /// so a lat/lon converts straight to world coordinates.
+    #[test]
+    fn heights_stay_in_band_across_all_biomes() {
+        let spots = [
+            ("savanna", -13.5, 132.0),
+            ("outback", -24.5, 133.5),
+            ("pilbara", -22.5, 118.5),
+            ("mediterranean", -30.0, 119.0),
+            ("temperate", -35.0, 146.0),
+            ("coastal", -26.0, 152.5),
+            ("tasmania", -42.0, 146.8),
+        ];
+        for (name, lat, lon) in spots {
+            let w = geo_to_world_offset(lat, lon);
+            for step in 0..25 {
+                let dx = (step % 5) as f32 * 130.0;
+                let dz = (step / 5) as f32 * 130.0;
+                let h = surface_height_voxels(w.x + dx, w.y + dz);
+                assert!(
+                    (1..=MAX_SURFACE_VOXEL_Y).contains(&h),
+                    "{name}: height {h} out of band"
+                );
+            }
+        }
+
+        // Indian Ocean west of the continent — unambiguously open water.
+        let sea = geo_to_world_offset(-30.0, 110.0);
+        assert_eq!(surface_height_voxels(sea.x, sea.y), 0);
+    }
+
+    /// Different regions actually get different relief — the ranges must not be
+    /// statistically flat, the plains must not be mountainous.
+    #[test]
+    fn relief_varies_by_region() {
+        let relief = |lat: f32, lon: f32| -> i32 {
+            let w = geo_to_world_offset(lat, lon);
+            let mut lo = i32::MAX;
+            let mut hi = i32::MIN;
+            for i in 0..40 {
+                let h = surface_height_voxels(w.x + i as f32 * 220.0, w.y + i as f32 * 170.0);
+                lo = lo.min(h);
+                hi = hi.max(h);
+            }
+            hi - lo
+        };
+
+        let savanna_plain = relief(-14.5, 133.5);
+        let tasmania_ranges = relief(-42.0, 146.8);
+        assert!(
+            tasmania_ranges > savanna_plain,
+            "Tasmania ({tasmania_ranges}) should be rougher than the savanna plains ({savanna_plain})"
+        );
+        assert!(tasmania_ranges >= 24, "Tasmanian highlands too flat: {tasmania_ranges}");
+    }
+
+    /// A worm crawling ~50 ft in any biome must cross real ups and downs — the
+    /// micro-relief layer, not just the regional forms.
+    #[test]
+    fn ground_is_never_flat_at_worm_scale() {
+        let spots = [(-24.5, 133.5), (-14.5, 133.5), (-35.0, 146.0)];
+        for (lat, lon) in spots {
+            let w = geo_to_world_offset(lat, lon);
+            let mut lo = i32::MAX;
+            let mut hi = i32::MIN;
+            for i in 0..50 {
+                let h = surface_height_voxels(w.x + i as f32, w.y + i as f32 * 0.7);
+                lo = lo.min(h);
+                hi = hi.max(h);
+            }
+            assert!(
+                hi - lo >= 3,
+                "terrain near ({lat}, {lon}) is billiard-flat: relief {} voxels",
+                hi - lo
+            );
+        }
+    }
+}

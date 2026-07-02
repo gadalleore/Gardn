@@ -1,28 +1,39 @@
 use bevy::prelude::*;
 use std::sync::OnceLock;
 
-/// World units are feet. Shared 4-inch voxels match tree trunk blocks.
+/// World units are feet. One shared 2-inch voxel for everything — ground,
+/// trunks, and foliage — so a 3-inch worm reads every block as worm-sized.
 pub const INCH: f32 = 1.0 / 12.0;
-pub const VOXEL_INCHES: i32 = 4;
+pub const VOXEL_INCHES: i32 = 2;
 pub const VOXEL_SIZE: f32 = VOXEL_INCHES as f32 * INCH;
 pub const VOXELS_PER_FOOT: i32 = 12 / VOXEL_INCHES;
 
 pub const WORM_LENGTH: f32 = 3.0 * INCH;
 pub const WORM_EYE_HEIGHT: f32 = 1.5 * INCH;
 
-/// Minecraft-style horizontal chunk — 64 ft wide = 192 voxels at 4-inch scale.
-pub const CHUNK_SIZE: f32 = 64.0;
+/// Minecraft-style horizontal chunk — 32 ft wide = 192 voxels at 2-inch scale
+/// (chunk shrinks with the voxel so per-chunk generation cost stays constant).
+pub const CHUNK_SIZE: f32 = 32.0;
 pub const CHUNK_VOXELS: i32 = (CHUNK_SIZE / VOXEL_SIZE) as i32;
-/// Underground depth in voxels (16 × 4″ ≈ 5.3 ft below surface).
+/// Underground depth in voxels below the chunk's lowest surface (16 × 2″ ≈ 2.7 ft).
 pub const CHUNK_DEPTH_VOXELS: i32 = 16;
-pub const SURFACE_VOXEL_Y: i32 = 0;
+/// Sea level: ocean water tops out at voxel y = 0; land surface rises above it.
+pub const SEA_LEVEL_VOXEL_Y: i32 = 0;
+/// Tallest terrain in voxels above sea level (16 ft — a Himalaya to a worm).
+pub const MAX_SURFACE_VOXEL_Y: i32 = 16 * VOXELS_PER_FOOT;
 
 pub const WORLD_SEED: u64 = 0xE0CA1E52_2026;
-pub const CHUNK_VIEW_DISTANCE: i32 = 1;
-pub const CHUNK_UNLOAD_DISTANCE: i32 = 2;
+pub const CHUNK_VIEW_DISTANCE: i32 = 2;
+pub const CHUNK_UNLOAD_DISTANCE: i32 = 3;
+/// Beyond the streamed chunks, tree silhouettes stay visible out to this many
+/// chunks (~640 ft) so the giants dominate the horizon without costing meshes.
+pub const SILHOUETTE_CHUNK_DISTANCE: i32 = 20;
+pub const SILHOUETTES_PER_FRAME: usize = 8;
 pub const CHUNKS_PER_FRAME: usize = 1;
-pub const TREE_SPAWN_INTERVAL_SECS: f32 = 0.35;
-pub const MAX_TREE_QUEUE: usize = 10;
+/// Giant trees are built (voxels + mesh) on background compute threads; this
+/// caps how many build in parallel so the pool isn't swamped.
+pub const MAX_CONCURRENT_TREE_BUILDS: usize = 4;
+pub const MAX_TREE_QUEUE: usize = 24;
 
 /// Real Australia spans ~4000 km × 3200 km — mapped onto world feet.
 pub const AUSTRALIA_WIDTH_KM: f32 = 4000.0;
@@ -111,6 +122,15 @@ pub fn set_spawn_geo_offset(offset: Vec2) {
 
 fn spawn_geo_offset() -> Vec2 {
     SPAWN_GEO_OFFSET.get().copied().unwrap_or(Vec2::ZERO)
+}
+
+/// Absolute continent-space feet (relative to the continent centre) for a world
+/// position — the spawn offset folded in. Topography noise samples in this space
+/// so the terrain shape is pinned to the real region of Australia, not to
+/// wherever this game's origin happens to sit.
+pub fn world_to_continental(world_x: f32, world_z: f32) -> Vec2 {
+    let off = spawn_geo_offset();
+    Vec2::new(world_x + off.x, world_z + off.y)
 }
 
 pub fn world_to_geo(world_x: f32, world_z: f32) -> (f32, f32) {

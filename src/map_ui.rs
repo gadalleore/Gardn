@@ -3,9 +3,10 @@ use bevy::prelude::*;
 use crate::australia::{biome_at_geo, biome_at_world, biome_display_name, is_land, AussieBiome};
 use crate::world::{geo_to_normalized, world_to_geo};
 
-/// Grid resolution for the little pixel-art continent (chunky = on theme).
-const MAP_COLS: usize = 42;
-const MAP_ROWS: usize = 34;
+/// Grid resolution for the little pixel-art continent — fine enough that the
+/// real coastline polygon (gulfs, capes, Tasmania) actually reads.
+const MAP_COLS: usize = 88;
+const MAP_ROWS: usize = 72;
 
 /// UI colour for each biome on the overlay silhouette.
 fn biome_map_color(biome: AussieBiome) -> Color {

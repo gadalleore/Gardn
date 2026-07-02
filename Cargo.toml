@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bevy = { version = "0.15", features = ["jpeg", "png"] }
+bevy = { version = "0.15", features = ["jpeg", "png", "mp3", "wav"] }
 bevy_flycam = "0.15"
 wgpu = "23"
 image = { version = "0.25", default-features = false, features = ["png"] }
