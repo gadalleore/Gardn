@@ -157,6 +157,8 @@ struct SoundtrackSong;
 #[derive(Resource)]
 struct Wind {
     dir: Vec2,
+    /// Compass heading of `dir`, radians. Only moves ±1° per weather shift.
+    heading: f32,
     /// 0 = dead calm … 5 = worm-shoving gale.
     strength: f32,
     target: f32,
@@ -166,17 +168,20 @@ struct Wind {
 
 impl Default for Wind {
     fn default() -> Self {
+        let mut rng = GardenRng::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0xB1FF),
+        );
+        let heading = rng.range(0.0, std::f32::consts::TAU);
         Self {
-            dir: Vec2::new(0.8, 0.6).normalize(),
-            strength: 1.0,
-            target: 1.0,
+            dir: Vec2::new(heading.cos(), heading.sin()),
+            heading,
+            strength: 0.0,
+            target: 0.0,
             next_shift_at: 0.0,
-            rng: GardenRng::new(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0xB1FF),
-            ),
+            rng,
         }
     }
 }
@@ -285,23 +290,32 @@ struct WindSway {
 
 fn update_wind(time: Res<Time>, mut wind: ResMut<Wind>) {
     let t = time.elapsed_secs();
-    // The wind slowly veers around the compass over tens of minutes.
-    let heading = t * 0.006 + (t * 0.019).sin() * 0.5;
-    wind.dir = Vec2::new(heading.cos(), heading.sin());
 
     // Weather re-roll: six discrete levels on a quadratic likelihood curve,
     // pinned at 50% for dead calm and 1% for a full 5/5 gale, the middle
     // falling off as (1 - n/5)²:
     //   0: 50.0%  1: 26.1%  2: 14.7%  3: 6.5%  4: 1.6%  5: 1.0%
+    //
+    // How long a level holds depends on how windy it is — calm days linger,
+    // gales blow themselves out: 0→5 min, 1→4, 2→3, 3→2.5, 4→2, 5→1.
     if t >= wind.next_shift_at {
         const WIND_LEVEL_CDF: [f32; 6] = [0.500, 0.7613, 0.9083, 0.9737, 0.9900, 1.0];
+        const HOLD_MINUTES: [f32; 6] = [5.0, 4.0, 3.0, 2.5, 2.0, 1.0];
+
         let roll = wind.rng.next_f32();
         let level = WIND_LEVEL_CDF
             .iter()
             .position(|&cum| roll < cum)
             .unwrap_or(5);
         wind.target = level as f32;
-        wind.next_shift_at = t + wind.rng.range(30.0, 80.0);
+        wind.next_shift_at = t + HOLD_MINUTES[level] * 60.0;
+
+        // The direction creeps: exactly one degree per shift, coin-flip
+        // left or right — over hours the wind slowly wanders the compass.
+        let step = 1.0f32.to_radians();
+        wind.heading += if wind.rng.chance(0.5) { step } else { -step };
+        wind.dir = Vec2::new(wind.heading.cos(), wind.heading.sin());
+
         println!("🌬️ Wind shifting toward {level}/5");
     }
     // Ease toward the target like real weather, not a light switch.
