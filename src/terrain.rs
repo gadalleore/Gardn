@@ -4,7 +4,7 @@ use bevy::render::mesh::{Indices, PrimitiveTopology};
 use std::collections::{HashMap, HashSet};
 
 use crate::australia::{biome_profile, AussieBiome};
-use crate::topography::surface_height_voxels;
+use crate::topography::{is_cave_cell, surface_height_voxels, CAVE_CELL_VOXELS};
 use crate::world::{
     GardenRng, CHUNK_DEPTH_VOXELS, CHUNK_SIZE, CHUNK_VOXELS, SEA_LEVEL_VOXEL_Y, VOXEL_SIZE,
 };
@@ -159,6 +159,25 @@ impl ChunkVoxels {
     pub fn is_empty(&self) -> bool {
         self.solid_count == 0
     }
+
+    /// Highest solid voxel per column, indexed `[z * size_x + x]` — the
+    /// authoritative ground the physics floor stands on (the height *formula*
+    /// can disagree with the meshed terrain by a voxel or two, which is
+    /// exactly enough to fall through a freshly eaten floor).
+    pub fn column_tops(&self) -> Vec<i32> {
+        let mut tops = vec![self.y_min - 1; (self.size_x * self.size_z) as usize];
+        for lz in 0..self.size_z {
+            for lx in 0..self.size_x {
+                for y in (self.y_min..=self.y_max).rev() {
+                    if self.get(lx, y, lz).is_some() {
+                        tops[(lz * self.size_x + lx) as usize] = y;
+                        break;
+                    }
+                }
+            }
+        }
+        tops
+    }
 }
 
 /// Re-carve every recorded bite into freshly generated chunk voxels.
@@ -285,6 +304,40 @@ pub fn generate_chunk_blocks(
     // Stamp ore veins directly over their bounding boxes instead of testing
     // every voxel against every vein (was ~25M checks/chunk, all underground).
     stamp_ore_veins(&mut voxels, &veins);
+
+    // Carve the cave web — after ore stamping, so veins gleam in cave walls.
+    // Decided per 8-inch lattice cell in world space (seamless across chunk
+    // borders); the bottom two layers stay bedrock so caves never open into
+    // the void.
+    let base_wx = coord.x * CHUNK_VOXELS;
+    let base_wz = coord.y * CHUNK_VOXELS;
+    let carve_floor = chunk_floor + 2;
+    let y_start = carve_floor.div_euclid(CAVE_CELL_VOXELS) * CAVE_CELL_VOXELS;
+    for lz in (0..CHUNK_VOXELS).step_by(CAVE_CELL_VOXELS as usize) {
+        for lx in (0..CHUNK_VOXELS).step_by(CAVE_CELL_VOXELS as usize) {
+            let cx = (lx + CAVE_CELL_VOXELS / 2).min(CHUNK_VOXELS - 1);
+            let cz = (lz + CAVE_CELL_VOXELS / 2).min(CHUNK_VOXELS - 1);
+            let h = heights[cz as usize * cols + cx as usize];
+
+            let mut y = y_start;
+            while y <= h {
+                if is_cave_cell(base_wx + lx, y, base_wz + lz, h) {
+                    for dy in 0..CAVE_CELL_VOXELS {
+                        let cy = y + dy;
+                        if cy < carve_floor || cy > h {
+                            continue;
+                        }
+                        for dz in 0..CAVE_CELL_VOXELS {
+                            for dx in 0..CAVE_CELL_VOXELS {
+                                voxels.clear_cell(lx + dx, cy, lz + dz);
+                            }
+                        }
+                    }
+                }
+                y += CAVE_CELL_VOXELS;
+            }
+        }
+    }
 
     voxels
 }
@@ -527,6 +580,7 @@ const FACE_DIRS: [(IVec3, [f32; 3], [[i32; 3]; 4], usize); 6] = [
 fn push_merged_quad(
     positions: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
     indices: &mut Vec<u32>,
     normal: [f32; 3],
     corners: [[i32; 3]; 4],
@@ -536,14 +590,31 @@ fn push_merged_quad(
     cell_size: f32,
 ) {
     let idx0 = positions.len() as u32;
+    // UVs tile once per voxel (a merged strip spans 0..len), so a block skin
+    // repeats along the strip instead of stretching. Needs a repeat sampler.
+    let n_axis = if normal[0] != 0.0 {
+        0
+    } else if normal[1] != 0.0 {
+        1
+    } else {
+        2
+    };
+    let (u_axis, v_axis) = match n_axis {
+        0 => (2, 1),
+        1 => (0, 2),
+        _ => (0, 1),
+    };
+
     for corner in corners {
         let mut p = [0f32; 3];
+        let mut c_scaled = [0i32; 3];
         for k in 0..3 {
-            let c = if k == merge_axis { corner[k] * len } else { corner[k] };
-            p[k] = (base[k] + c) as f32 * cell_size;
+            c_scaled[k] = if k == merge_axis { corner[k] * len } else { corner[k] };
+            p[k] = (base[k] + c_scaled[k]) as f32 * cell_size;
         }
         positions.push(p);
         normals.push(normal);
+        uvs.push([c_scaled[u_axis] as f32, c_scaled[v_axis] as f32]);
     }
     indices.extend_from_slice(&[idx0, idx0 + 1, idx0 + 2, idx0, idx0 + 2, idx0 + 3]);
 }
@@ -554,6 +625,7 @@ fn push_merged_quad(
 pub fn build_colored_terrain_mesh(voxels: &ChunkVoxels) -> Mesh {
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
     let mut colors: Vec<[f32; 4]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
 
@@ -614,6 +686,7 @@ pub fn build_colored_terrain_mesh(voxels: &ChunkVoxels) -> Mesh {
                     push_merged_quad(
                         &mut positions,
                         &mut normals,
+                        &mut uvs,
                         &mut indices,
                         normal,
                         corners,
@@ -633,17 +706,44 @@ pub fn build_colored_terrain_mesh(voxels: &ChunkVoxels) -> Mesh {
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     mesh.insert_indices(Indices::U32(indices));
     mesh
 }
 
-/// Used by voxel trees (material colour comes from StandardMaterial, so no
-/// vertex colours or UVs). Same strip merging as the terrain mesher — trunk
-/// walls collapse into long vertical quads.
+/// Collapse fine voxels into `factor`-sized coarse cells for distant LOD
+/// meshes: a coarse cell survives when enough of its fine voxels are filled
+/// (`fill_ratio` of factor³), so the big blocks trace the average shape of the
+/// cloud instead of swelling to its loosest outline. Output coords are on the
+/// coarse grid — mesh them with `block_size * factor`.
+pub fn downsample_blocks(blocks: &HashSet<IVec3>, factor: i32, fill_ratio: f32) -> HashSet<IVec3> {
+    let mut counts: HashMap<IVec3, u32> = HashMap::new();
+    for b in blocks {
+        let cell = IVec3::new(
+            b.x.div_euclid(factor),
+            b.y.div_euclid(factor),
+            b.z.div_euclid(factor),
+        );
+        *counts.entry(cell).or_insert(0) += 1;
+    }
+
+    let needed = (((factor * factor * factor) as f32 * fill_ratio) as u32).max(1);
+    counts
+        .into_iter()
+        .filter(|(_, n)| *n >= needed)
+        .map(|(cell, _)| cell)
+        .collect()
+}
+
+/// Used by voxel trees (colour comes from StandardMaterial, so no vertex
+/// colours; UVs let an optional block skin texture tile over the faces). Same
+/// strip merging as the terrain mesher — trunk walls collapse into long
+/// vertical quads.
 pub fn build_culled_voxel_mesh(blocks: &HashSet<IVec3>, block_size: f32) -> Mesh {
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
 
     for (neighbor, normal, corners, merge_axis) in FACE_DIRS {
@@ -677,6 +777,7 @@ pub fn build_culled_voxel_mesh(blocks: &HashSet<IVec3>, block_size: f32) -> Mesh
             push_merged_quad(
                 &mut positions,
                 &mut normals,
+                &mut uvs,
                 &mut indices,
                 normal,
                 corners,
@@ -693,6 +794,7 @@ pub fn build_culled_voxel_mesh(blocks: &HashSet<IVec3>, block_size: f32) -> Mesh
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_indices(Indices::U32(indices));
     mesh
 }

@@ -68,8 +68,6 @@ pub struct SilhouetteSpec {
     pub height_ft: f32,
     pub trunk_width_ft: f32,
     pub crown_radius_ft: f32,
-    /// Crown centre as a fraction of tree height.
-    pub crown_center_frac: f32,
     pub cone: bool,
 }
 
@@ -82,7 +80,6 @@ pub fn silhouette_spec(species: TreeSpecies, tree_seed: u64) -> SilhouetteSpec {
             height_ft,
             trunk_width_ft: 1.5,
             crown_radius_ft: 14.0,
-            crown_center_frac: 1.0,
             cone: false,
         };
     }
@@ -95,16 +92,17 @@ pub fn silhouette_spec(species: TreeSpecies, tree_seed: u64) -> SilhouetteSpec {
     } else if form.cone {
         115.0 / 12.0
     } else {
-        // Branch reach plus a pom-pom of foliage at the tip.
-        form.branch_len_in.1 as f32 / 12.0 * 0.5 + 46.0 * form.blob_scale / 12.0
+        // Whichever reaches farther: branch tips with their pom-poms, or the
+        // apex crown capping the trunk (spread + enlarged blobs).
+        let branch_reach = form.branch_len_in.1 as f32 * 0.5 + 46.0 * form.blob_scale;
+        let apex_reach = 122.0 * form.blob_scale;
+        branch_reach.max(apex_reach) / 12.0
     };
-    let crown_center_frac = ((form.branch_zone + 1.0) * 0.5).min(0.92);
 
     SilhouetteSpec {
         height_ft,
         trunk_width_ft,
         crown_radius_ft,
-        crown_center_frac,
         cone: form.cone,
     }
 }
@@ -218,8 +216,8 @@ impl Default for TreeForm {
             wobble_clamp_in: 8,
             forks: (0, 0),
             branch_zone: 0.58,
-            branch_count: (5, 9),
-            branch_len_in: (80, 250),
+            branch_count: (6, 10),
+            branch_len_in: (180, 480),
             branch_elev_deg: (12.0, 72.0),
             low_elev_deg: (-28.0, 18.0),
             outward_pull: (0.25, 0.55),
@@ -243,7 +241,7 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             radius_in: 26,
             branch_zone: 0.5,
             branch_count: (4, 7),
-            branch_len_in: (60, 180),
+            branch_len_in: (140, 320),
             blob_scale: 1.2,
             ..default_form()
         },
@@ -254,7 +252,7 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             wobble_clamp_in: 16,
             branch_zone: 0.35,
             branch_count: (4, 7),
-            branch_len_in: (40, 110),
+            branch_len_in: (90, 200),
             ..default_form()
         },
         TreeSpecies::Karri => TreeForm {
@@ -263,7 +261,7 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             wobble: 0.02,
             branch_zone: 0.78,
             branch_count: (5, 8),
-            branch_len_in: (90, 300),
+            branch_len_in: (220, 560),
             blob_scale: 1.8,
             ..default_form()
         },
@@ -272,7 +270,7 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             radius_in: 48,
             branch_zone: 0.6,
             branch_count: (6, 10),
-            branch_len_in: (70, 220),
+            branch_len_in: (160, 420),
             blob_scale: 1.5,
             ..default_form()
         },
@@ -282,7 +280,7 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             wobble: 0.02,
             branch_zone: 0.8,
             branch_count: (5, 8),
-            branch_len_in: (100, 350),
+            branch_len_in: (240, 640),
             blob_scale: 1.9,
             ..default_form()
         },
@@ -294,7 +292,7 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             forks: (1, 2),
             branch_zone: 0.3,
             branch_count: (5, 9),
-            branch_len_in: (40, 130),
+            branch_len_in: (90, 240),
             branch_elev_deg: (0.0, 45.0),
             low_elev_deg: (-30.0, 5.0),
             blob_scale: 1.0,
@@ -308,7 +306,7 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             forks: (2, 3),
             branch_zone: 0.25,
             branch_count: (6, 10),
-            branch_len_in: (36, 100),
+            branch_len_in: (80, 190),
             canopy_along_branch: 0.05,
             blob_scale: 0.8,
             ..default_form()
@@ -322,7 +320,7 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             forks: (2, 3),
             branch_zone: 0.22,
             branch_count: (8, 14),
-            branch_len_in: (45, 160),
+            branch_len_in: (100, 300),
             branch_elev_deg: (4.0, 48.0),
             low_elev_deg: (-18.0, 22.0),
             outward_pull: (0.45, 0.75),
@@ -337,7 +335,7 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             wobble: 0.03,
             branch_zone: 0.85,
             branch_count: (5, 8),
-            branch_len_in: (70, 200),
+            branch_len_in: (160, 380),
             branch_elev_deg: (18.0, 70.0),
             blob_scale: 1.0,
             ..default_form()
@@ -347,7 +345,7 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             radius_in: 20,
             branch_zone: 0.4,
             branch_count: (7, 12),
-            branch_len_in: (60, 160),
+            branch_len_in: (130, 330),
             canopy_along_branch: 0.06,
             blob_scale: 1.2,
             ..default_form()
@@ -357,7 +355,7 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             radius_in: 18,
             branch_zone: 0.25,
             branch_count: (12, 20),
-            branch_len_in: (20, 60),
+            branch_len_in: (50, 130),
             branch_elev_deg: (-24.0, 12.0),
             low_elev_deg: (-32.0, -6.0),
             outward_pull: (0.15, 0.35),
@@ -372,7 +370,7 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             wobble_clamp_in: 16,
             branch_zone: 0.35,
             branch_count: (6, 10),
-            branch_len_in: (36, 100),
+            branch_len_in: (80, 200),
             blob_scale: 0.9,
             dome: Some((80.0, 45.0)),
             ..default_form()
@@ -383,7 +381,7 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             base_flare_in: 40,
             branch_zone: 0.45,
             branch_count: (6, 9),
-            branch_len_in: (140, 420),
+            branch_len_in: (260, 700),
             branch_elev_deg: (-6.0, 26.0),
             low_elev_deg: (-20.0, 8.0),
             outward_pull: (0.5, 0.85),
@@ -397,7 +395,7 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             radius_in: 20,
             branch_zone: 0.6,
             branch_count: (3, 6),
-            branch_len_in: (30, 70),
+            branch_len_in: (60, 140),
             blob_scale: 0.8,
             cone: true,
             ..default_form()
@@ -407,7 +405,7 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             radius_in: 32,
             branch_zone: 0.5,
             branch_count: (6, 10),
-            branch_len_in: (45, 130),
+            branch_len_in: (100, 280),
             canopy_along_branch: 0.04,
             dome: Some((130.0, 70.0)),
             ..default_form()
@@ -430,9 +428,15 @@ fn generate_form_tree(rng: &mut GardenRng, form: &TreeForm) -> VoxelTreeData {
     if form.cone {
         foliage.extend(cone_canopy(rng, &trunk));
     }
-
     let mut bark = trunk;
     bark.extend(branches);
+
+    if form.dome.is_none() && !form.cone {
+        let (crown_wood, crown_leaves) = apex_crown(rng, &bark, form);
+        bark.extend(crown_wood);
+        foliage.extend(crown_leaves);
+    }
+
     VoxelTreeData { bark, foliage }
 }
 
@@ -744,6 +748,59 @@ fn pom_foliage(rng: &mut GardenRng, tip: IVec3, scale: f32) -> HashSet<IVec3> {
     cloud
 }
 
+/// Leafy cap on the trunk apex: a cluster of enlarged pom blobs around the top
+/// of the tree, each held up by a real 4-inch branchlet grown from the trunk
+/// apex out to the tuft — leaves have weight, so wood must carry them; nothing
+/// floats. Returns (supporting wood, leaves).
+fn apex_crown(
+    rng: &mut GardenRng,
+    trunk: &HashSet<IVec3>,
+    form: &TreeForm,
+) -> (HashSet<IVec3>, HashSet<IVec3>) {
+    let max_y = trunk.iter().map(|p| p.y).max().unwrap_or(0);
+    let apex = trunk_centroid_at_y(trunk, max_y);
+
+    let scale = form.blob_scale * 1.25;
+    let spread = ((64.0 * form.blob_scale) as i32 / VOXEL_INCHES).max(1);
+    let dip = (14 / VOXEL_INCHES).max(1);
+
+    let mut wood = HashSet::new();
+    let mut cloud = HashSet::new();
+    let tuft_count = rng.range_i(2, 4);
+    for _ in 0..tuft_count {
+        let offset = IVec3::new(
+            rng.range_i(-spread, spread),
+            rng.range_i(-dip, dip / 2),
+            rng.range_i(-spread, spread),
+        );
+        let target = apex + offset;
+
+        let reach = offset.as_vec3();
+        if reach.length_squared() > 1.0 {
+            // rasterize_branch advances ~0.55 voxel per step, so oversample
+            // the step count to actually span the offset.
+            let steps = (reach.length() * 1.9).ceil() as i32;
+            for block in rasterize_branch(apex, reach.normalize(), steps) {
+                for d in [
+                    IVec3::ZERO,
+                    IVec3::X,
+                    IVec3::Y,
+                    IVec3::Z,
+                    IVec3::new(1, 1, 0),
+                    IVec3::new(1, 0, 1),
+                    IVec3::new(0, 1, 1),
+                    IVec3::new(1, 1, 1),
+                ] {
+                    wood.insert(block + d);
+                }
+            }
+        }
+
+        cloud.extend(pom_foliage(rng, target, scale));
+    }
+    (wood, cloud)
+}
+
 /// Dense ellipsoid crown capping the whole tree — figs, banksias, beeches.
 /// Radii in inches.
 fn dome_canopy(rng: &mut GardenRng, trunk: &HashSet<IVec3>, rx_in: f32, ry_in: f32) -> HashSet<IVec3> {
@@ -937,6 +994,27 @@ mod tests {
                 total < 3_000_000,
                 "{species:?} generated {total} voxels — too heavy"
             );
+        }
+    }
+
+    /// Distant-canopy LOD: each coarser rung must cut the foliage mesh hard,
+    /// and never come out empty (a far tree with an invisible crown).
+    #[test]
+    fn foliage_lod_rungs_shrink_the_mesh() {
+        use crate::terrain::{build_culled_voxel_mesh, downsample_blocks};
+        let mut rng = GardenRng::new(0xB0AB);
+        let tree = generate_tree(TreeSpecies::MountainAsh, &mut rng);
+
+        let mut prev_verts = build_culled_voxel_mesh(&tree.foliage, 1.0).count_vertices();
+        for factor in [4, 16] {
+            let coarse = downsample_blocks(&tree.foliage, factor, 0.2);
+            assert!(!coarse.is_empty(), "factor {factor} erased the canopy");
+            let verts = build_culled_voxel_mesh(&coarse, factor as f32).count_vertices();
+            assert!(
+                verts * 4 < prev_verts,
+                "factor {factor} only got {verts} verts from {prev_verts} — LOD too weak"
+            );
+            prev_verts = verts;
         }
     }
 

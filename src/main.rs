@@ -9,15 +9,18 @@ mod world;
 
 use bevy::prelude::*;
 use bevy::asset::RenderAssetUsages;
-use bevy::pbr::{CascadeShadowConfigBuilder, DistanceFog, FogFalloff};
+use bevy::core_pipeline::bloom::Bloom;
+use bevy::pbr::{CascadeShadowConfigBuilder, DistanceFog, FogFalloff, NotShadowCaster};
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::RenderPlugin;
 use bevy::render::settings::{RenderCreation, WgpuSettings};
+use bevy::image::{ImageAddressMode, ImageSamplerDescriptor};
 use bevy::render::texture::ImagePlugin;
+use bevy::render::view::RenderLayers;
 use bevy::tasks::futures_lite::future;
 use bevy::tasks::{block_on, AsyncComputeTaskPool, Task};
 use bevy_flycam::prelude::*;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use australia::{biome_at_world, biome_display_name, biome_profile, pick_coastal_spawn, AussieBiome};
@@ -26,14 +29,14 @@ use chunk_store::{
 };
 use map_ui::{setup_map_ui, toggle_map_ui, update_map_ui, MapOverlay};
 use silhouettes::{
-    billboard_silhouettes, plan_tree_silhouettes, process_silhouette_queue,
-    setup_silhouette_assets, SilhouetteWorld,
+    billboard_silhouettes, orient_silhouette_shadows, plan_tree_silhouettes,
+    process_silhouette_queue, setup_silhouette_assets, SilhouetteWorld,
 };
 use terrain::{
-    apply_edits, build_culled_voxel_mesh, generate_chunk_blocks, spawn_terrain_meshes, BlockType,
+    apply_edits, build_culled_voxel_mesh, downsample_blocks, generate_chunk_blocks, BlockType,
     ChunkVoxels, TerrainMaterials, TerrainSurface,
 };
-use topography::surface_top_world_y;
+use topography::{is_cave_cell, surface_height_voxels, surface_top_world_y};
 use trees::{generate_tree, TreeSpecies, VoxelTreeData};
 use world::*;
 
@@ -63,14 +66,40 @@ struct WorldChunk {
     coord: IVec2,
 }
 
+/// Real trees still building asynchronously for a live chunk. The horizon
+/// cutouts watch this: a chunk's silhouette trees only retire once it hits
+/// zero, so a distant tree never vanishes before its real self stands up.
+#[derive(Component)]
+pub struct TreesPending(pub usize);
+
 /// Tracks which chunk columns are currently materialized in the ECS world.
 #[derive(Resource, Default)]
 struct ChunkWorld {
     loaded: HashMap<IVec2, Entity>,
     /// Live records for chunks still in the ECS — collapsed into [`ChunkArchive`] on unload.
     active_records: HashMap<IVec2, ChunkRecord>,
+    /// Chunks generating on the background pool right now.
+    pending: HashSet<IVec2>,
+    /// Actual per-column surface voxel of each live chunk (post-caves,
+    /// post-burrows-at-load). The gravity floor stands on THIS, not on the
+    /// height formula, which can disagree with the meshed terrain by a voxel.
+    surface_tops: HashMap<IVec2, Vec<i32>>,
     load_queue: VecDeque<IVec2>,
     last_player_chunk: Option<IVec2>,
+}
+
+/// Everything a background thread builds for one terrain chunk.
+struct BuiltChunk {
+    record: ChunkRecord,
+    mesh: Option<Mesh>,
+    column_tops: Vec<i32>,
+}
+
+/// An in-flight background chunk build; resolved by [`finish_chunk_tasks`].
+#[derive(Component)]
+struct PendingChunk {
+    task: Task<BuiltChunk>,
+    coord: IVec2,
 }
 
 #[derive(Resource, Default)]
@@ -83,16 +112,517 @@ struct LeafAssets {
     material: Handle<StandardMaterial>,
 }
 
+/// Optional player-authored skin for tree foliage blocks (`assets/foliage.png`).
+/// Painted in grayscale — each species' foliage colour multiplies it, so one
+/// texture skins every tree. Alpha in the texture makes leaf blocks semi-
+/// transparent. `None` (file absent) falls back to flat-colour foliage.
+#[derive(Resource, Default)]
+struct FoliageSkin(Option<Handle<Image>>);
+
 #[derive(Resource)]
 struct GameSounds {
     munch: Handle<AudioSource>,
+}
+
+/// Shared handles for worm castings — the little dark cube a worm leaves on
+/// the ground behind it after eating anything (dirt or leaf alike).
+#[derive(Resource)]
+struct CastingAssets {
+    mesh: Handle<Mesh>,
+    material: Handle<StandardMaterial>,
+}
+
+/// In-game radio: every track in `assets/music/` is in the rotation (drop a
+/// file in to add it). A song starts every [`SOUNDTRACK_INTERVAL_SECS`]; picks
+/// are random but never the same song twice in a row.
+#[derive(Resource)]
+struct Soundtrack {
+    tracks: Vec<Handle<AudioSource>>,
+    last_played: Option<usize>,
+    /// Time until the next song may start (a still-playing song delays it).
+    timer: Timer,
+    rng: GardenRng,
+}
+
+const SOUNDTRACK_INTERVAL_SECS: f32 = 5.0 * 60.0;
+
+/// Marks the currently playing soundtrack song (despawned when it ends).
+#[derive(Component)]
+struct SoundtrackSong;
+
+/// Global wind: a slowly wandering direction, gusts layered on, and a
+/// 0–5 strength that re-rolls every half-minute-or-so with a strong bias
+/// toward calm. 0 = nice still day; 5 = a gale that physically shoves the
+/// worm downwind. Streamers in the air show where it's blowing.
+#[derive(Resource)]
+struct Wind {
+    dir: Vec2,
+    /// 0 = dead calm … 5 = worm-shoving gale.
+    strength: f32,
+    target: f32,
+    next_shift_at: f32,
+    rng: GardenRng,
+}
+
+impl Default for Wind {
+    fn default() -> Self {
+        Self {
+            dir: Vec2::new(0.8, 0.6).normalize(),
+            strength: 1.0,
+            target: 1.0,
+            next_shift_at: 0.0,
+            rng: GardenRng::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0xB1FF),
+            ),
+        }
+    }
+}
+
+/// The gale threshold: above this the worm starts getting pushed.
+const WIND_PUSH_FROM: f32 = 4.0;
+
+/// A ribbon of air racing downwind past the worm — the wind made visible.
+/// Spawned upwind, despawned when it outlives itself or blows out of range.
+#[derive(Component)]
+struct WindStreamer {
+    age: f32,
+    life: f32,
+    speed: f32,
+    bob_phase: f32,
+}
+
+#[derive(Resource)]
+struct StreamerAssets {
+    mesh: Handle<Mesh>,
+    material: Handle<StandardMaterial>,
+}
+
+/// Keep a population of streamers proportional to wind strength flowing past
+/// the camera, all pointing (and moving) downwind.
+fn update_wind_streamers(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut wind: ResMut<Wind>,
+    assets: Res<StreamerAssets>,
+    chunk_world: Res<ChunkWorld>,
+    cam_q: Query<&Transform, (With<Camera>, Without<WindStreamer>)>,
+    mut streamers: Query<(Entity, &mut WindStreamer, &mut Transform), Without<Camera>>,
+) {
+    let Ok(cam) = cam_q.get_single() else {
+        return;
+    };
+    let cam_pos = cam.translation;
+    let dir3 = Vec3::new(wind.dir.x, 0.0, wind.dir.y);
+    let yaw = Quat::from_rotation_y((-wind.dir.y).atan2(wind.dir.x));
+    let dt = time.delta_secs();
+    let t = time.elapsed_secs();
+
+    let desired = (wind.strength * 6.0).round() as usize;
+
+    let mut alive = 0usize;
+    for (entity, mut streamer, mut tf) in &mut streamers {
+        streamer.age += dt;
+        tf.translation += dir3 * streamer.speed * dt;
+        tf.translation.y += (t * 2.3 + streamer.bob_phase).sin() * 0.3 * dt;
+        tf.rotation = yaw;
+
+        let gone_far = Vec2::new(tf.translation.x - cam_pos.x, tf.translation.z - cam_pos.z)
+            .length()
+            > 45.0;
+        if streamer.age > streamer.life || gone_far {
+            commands.entity(entity).despawn();
+        } else {
+            alive += 1;
+        }
+    }
+
+    // Top up toward the target population, a few per frame, seeded upwind so
+    // they stream past the worm.
+    let mut to_spawn = desired.saturating_sub(alive).min(3);
+    while to_spawn > 0 {
+        to_spawn -= 1;
+        let side = Vec3::new(-dir3.z, 0.0, dir3.x);
+        let mut pos = cam_pos - dir3 * wind.rng.range(8.0, 30.0)
+            + side * wind.rng.range(-18.0, 18.0)
+            + Vec3::Y * wind.rng.range(-0.5, 4.5);
+        pos.y = pos
+            .y
+            .max(ground_world_y(&chunk_world, pos.x, pos.z) + 0.25);
+
+        let speed = 4.0 + wind.strength * 3.0 + wind.rng.range(0.0, 2.0);
+        commands.spawn((
+            WindStreamer {
+                age: 0.0,
+                life: wind.rng.range(3.0, 6.0),
+                speed,
+                bob_phase: wind.rng.range(0.0, std::f32::consts::TAU),
+            },
+            Mesh3d(assets.mesh.clone()),
+            MeshMaterial3d(assets.material.clone()),
+            NotShadowCaster,
+            Transform {
+                translation: pos,
+                rotation: yaw,
+                ..default()
+            },
+        ));
+    }
+}
+
+/// Per-tree sway character, seeded from the tree itself: giants heave slowly,
+/// saplings flick about.
+#[derive(Component)]
+struct WindSway {
+    phase: f32,
+    /// Peak lean, radians.
+    amplitude: f32,
+    /// Oscillation rate, rad/s.
+    frequency: f32,
+}
+
+fn update_wind(time: Res<Time>, mut wind: ResMut<Wind>) {
+    let t = time.elapsed_secs();
+    // The wind slowly veers around the compass over tens of minutes.
+    let heading = t * 0.006 + (t * 0.019).sin() * 0.5;
+    wind.dir = Vec2::new(heading.cos(), heading.sin());
+
+    // Weather re-roll: six discrete levels on a quadratic likelihood curve,
+    // pinned at 50% for dead calm and 1% for a full 5/5 gale, the middle
+    // falling off as (1 - n/5)²:
+    //   0: 50.0%  1: 26.1%  2: 14.7%  3: 6.5%  4: 1.6%  5: 1.0%
+    if t >= wind.next_shift_at {
+        const WIND_LEVEL_CDF: [f32; 6] = [0.500, 0.7613, 0.9083, 0.9737, 0.9900, 1.0];
+        let roll = wind.rng.next_f32();
+        let level = WIND_LEVEL_CDF
+            .iter()
+            .position(|&cum| roll < cum)
+            .unwrap_or(5);
+        wind.target = level as f32;
+        wind.next_shift_at = t + wind.rng.range(30.0, 80.0);
+        println!("🌬️ Wind shifting toward {level}/5");
+    }
+    // Ease toward the target like real weather, not a light switch.
+    let blend = (time.delta_secs() * 0.06).min(1.0);
+    wind.strength += (wind.target - wind.strength) * blend;
+}
+
+/// Rock every tree around its base. Rotation pivots at the trunk root (tree
+/// meshes grow up from y=0), so the roots stay planted while the crown rides
+/// the gusts — the wood carries the leaves, so the whole canopy moves with it.
+fn sway_trees(
+    time: Res<Time>,
+    wind: Res<Wind>,
+    mut trees: Query<(&WindSway, &mut Transform), With<WildTree>>,
+    mut canopies: Query<
+        (&Parent, &mut Transform),
+        (With<FoliageLod>, Without<WildTree>),
+    >,
+    sway_of: Query<&WindSway>,
+) {
+    let t = time.elapsed_secs();
+    // Gusts: two slow sines beating against each other, 0..1.
+    let gust = 0.5 + 0.5 * ((t * 0.11).sin() * 0.6 + (t * 0.043).sin() * 0.4);
+    let lean_axis = Vec3::new(-wind.dir.y, 0.0, wind.dir.x);
+    // 0/5 = trees stand dead still; 5/5 = everything heaving.
+    let force = wind.strength / 5.0;
+
+    for (sway, mut tf) in &mut trees {
+        let wave = (t * sway.frequency + sway.phase).sin() * 0.7
+            + (t * sway.frequency * 2.3 + sway.phase * 1.7).sin() * 0.3;
+        let angle = force
+            * (sway.amplitude * (0.35 + 0.65 * gust) * wave
+                + sway.amplitude * 0.5 * gust); // steady downwind lean under the oscillation
+        tf.rotation = Quat::from_axis_angle(lean_axis, angle);
+    }
+
+    // Leaf flutter: the canopy stirs a touch faster than the trunk under it,
+    // and keeps a whisper of life even in light air.
+    let flutter_force = (0.08 + 0.92 * force).min(1.0);
+    for (parent, mut tf) in &mut canopies {
+        let Ok(sway) = sway_of.get(parent.get()) else {
+            continue;
+        };
+        let flutter = flutter_force
+            * sway.amplitude
+            * 0.35
+            * (0.3 + 0.7 * gust)
+            * (t * sway.frequency * 2.9 + sway.phase * 2.3).sin();
+        tf.rotation = Quat::from_axis_angle(lean_axis, flutter);
+    }
+}
+
+/// Foliage LOD ladder: block-size multipliers per level (2″ → 8″ → 32″ leaf
+/// blocks) and the switch-over distances in feet. Distance is measured from
+/// the camera to the canopy's bounding *sphere*, so the crown of a giant goes
+/// coarse even while you stand at its trunk — 2-inch blocks 400 ft overhead
+/// are wasted triangles either way.
+const FOLIAGE_LOD_FACTORS: [i32; 3] = [1, 4, 16];
+const FOLIAGE_LOD_DISTANCES_FT: [f32; 2] = [25.0, 100.0];
+/// Minimum fraction of fine voxels a coarse cell needs to survive downsampling.
+const FOLIAGE_LOD_FILL: f32 = 0.2;
+
+/// On the tree root: canopy bounding sphere (tree-local) for LOD selection.
+#[derive(Component)]
+struct FoliageLodGroup {
+    center: Vec3,
+    radius: f32,
+}
+
+/// On each foliage mesh child: which rung of the LOD ladder it is.
+#[derive(Component)]
+struct FoliageLod {
+    level: usize,
+}
+
+/// Worm gravity. The little guy has weight: no god mode, no hovering — he
+/// falls to the ground and stays on it. `G` toggles god mode (free flight,
+/// the old behaviour) for inspecting the giants.
+const GRAVITY_FT_S2: f32 = 32.0;
+const TERMINAL_FALL_FT_S: f32 = 90.0;
+
+#[derive(Resource)]
+struct GodMode {
+    enabled: bool,
+    fall_speed: f32,
+    /// Current upward stretch from holding Space — a worm can *reach*, not
+    /// jump (jumping waits for the "legs" branch of the skill tree).
+    reach: f32,
+}
+
+impl GodMode {
+    fn from_env() -> Self {
+        // A debug start high in the air implies you want to fly around it.
+        let enabled = std::env::var("GARDN_HIGH").is_ok_and(|v| v.trim().parse::<f32>().is_ok());
+        Self {
+            enabled,
+            fall_speed: 0.0,
+            reach: 0.0,
+        }
+    }
+}
+
+fn toggle_god_mode(keys: Res<ButtonInput<KeyCode>>, mut god: ResMut<GodMode>) {
+    if keys.just_pressed(KeyCode::KeyG) {
+        god.enabled = !god.enabled;
+        god.fall_speed = 0.0;
+        if god.enabled {
+            println!("👼 God mode ON — free flight.");
+        } else {
+            println!("🪱 God mode OFF — gravity has you.");
+        }
+    }
+}
+
+/// The ground under (x, z): the terrain surface, sunk through natural caves
+/// and any voxels the worm has eaten — digging (or a cave mouth) really
+/// lowers your floor.
+fn ground_world_y(chunk_world: &ChunkWorld, x: f32, z: f32) -> f32 {
+    let surface = surface_height_voxels(x, z);
+    let vx = (x / VOXEL_SIZE).floor() as i32;
+    let vz = (z / VOXEL_SIZE).floor() as i32;
+    let coord = IVec2::new(vx.div_euclid(CHUNK_VOXELS), vz.div_euclid(CHUNK_VOXELS));
+    let local_x = vx.rem_euclid(CHUNK_VOXELS);
+    let local_z = vz.rem_euclid(CHUNK_VOXELS);
+
+    // Live chunks know their REAL per-column surface (post-caves, post-load
+    // burrows) — the formula can be a voxel or two off the meshed terrain,
+    // which used to leave the worm hovering over (or clipping into) a freshly
+    // eaten floor. Fall back to the formula only for unloaded ground.
+    let cached = chunk_world
+        .surface_tops
+        .get(&coord)
+        .map(|tops| tops[(local_z * CHUNK_VOXELS + local_x) as usize]);
+    let mut top = cached.unwrap_or(surface);
+
+    let record = chunk_world.active_records.get(&coord);
+    let bedrock = surface - CHUNK_DEPTH_VOXELS + 2;
+    while top > bedrock {
+        let eaten = record.is_some_and(|r| r.edits.contains(&IVec3::new(local_x, top, local_z)));
+        // Cached tops already account for caves; only this session's fresh
+        // bites need the descent. Formula fallback also sinks through caves.
+        if eaten || (cached.is_none() && is_cave_cell(vx, top, vz, surface)) {
+            top -= 1;
+        } else {
+            break;
+        }
+    }
+    (top + 1) as f32 * VOXEL_SIZE
+}
+
+/// Pull the worm down to the ground unless god mode is on. Runs after the
+/// flycam has moved the camera, just before transforms propagate.
+fn worm_gravity(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    wind: Res<Wind>,
+    mut god: ResMut<GodMode>,
+    chunk_world: Res<ChunkWorld>,
+    mut cam_q: Query<&mut Transform, With<Camera>>,
+) {
+    if god.enabled {
+        return;
+    }
+    let Ok(mut tf) = cam_q.get_single_mut() else {
+        return;
+    };
+
+    // A gale shoves the worm downwind — above 4/5 the push outpaces crawling
+    // into it, so find shelter or get blown across the paddock.
+    if wind.strength > WIND_PUSH_FROM {
+        let shove = (wind.strength - WIND_PUSH_FROM) * 2.2 * time.delta_secs();
+        tf.translation.x += wind.dir.x * shove;
+        tf.translation.z += wind.dir.y * shove;
+    }
+
+    let here = ground_world_y(&chunk_world, tf.translation.x, tf.translation.z);
+
+    // Pre-climb: peek a couple of voxels ahead on each axis and mount small
+    // ledges *before* touching them, so the worm rides up onto a block
+    // instead of clipping into its face first. Rises taller than a step
+    // (real walls and cliffs) don't trigger it.
+    const CLIMB_LOOKAHEAD_FT: f32 = 2.5 * VOXEL_SIZE;
+    const MAX_STEP_FT: f32 = 8.0 * VOXEL_SIZE;
+    let mut floor = here;
+    for (dx, dz) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+        let ahead = ground_world_y(
+            &chunk_world,
+            tf.translation.x + dx * CLIMB_LOOKAHEAD_FT,
+            tf.translation.z + dz * CLIMB_LOOKAHEAD_FT,
+        );
+        if ahead > floor && ahead - here <= MAX_STEP_FT {
+            floor = ahead;
+        }
+    }
+
+    // Space = reach: the worm stretches up to a full extra worm-length to get
+    // its mouth at higher blocks. No jumping — that's a legs feature.
+    let reach_target = if keys.pressed(KeyCode::Space) {
+        WORM_REACH
+    } else {
+        0.0
+    };
+    let blend = (time.delta_secs() * 10.0).min(1.0);
+    god.reach += (reach_target - god.reach) * blend;
+
+    let stand = floor + WORM_EYE_HEIGHT + god.reach;
+
+    // The flycam still nudges Y a little each frame (Space/Shift); anything
+    // within a small tolerance of standing height counts as grounded and gets
+    // snapped, so those nudges can't accumulate into a hover.
+    if tf.translation.y > stand + 0.05 {
+        god.fall_speed =
+            (god.fall_speed + GRAVITY_FT_S2 * time.delta_secs()).min(TERMINAL_FALL_FT_S);
+        tf.translation.y = (tf.translation.y - god.fall_speed * time.delta_secs()).max(stand);
+    } else {
+        // Grounded (or crawling uphill): hug the surface.
+        tf.translation.y = stand;
+    }
+    if tf.translation.y <= stand {
+        god.fall_speed = 0.0;
+    }
+}
+
+/// One full sun cycle every 24 real hours. The clock starts at
+/// [`GAME_START_HOUR`] when the app launches; GARDN_HOUR=<0-24> overrides the
+/// starting hour (e.g. `GARDN_HOUR=0` to see the moonlit night right away).
+const DAY_LENGTH_SECS: f32 = 24.0 * 3600.0;
+const GAME_START_HOUR: f32 = 8.0;
+/// How far from the camera the sun/moon discs float — past the fog's end
+/// (680 ft) but inside the far clip (1000 ft); unlit materials skip fog, so
+/// they burn through the haze.
+const CELESTIAL_DISTANCE_FT: f32 = 880.0;
+
+#[derive(Resource)]
+struct DayCycle {
+    start_frac: f32,
+}
+
+impl DayCycle {
+    fn from_env() -> Self {
+        let hour = std::env::var("GARDN_HOUR")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(GAME_START_HOUR);
+        println!("🕗 Day cycle: starting the 24-hour clock at {hour:.1}h.");
+        Self {
+            start_frac: (hour / 24.0).rem_euclid(1.0),
+        }
+    }
+}
+
+/// A directional light driven around the sky by the day cycle.
+#[derive(Component)]
+struct CelestialLight {
+    is_sun: bool,
+}
+
+/// Current to-sun direction, updated by the day cycle — the silhouette shadow
+/// planes orient themselves by it so cutout shadows track the real sun.
+#[derive(Resource)]
+pub struct SunDirection(pub Vec3);
+
+/// Fades a freshly spawned thing in by ramping its material's base-colour
+/// alpha from 0, then restores the steady-state alpha mode (and optionally
+/// swaps back to a shared material) so nothing pays transparency costs
+/// forever. Attach to the entity holding the material.
+#[derive(Component)]
+pub struct FadeIn {
+    pub material: Handle<StandardMaterial>,
+    pub timer: Timer,
+    pub final_alpha_mode: AlphaMode,
+    /// Swap to this (shared) material once done, releasing the fade clone.
+    pub swap_to: Option<Handle<StandardMaterial>>,
+}
+
+const TREE_FADE_SECS: f32 = 1.6;
+pub const GROUND_FADE_SECS: f32 = 1.2;
+
+fn fade_in_materials(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut fades: Query<(Entity, &mut FadeIn)>,
+) {
+    for (entity, mut fade) in &mut fades {
+        fade.timer.tick(time.delta());
+        let t = fade.timer.fraction();
+        let eased = t * t * (3.0 - 2.0 * t);
+
+        if let Some(mat) = materials.get_mut(&fade.material) {
+            mat.base_color = mat.base_color.with_alpha(eased);
+            if fade.timer.finished() {
+                mat.base_color = mat.base_color.with_alpha(1.0);
+                mat.alpha_mode = fade.final_alpha_mode;
+            }
+        }
+
+        if fade.timer.finished() {
+            if let Some(shared) = fade.swap_to.take() {
+                commands.entity(entity).insert(MeshMaterial3d(shared));
+            }
+            commands.entity(entity).remove::<FadeIn>();
+        }
+    }
+}
+
+/// The visible unlit disc for a celestial body, re-anchored to the camera each
+/// frame so it always hangs at the same sky position.
+#[derive(Component)]
+struct CelestialDisc {
+    is_sun: bool,
 }
 
 /// Everything the render world needs for one finished tree, produced on a
 /// background compute thread so 650-ft giants never hitch the frame.
 struct BuiltTree {
     bark_mesh: Mesh,
-    foliage_mesh: Mesh,
+    /// One foliage mesh per LOD level, finest first.
+    foliage_meshes: [Mesh; FOLIAGE_LOD_FACTORS.len()],
+    foliage_center: Vec3,
+    foliage_radius: f32,
     bark_color: Color,
     foliage_color: Color,
 }
@@ -104,6 +634,7 @@ struct PendingTree {
     chunk_entity: Entity,
     local_base: Vec3,
     species: TreeSpecies,
+    tree_seed: u64,
 }
 
 /// A completed bite: which voxel came out of which chunk, plus the freshly
@@ -125,7 +656,16 @@ struct PendingBurrow {
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins
-            .set(ImagePlugin::default_nearest())
+            // Nearest for the pixel-art look; Repeat so block-skin UVs that run
+            // 0..len across merged voxel strips tile instead of smearing.
+            .set(ImagePlugin {
+                default_sampler: ImageSamplerDescriptor {
+                    address_mode_u: ImageAddressMode::Repeat,
+                    address_mode_v: ImageAddressMode::Repeat,
+                    address_mode_w: ImageAddressMode::Repeat,
+                    ..ImageSamplerDescriptor::nearest()
+                },
+            })
             .set(WindowPlugin {
                 primary_window: Some(Window {
                     title: "gardn".into(),
@@ -150,6 +690,10 @@ fn main() {
             ..default()
         })
         .insert_resource(ClearColor(Color::srgb(0.58, 0.72, 0.88))) // Soft garden sky
+        .insert_resource(DayCycle::from_env())
+        .insert_resource(GodMode::from_env())
+        .insert_resource(SunDirection(Vec3::new(0.6, 0.6, 0.35).normalize()))
+        .init_resource::<Wind>()
         .init_resource::<ChunkWorld>()
         .init_resource::<ChunkArchive>()
         .init_resource::<TreeSpawnQueue>()
@@ -174,6 +718,7 @@ fn main() {
             (
                 plan_chunk_streaming,
                 process_chunk_load_queue,
+                finish_chunk_tasks,
                 start_tree_build_tasks,
                 finish_tree_build_tasks,
                 plan_tree_silhouettes,
@@ -187,10 +732,24 @@ fn main() {
             Update,
             (
                 billboard_silhouettes,
+                orient_silhouette_shadows,
+                update_foliage_lod,
+                update_wind,
+                sway_trees,
+                update_wind_streamers,
+                update_day_cycle,
+                fade_in_materials,
+                run_soundtrack,
+                toggle_god_mode,
                 toggle_map_ui,
                 update_map_ui,
                 animate_floating_leaves,
             ),
+        )
+        // After the flycam has moved the camera, before transforms propagate.
+        .add_systems(
+            PostUpdate,
+            worm_gravity.before(bevy::transform::TransformSystem::TransformPropagate),
         )
         .add_systems(PostStartup, (lower_worm_camera, plan_chunk_streaming))
         .run();
@@ -204,6 +763,7 @@ fn setup_garden(
     asset_server: Res<AssetServer>,
 ) {
     commands.insert_resource(TerrainMaterials::new(&mut materials));
+    println!("🐛 Controls: WASD crawl · Space stretch/reach · E eat/burrow · M map · G god mode (flight)");
 
     // 3D leaves: extruded from the higher-res pixel art leaf.png with jagged 8-bit outline following the sprite pixels exactly
     // (coffee-coaster scale). The mesh itself is the leaf silhouette; spins/bobs
@@ -228,10 +788,43 @@ fn setup_garden(
         munch: asset_server.load("sounds/munch.wav"),
     });
 
+    commands.insert_resource(CastingAssets {
+        mesh: meshes.add(Cuboid::from_length(VOXEL_SIZE)),
+        material: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.26, 0.19, 0.13),
+            perceptual_roughness: 1.0,
+            ..default()
+        }),
+    });
+
+    // Wind streamers: pale ribbons ~1.4 ft long, faintly translucent, unlit
+    // so they read as moving air rather than solid geometry.
+    commands.insert_resource(StreamerAssets {
+        mesh: meshes.add(Cuboid::new(1.4, 0.02, 0.02)),
+        material: materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 1.0, 1.0, 0.38),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            ..default()
+        }),
+    });
+
+    // Foliage block skin is optional — probe the disk so a missing file means
+    // clean flat-colour fallback instead of a pink error texture.
+    let foliage_skin = std::path::Path::new("assets/foliage.png")
+        .exists()
+        .then(|| asset_server.load("foliage.png"));
+    commands.insert_resource(FoliageSkin(foliage_skin));
+
     // Sun light — shadows on, so open canopies throw dappled light shafts onto
     // the forest floor. Tight first cascade keeps shadow detail crisp at worm
-    // eye level; the far cascades cover the giants overhead.
+    // eye level; the far cascades cover the giants overhead. The day cycle
+    // steers its direction, colour, and strength every frame.
+    // Layer 1 holds the invisible sun-facing shadow planes of the horizon
+    // cutouts: the camera (layer 0) never draws them, but the lights see both
+    // layers, so distant cutout trees still throw tree-shaped shadows.
     commands.spawn((
+        CelestialLight { is_sun: true },
         DirectionalLight {
             illuminance: 11_000.0,
             shadows_enabled: true,
@@ -244,7 +837,60 @@ fn setup_garden(
             ..default()
         }
         .build(),
+        RenderLayers::from_layers(&[0, 1]),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.9, 0.7, 0.0)),
+    ));
+
+    // Full moon, always opposite the sun — the night is never pitch black.
+    commands.spawn((
+        CelestialLight { is_sun: false },
+        DirectionalLight {
+            illuminance: 0.0,
+            color: Color::srgb(0.72, 0.80, 1.0),
+            shadows_enabled: false,
+            ..default()
+        },
+        CascadeShadowConfigBuilder {
+            num_cascades: 2,
+            first_cascade_far_bound: 12.0,
+            maximum_distance: 160.0,
+            ..default()
+        }
+        .build(),
+        RenderLayers::from_layers(&[0, 1]),
+        Transform::default(),
+    ));
+
+    // The bodies themselves: unlit spheres that ignore fog, hung well past the
+    // fog wall so they read as sky, not scenery.
+    commands.spawn((
+        CelestialDisc { is_sun: true },
+        Mesh3d(meshes.add(Sphere::new(34.0))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            // Pure HDR emitter (unlit would discard emissive): with bloom on
+            // the camera the disc blazes a brilliant white halo instead of
+            // reading as a flat dot. fog_enabled: false so the fog wall at
+            // 680 ft can't swallow it.
+            base_color: Color::BLACK,
+            emissive: LinearRgba::rgb(40.0, 39.0, 36.0),
+            fog_enabled: false,
+            ..default()
+        })),
+        NotShadowCaster,
+        Transform::default(),
+    ));
+    commands.spawn((
+        CelestialDisc { is_sun: false },
+        Mesh3d(meshes.add(Sphere::new(24.0))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            // A gentle glow — moonlight, not a second sun.
+            base_color: Color::BLACK,
+            emissive: LinearRgba::rgb(1.6, 1.8, 2.4),
+            fog_enabled: false,
+            ..default()
+        })),
+        NotShadowCaster,
+        Transform::default(),
     ));
 
     commands.insert_resource(AmbientLight {
@@ -252,11 +898,46 @@ fn setup_garden(
         brightness: 70.0,
     });
 
-    // Background music, looping for the whole session.
-    commands.spawn((
-        AudioPlayer::new(asset_server.load("music/gardnr.mp3")),
-        PlaybackSettings::LOOP,
-    ));
+    // Soundtrack rotation: every audio file in assets/music/ is a track.
+    // The first song starts right away; run_soundtrack spaces out the rest.
+    let mut tracks = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("assets/music") {
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| {
+                let lower = n.to_lowercase();
+                // Only formats compiled into the build (Cargo features).
+                lower.ends_with(".mp3") || lower.ends_with(".wav")
+            })
+            .collect();
+        names.sort();
+        for name in names {
+            tracks.push(asset_server.load(format!("music/{name}")));
+        }
+    }
+    let mut soundtrack = Soundtrack {
+        tracks,
+        last_played: None,
+        timer: Timer::from_seconds(SOUNDTRACK_INTERVAL_SECS, TimerMode::Once),
+        rng: GardenRng::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x50D4),
+        ),
+    };
+    if !soundtrack.tracks.is_empty() {
+        let first = (soundtrack.rng.next_f32() * soundtrack.tracks.len() as f32) as usize
+            % soundtrack.tracks.len();
+        commands.spawn((
+            SoundtrackSong,
+            AudioPlayer::new(soundtrack.tracks[first].clone()),
+            PlaybackSettings::DESPAWN,
+        ));
+        soundtrack.last_played = Some(first);
+    }
+    commands.insert_resource(soundtrack);
 }
 
 /// Pick a fresh spot on a green stretch of coastline for this launch and pin it
@@ -312,7 +993,25 @@ fn start_tree_build_tasks(
             // Bark and foliage are both rasterised on the world voxel grid —
             // one block size for the whole world.
             let bark_mesh = build_culled_voxel_mesh(&tree.bark, VOXEL_SIZE);
-            let foliage_mesh = build_culled_voxel_mesh(&tree.foliage, VOXEL_SIZE);
+            let foliage_meshes = FOLIAGE_LOD_FACTORS.map(|factor| {
+                if factor == 1 {
+                    build_culled_voxel_mesh(&tree.foliage, VOXEL_SIZE)
+                } else {
+                    let coarse = downsample_blocks(&tree.foliage, factor, FOLIAGE_LOD_FILL);
+                    build_culled_voxel_mesh(&coarse, VOXEL_SIZE * factor as f32)
+                }
+            });
+
+            // Canopy bounding sphere (tree-local feet) for distance-based LOD.
+            let mut min = Vec3::splat(f32::MAX);
+            let mut max = Vec3::splat(f32::MIN);
+            for v in &tree.foliage {
+                let p = v.as_vec3() * VOXEL_SIZE;
+                min = min.min(p);
+                max = max.max(p);
+            }
+            let foliage_center = (min + max) * 0.5;
+            let foliage_radius = (max - min).length() * 0.5;
             let bark_color = Color::srgb(
                 rng.range(bark.0 - 0.05, bark.0 + 0.05),
                 rng.range(bark.1 - 0.05, bark.1 + 0.05),
@@ -325,7 +1024,9 @@ fn start_tree_build_tasks(
             );
             BuiltTree {
                 bark_mesh,
-                foliage_mesh,
+                foliage_meshes,
+                foliage_center,
+                foliage_radius,
                 bark_color,
                 foliage_color,
             }
@@ -336,6 +1037,7 @@ fn start_tree_build_tasks(
             chunk_entity: job.chunk_entity,
             local_base: job.local_base,
             species,
+            tree_seed,
         });
         in_flight += 1;
     }
@@ -346,8 +1048,9 @@ fn finish_tree_build_tasks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    foliage_skin: Res<FoliageSkin>,
     mut pending_q: Query<(Entity, &mut PendingTree)>,
-    live_chunks: Query<(), With<WorldChunk>>,
+    mut tree_counts: Query<&mut TreesPending, With<WorldChunk>>,
 ) {
     for (holder, mut pending) in &mut pending_q {
         let Some(built) = block_on(future::poll_once(&mut pending.task)) else {
@@ -355,38 +1058,109 @@ fn finish_tree_build_tasks(
         };
 
         // The chunk may have streamed out while the tree was building.
-        if live_chunks.get(pending.chunk_entity).is_ok() {
+        if let Ok(mut count) = tree_counts.get_mut(pending.chunk_entity) {
+            count.0 = count.0.saturating_sub(1);
             let bark_mesh = meshes.add(built.bark_mesh);
-            let foliage_mesh = meshes.add(built.foliage_mesh);
+            let foliage_meshes = built.foliage_meshes.map(|m| meshes.add(m));
+            // Trees fade in over a second and a half instead of popping:
+            // materials start fully transparent and FadeIn ramps them up,
+            // restoring the cheap steady-state alpha mode afterwards.
             let bark_material = materials.add(StandardMaterial {
-                base_color: built.bark_color,
+                base_color: built.bark_color.with_alpha(0.0),
+                alpha_mode: AlphaMode::Blend,
                 ..default()
             });
+            // The species tint multiplies the (grayscale) skin texture, so one
+            // player-drawn foliage.png colours itself per tree. Texture alpha
+            // needs blending; flat colour stays opaque (cheaper, no sorting).
+            // Strand-like foliage (fern fronds, casuarina needles) is drawn as
+            // thin ribbons of blocks — the cutout skin shreds those, so they
+            // stay solid.
+            let strand_foliage = matches!(
+                pending.species,
+                TreeSpecies::TreeFern | TreeSpecies::DesertOak
+            );
+            let skin = if strand_foliage {
+                None
+            } else {
+                foliage_skin.0.clone()
+            };
+            let foliage_final_mode = if skin.is_some() {
+                AlphaMode::Blend
+            } else {
+                AlphaMode::Opaque
+            };
             let foliage_material = materials.add(StandardMaterial {
-                base_color: built.foliage_color,
+                base_color: built.foliage_color.with_alpha(0.0),
+                alpha_mode: AlphaMode::Blend,
+                base_color_texture: skin,
                 ..default()
             });
 
             let species = pending.species;
             let local_base = pending.local_base;
+
+            // Sway character scales with stature: giants heave in slow, small
+            // arcs; scrub whips about. Seeded per tree so a forest never rocks
+            // in unison.
+            let mut sway_rng = GardenRng::new(pending.tree_seed ^ 0x57A9_11FE);
+            let stature_ft = built.foliage_center.y.max(10.0);
+            let wind_sway = WindSway {
+                phase: sway_rng.range(0.0, std::f32::consts::TAU),
+                amplitude: (0.006 + 2.5 / stature_ft).min(0.03)
+                    + sway_rng.range(0.0, 0.004),
+                frequency: (60.0 / stature_ft).clamp(0.25, 2.0)
+                    * sway_rng.range(0.85, 1.15),
+            };
+
             commands.entity(pending.chunk_entity).with_children(|trees| {
                 trees
                     .spawn((
                         WildTree { species },
+                        wind_sway,
+                        FoliageLodGroup {
+                            center: built.foliage_center,
+                            radius: built.foliage_radius,
+                        },
                         Visibility::default(),
                         Transform::from_translation(local_base),
                     ))
                     .with_children(|tree_root| {
                         tree_root.spawn((
                             Mesh3d(bark_mesh),
-                            MeshMaterial3d(bark_material),
+                            MeshMaterial3d(bark_material.clone()),
                             Transform::IDENTITY,
+                            FadeIn {
+                                material: bark_material,
+                                timer: Timer::from_seconds(TREE_FADE_SECS, TimerMode::Once),
+                                final_alpha_mode: AlphaMode::Opaque,
+                                swap_to: None,
+                            },
                         ));
-                        tree_root.spawn((
-                            Mesh3d(foliage_mesh),
-                            MeshMaterial3d(foliage_material),
-                            Transform::IDENTITY,
-                        ));
+                        // All LOD rungs spawn hidden; update_foliage_lod shows
+                        // the right one on the next frame. The foliage material
+                        // is shared across rungs, so one FadeIn (on rung 0)
+                        // fades whichever rung is showing.
+                        for (level, mesh) in foliage_meshes.into_iter().enumerate() {
+                            let mut rung = tree_root.spawn((
+                                FoliageLod { level },
+                                Mesh3d(mesh),
+                                MeshMaterial3d(foliage_material.clone()),
+                                Transform::IDENTITY,
+                                Visibility::Hidden,
+                            ));
+                            if level == 0 {
+                                rung.insert(FadeIn {
+                                    material: foliage_material.clone(),
+                                    timer: Timer::from_seconds(
+                                        TREE_FADE_SECS,
+                                        TimerMode::Once,
+                                    ),
+                                    final_alpha_mode: foliage_final_mode,
+                                    swap_to: None,
+                                });
+                            }
+                        }
                     });
             });
         }
@@ -395,29 +1169,168 @@ fn finish_tree_build_tasks(
     }
 }
 
-fn load_chunk(
-    commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
-    terrain_materials: &TerrainMaterials,
-    record: &ChunkRecord,
-) -> Entity {
-    let coord = record.coord;
-    let origin = chunk_world_origin(coord);
+/// Swap each tree's foliage mesh by distance: full 2-inch leaf blocks up
+/// close, bigger averaged blocks farther out. Distance is to the canopy's
+/// bounding sphere, so height counts — a giant's crown coarsens even from
+/// directly below, and sharpens again if you ever get up there.
+fn update_foliage_lod(
+    cam_q: Query<&Transform, With<Camera>>,
+    trees: Query<(&GlobalTransform, &FoliageLodGroup, &Children)>,
+    mut lods: Query<(&FoliageLod, &mut Visibility)>,
+) {
+    let Ok(cam) = cam_q.get_single() else {
+        return;
+    };
+    let cam_pos = cam.translation;
 
-    let chunk_entity = commands
-        .spawn((
-            WorldChunk { coord },
-            Transform::from_translation(origin),
-            Visibility::default(),
-        ))
-        .id();
+    for (tree_tf, group, children) in &trees {
+        let center = tree_tf.translation() + group.center;
+        let dist = (cam_pos - center).length() - group.radius;
+        let level = FOLIAGE_LOD_DISTANCES_FT
+            .iter()
+            .position(|&cutoff| dist < cutoff)
+            .unwrap_or(FOLIAGE_LOD_DISTANCES_FT.len());
 
-    let mut blocks = generate_chunk_blocks(coord, origin, record.terrain_seed);
-    // Re-open any burrows the worm has eaten here on previous visits.
-    apply_edits(&mut blocks, &record.edits);
-    spawn_terrain_meshes(commands, chunk_entity, meshes, terrain_materials, blocks);
+        for child in children {
+            let Ok((lod, mut vis)) = lods.get_mut(*child) else {
+                continue;
+            };
+            let want = if lod.level == level {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+            if *vis != want {
+                *vis = want;
+            }
+        }
+    }
+}
 
-    chunk_entity
+/// Start the next soundtrack song once the interval has elapsed — random pick,
+/// never the same song twice in a row. A song that outlasts the interval is
+/// never cut off; the next one starts when it ends.
+fn run_soundtrack(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut soundtrack: ResMut<Soundtrack>,
+    playing: Query<(), With<SoundtrackSong>>,
+) {
+    soundtrack.timer.tick(time.delta());
+    if !soundtrack.timer.finished() || !playing.is_empty() || soundtrack.tracks.is_empty() {
+        return;
+    }
+
+    let n = soundtrack.tracks.len();
+    let mut pick = (soundtrack.rng.next_f32() * n as f32) as usize % n;
+    if n > 1 && Some(pick) == soundtrack.last_played {
+        pick = (pick + 1) % n;
+    }
+
+    commands.spawn((
+        SoundtrackSong,
+        AudioPlayer::new(soundtrack.tracks[pick].clone()),
+        PlaybackSettings::DESPAWN,
+    ));
+    soundtrack.last_played = Some(pick);
+    soundtrack.timer.reset();
+}
+
+/// Walk the sun (and the full moon opposite it) across the sky on a real
+/// 24-hour clock, retinting sky, fog, and ambient light to match. The moon
+/// takes over lighting at night so the world is always readable.
+fn update_day_cycle(
+    time: Res<Time>,
+    day: Res<DayCycle>,
+    mut clear: ResMut<ClearColor>,
+    mut ambient: ResMut<AmbientLight>,
+    mut sun_direction: ResMut<SunDirection>,
+    mut cam_q: Query<(&Transform, Option<&mut DistanceFog>), With<Camera>>,
+    mut lights: Query<(&CelestialLight, &mut DirectionalLight, &mut Transform), Without<Camera>>,
+    mut discs: Query<
+        (&CelestialDisc, &mut Transform, &mut Visibility),
+        (Without<Camera>, Without<CelestialLight>),
+    >,
+) {
+    let frac = (day.start_frac + time.elapsed_secs() / DAY_LENGTH_SECS).rem_euclid(1.0);
+    // 0.25 of the cycle = 6:00 — sunrise on the eastern horizon.
+    let angle = (frac - 0.25) * std::f32::consts::TAU;
+    // Slight southward tilt keeps noon shadows from collapsing to nothing.
+    let sun_dir = Vec3::new(angle.cos(), angle.sin(), 0.35).normalize();
+    let moon_dir = -sun_dir;
+    let elev = sun_dir.y;
+    // The cutout shadow planes face whichever body is casting shadows.
+    sun_direction.0 = if elev >= 0.0 { sun_dir } else { moon_dir };
+
+    let day_t = (elev * 3.0).clamp(0.0, 1.0);
+    let dusk_t = ((elev + 0.15) / 0.15).clamp(0.0, 1.0);
+    let moon_t = (-elev * 3.0).clamp(0.0, 1.0);
+
+    // Five-stop sky: proper BLUE all day, and sundown walks blue → yellow →
+    // orange → dark. Night is never black — the full moon on the other side
+    // of the sky lifts it with a cool white sheen.
+    const DAY_SKY: Vec3 = Vec3::new(0.34, 0.58, 0.96);
+    const GOLD_SKY: Vec3 = Vec3::new(0.92, 0.80, 0.48);
+    const ORANGE_SKY: Vec3 = Vec3::new(0.96, 0.52, 0.26);
+    const NIGHT_SKY: Vec3 = Vec3::new(0.07, 0.09, 0.17);
+    const MOON_SHEEN: Vec3 = Vec3::new(0.18, 0.21, 0.30);
+
+    let sky = if elev >= 0.35 {
+        DAY_SKY
+    } else if elev >= 0.15 {
+        GOLD_SKY.lerp(DAY_SKY, (elev - 0.15) / 0.20)
+    } else if elev >= 0.0 {
+        ORANGE_SKY.lerp(GOLD_SKY, elev / 0.15)
+    } else {
+        NIGHT_SKY.lerp(MOON_SHEEN, moon_t).lerp(ORANGE_SKY, dusk_t)
+    };
+    let sky_color = Color::srgb(sky.x, sky.y, sky.z);
+    clear.0 = sky_color;
+
+    ambient.brightness = 16.0 + 54.0 * day_t;
+    // Ambient follows the same walk: blue daylight, golden dusk, moon-white night.
+    let amb = Vec3::new(0.55, 0.62, 0.85)
+        .lerp(Vec3::new(0.78, 0.86, 1.0), day_t)
+        .lerp(Vec3::new(0.95, 0.85, 0.62), (1.0 - day_t) * (dusk_t * dusk_t));
+    ambient.color = Color::srgb(amb.x, amb.y, amb.z);
+
+    for (light, mut dl, mut tf) in &mut lights {
+        if light.is_sun {
+            dl.illuminance = 24_000.0 * elev.max(0.0).powf(0.6);
+            let warm = Vec3::new(1.0, 0.60, 0.35).lerp(Vec3::new(1.0, 0.98, 0.94), day_t);
+            dl.color = Color::srgb(warm.x, warm.y, warm.z);
+            // Hand the (expensive) shadow pass to whichever body is up.
+            dl.shadows_enabled = elev > 0.02;
+            tf.look_to(-sun_dir, Vec3::Y);
+        } else {
+            dl.illuminance = 420.0 * moon_t;
+            dl.shadows_enabled = elev < -0.02;
+            tf.look_to(-moon_dir, Vec3::Y);
+        }
+    }
+
+    let Ok((cam_tf, fog)) = cam_q.get_single_mut() else {
+        return;
+    };
+    let cam_pos = cam_tf.translation;
+    if let Some(mut fog) = fog {
+        fog.color = sky_color;
+        let glow = Vec3::new(1.0, 0.95, 0.85).lerp(Vec3::new(0.75, 0.82, 1.0), moon_t);
+        fog.directional_light_color = Color::srgba(glow.x, glow.y, glow.z, 0.6);
+    }
+
+    for (disc, mut tf, mut vis) in &mut discs {
+        let dir = if disc.is_sun { sun_dir } else { moon_dir };
+        tf.translation = cam_pos + dir * CELESTIAL_DISTANCE_FT;
+        let want = if dir.y > -0.05 {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != want {
+            *vis = want;
+        }
+    }
 }
 
 fn despawn_entity_tree(entity: Entity, commands: &mut Commands) {
@@ -456,7 +1369,10 @@ fn plan_chunk_streaming(
     for dx in -CHUNK_VIEW_DISTANCE..=CHUNK_VIEW_DISTANCE {
         for dz in -CHUNK_VIEW_DISTANCE..=CHUNK_VIEW_DISTANCE {
             let coord = player_chunk + IVec2::new(dx, dz);
-            if chunk_world.loaded.contains_key(&coord) || chunk_is_queued(&chunk_world, coord) {
+            if chunk_world.loaded.contains_key(&coord)
+                || chunk_world.pending.contains(&coord)
+                || chunk_is_queued(&chunk_world, coord)
+            {
                 continue;
             }
             needed.push(coord);
@@ -480,6 +1396,7 @@ fn plan_chunk_streaming(
             continue;
         };
         tree_queue.0.retain(|job| job.chunk_entity != entity);
+        chunk_world.surface_tops.remove(&coord);
         if let Some(record) = chunk_world.active_records.remove(&coord) {
             archive_chunk(&mut archive, record);
         }
@@ -487,8 +1404,58 @@ fn plan_chunk_streaming(
     }
 }
 
-/// Drain the load queue a little each frame so the main thread stays responsive.
+/// How many chunk builds may run on the pool at once.
+const MAX_CONCURRENT_CHUNK_BUILDS: usize = 3;
+
+/// Drain the load queue onto the background compute pool — voxel generation,
+/// cave carving, and meshing all happen off the main thread now, so streaming
+/// into new territory never hitches the frame.
 fn process_chunk_load_queue(
+    mut commands: Commands,
+    mut chunk_world: ResMut<ChunkWorld>,
+    mut archive: ResMut<ChunkArchive>,
+) {
+    let pool = AsyncComputeTaskPool::get();
+
+    for _ in 0..CHUNKS_PER_FRAME {
+        if chunk_world.pending.len() >= MAX_CONCURRENT_CHUNK_BUILDS {
+            break;
+        }
+        let Some(coord) = chunk_world.load_queue.pop_front() else {
+            break;
+        };
+        if chunk_world.loaded.contains_key(&coord) || chunk_world.pending.contains(&coord) {
+            continue;
+        }
+
+        let saved = take_saved_chunk(&mut archive, coord);
+        let task = pool.spawn(async move {
+            let record = saved.unwrap_or_else(|| ChunkRecord::generate(coord));
+            let origin = chunk_world_origin(coord);
+            let mut blocks = generate_chunk_blocks(coord, origin, record.terrain_seed);
+            // Re-open any burrows the worm has eaten here on previous visits.
+            apply_edits(&mut blocks, &record.edits);
+            let column_tops = blocks.column_tops();
+            let mesh = if blocks.is_empty() {
+                None
+            } else {
+                Some(terrain::build_colored_terrain_mesh(&blocks))
+            };
+            BuiltChunk {
+                record,
+                mesh,
+                column_tops,
+            }
+        });
+
+        chunk_world.pending.insert(coord);
+        commands.spawn(PendingChunk { task, coord });
+    }
+}
+
+/// Land finished chunk builds: spawn the chunk entity, its terrain mesh and
+/// leaves, and queue its trees.
+fn finish_chunk_tasks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut chunk_world: ResMut<ChunkWorld>,
@@ -496,28 +1463,53 @@ fn process_chunk_load_queue(
     mut tree_queue: ResMut<TreeSpawnQueue>,
     terrain_materials: Res<TerrainMaterials>,
     leaf_assets: Res<LeafAssets>,
+    mut pending_q: Query<(Entity, &mut PendingChunk)>,
 ) {
-    for _ in 0..CHUNKS_PER_FRAME {
-        let Some(coord) = chunk_world.load_queue.pop_front() else {
-            break;
+    for (holder, mut pending) in &mut pending_q {
+        let Some(built) = block_on(future::poll_once(&mut pending.task)) else {
+            continue;
         };
+        let coord = pending.coord;
+        commands.entity(holder).despawn();
+        chunk_world.pending.remove(&coord);
 
-        if chunk_world.loaded.contains_key(&coord) {
+        // The player may have wandered off while this chunk was building.
+        let still_wanted = chunk_world
+            .last_player_chunk
+            .is_none_or(|pc| chunk_chebyshev_distance(coord, pc) <= CHUNK_UNLOAD_DISTANCE);
+        if !still_wanted || chunk_world.loaded.contains_key(&coord) {
+            archive_chunk(&mut archive, built.record);
             continue;
         }
-        if tree_queue.0.len() >= MAX_TREE_QUEUE {
-            chunk_world.load_queue.push_front(coord);
-            break;
+
+        let origin = chunk_world_origin(coord);
+        let chunk_entity = commands
+            .spawn((
+                WorldChunk { coord },
+                TreesPending(built.record.trees.len()),
+                Transform::from_translation(origin),
+                Visibility::default(),
+            ))
+            .id();
+
+        if let Some(mesh) = built.mesh {
+            let mesh = meshes.add(mesh);
+            let material = terrain_materials.vertex_color_terrain.clone();
+            commands.entity(chunk_entity).with_children(|parent| {
+                parent.spawn((
+                    Mesh3d(mesh),
+                    MeshMaterial3d(material),
+                    Transform::IDENTITY,
+                    TerrainSurface,
+                ));
+            });
         }
+        scatter_chunk_leaves(&mut commands, chunk_entity, coord, &leaf_assets);
 
-        let record =
-            take_saved_chunk(&mut archive, coord).unwrap_or_else(|| ChunkRecord::generate(coord));
-
-        let entity = load_chunk(&mut commands, &mut meshes, &terrain_materials, &record);
-        scatter_chunk_leaves(&mut commands, entity, coord, &leaf_assets);
-        chunk_world.active_records.insert(coord, record.clone());
-        tree_queue.0.extend(record.tree_jobs(entity));
-        chunk_world.loaded.insert(coord, entity);
+        tree_queue.0.extend(built.record.tree_jobs(chunk_entity));
+        chunk_world.surface_tops.insert(coord, built.column_tops);
+        chunk_world.active_records.insert(coord, built.record);
+        chunk_world.loaded.insert(coord, chunk_entity);
     }
 }
 
@@ -626,10 +1618,48 @@ fn scatter_chunk_leaves(
 /// range; otherwise the worm BURROWS — the voxel it's facing (or the ground
 /// under it) is eaten out of the world for real, the chunk remeshes on a
 /// background thread, and the bite is remembered so tunnels survive streaming.
+/// Drop a casting on the ground just behind the worm — whatever goes in one
+/// end, a tidy dark block comes out the other.
+fn spawn_worm_casting(
+    commands: &mut Commands,
+    casting: &CastingAssets,
+    chunk_world: &ChunkWorld,
+    cam: &Transform,
+) {
+    let f = *cam.forward();
+    let mut back = -Vec3::new(f.x, 0.0, f.z).normalize_or_zero();
+    if back == Vec3::ZERO {
+        back = Vec3::Z;
+    }
+    let spot = cam.translation + back * (WORM_LENGTH * 1.3);
+    let coord = world_to_chunk(spot.x, spot.z);
+    let Some(&chunk_entity) = chunk_world.loaded.get(&coord) else {
+        return;
+    };
+    let origin = chunk_world_origin(coord);
+    let y = ground_world_y(chunk_world, spot.x, spot.z) + VOXEL_SIZE * 0.5;
+    // Position-hashed yaw so a trail of castings doesn't align with the grid.
+    let yaw = (spot.x * 12.9898 + spot.z * 78.233).sin() * std::f32::consts::PI;
+
+    let (mesh, material) = (casting.mesh.clone(), casting.material.clone());
+    commands.entity(chunk_entity).with_children(|chunk| {
+        chunk.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(material),
+            Transform {
+                translation: Vec3::new(spot.x - origin.x, y, spot.z - origin.z),
+                rotation: Quat::from_rotation_y(yaw),
+                ..default()
+            },
+        ));
+    });
+}
+
 fn eat_leaves(
     mut commands: Commands,
     keyboard: Res<ButtonInput<KeyCode>>,
     sounds: Res<GameSounds>,
+    castings: Res<CastingAssets>,
     chunk_world: Res<ChunkWorld>,
     cam_q: Query<&Transform, With<Camera>>,
     leaf_q: Query<(Entity, &GlobalTransform), With<Leaf>>,
@@ -662,6 +1692,7 @@ fn eat_leaves(
     if let Some((ent, d)) = closest {
         commands.entity(ent).despawn();
         munch(&mut commands, &sounds);
+        spawn_worm_casting(&mut commands, &castings, &chunk_world, cam);
         println!("🍃 Yum! Little guy devoured a leaf (dist: {:.1})", d);
         return;
     }
@@ -749,11 +1780,13 @@ fn probe_and_carve(
 fn finish_burrow_tasks(
     mut commands: Commands,
     sounds: Res<GameSounds>,
+    castings: Res<CastingAssets>,
     mut chunk_world: ResMut<ChunkWorld>,
     mut archive: ResMut<ChunkArchive>,
     mut meshes: ResMut<Assets<Mesh>>,
     terrain_materials: Res<TerrainMaterials>,
     mut pending_q: Query<(Entity, &mut PendingBurrow)>,
+    cam_q: Query<&Transform, With<Camera>>,
     children_q: Query<&Children>,
     surface_q: Query<(), With<TerrainSurface>>,
 ) {
@@ -803,6 +1836,9 @@ fn finish_burrow_tasks(
             AudioPlayer::new(sounds.munch.clone()),
             PlaybackSettings::DESPAWN,
         ));
+        if let Ok(cam) = cam_q.get_single() {
+            spawn_worm_casting(&mut commands, &castings, &chunk_world, cam);
+        }
         println!("🪱 Burrowed through a mouthful of {:?}.", result.block);
     }
 }
@@ -838,7 +1874,7 @@ fn animate_floating_leaves(
 /// giants haze out into the sky instead of rendering pin-sharp.
 fn lower_worm_camera(
     mut commands: Commands,
-    mut query: Query<(Entity, &mut Transform), With<Camera>>,
+    mut query: Query<(Entity, &mut Transform, &mut Camera)>,
 ) {
     // Top of the local surface voxel + a worm's eye height above it.
     let surface_top = surface_top_world_y(0.0, 0.0);
@@ -855,10 +1891,15 @@ fn lower_worm_camera(
         }
     }
 
-    for (entity, mut transform) in &mut query {
+    for (entity, mut transform, mut camera) in &mut query {
         transform.translation.x = 0.0;
         transform.translation.z = 0.0;
         transform.translation.y = eye_y;
+
+        // HDR + bloom: the sun's emissive disc overdrives past 1.0 and blooms
+        // into a brilliant glare instead of clipping to flat white.
+        camera.hdr = true;
+        commands.entity(entity).insert(Bloom::NATURAL);
 
         commands.entity(entity).insert(DistanceFog {
             // Matches the clear colour so fogged geometry melts into the sky.

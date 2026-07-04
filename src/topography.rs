@@ -75,13 +75,13 @@ pub fn surface_height_voxels(world_x: f32, world_z: f32) -> i32 {
     // mound is ~16 worm-lengths tall.
     let (micro_amp_ft, rocky) = match biome {
         AussieBiome::Ocean => (0.0, false),
-        AussieBiome::TropicalSavanna => (1.0, false), // cracked floodplain hummocks
-        AussieBiome::AridOutback => (1.6, false),     // sand ripples and gibber mounds
-        AussieBiome::Pilbara => (2.4, true),          // ironstone rubble and ribs
-        AussieBiome::Mediterranean => (1.4, false),   // laterite gravel rises
-        AussieBiome::TemperateForest => (2.0, false), // root mounds and gully lips
-        AussieBiome::CoastalBush => (1.6, false),     // hind-dune hummocks
-        AussieBiome::Tasmania => (2.8, true),         // boulder and button-grass mounds
+        AussieBiome::TropicalSavanna => (2.5, false), // cracked floodplain hummocks
+        AussieBiome::AridOutback => (3.5, false),     // sand ripples and gibber mounds
+        AussieBiome::Pilbara => (5.0, true),          // ironstone rubble and ribs
+        AussieBiome::Mediterranean => (3.0, false),   // laterite gravel rises
+        AussieBiome::TemperateForest => (4.5, false), // root mounds and gully lips
+        AussieBiome::CoastalBush => (3.5, false),     // hind-dune hummocks
+        AussieBiome::Tasmania => (6.0, true),         // boulder and button-grass mounds
     };
     let micro_ft = if rocky {
         (ridged(x / 24.0, z / 24.0, seed(20), 3) - 0.35) * 2.0 * micro_amp_ft
@@ -90,10 +90,51 @@ pub fn surface_height_voxels(world_x: f32, world_z: f32) -> i32 {
         // actually occur in the landscape, then soft-clip the extremes.
         (fbm(x / 24.0, z / 24.0, seed(21), 3) * 1.8).clamp(-1.0, 1.0) * micro_amp_ft
     };
+    // Rolling hills, in feet — the visible "up and down" of the landscape.
+    // 300-ish ft wavelengths put several full rises and falls inside the far
+    // horizon (~640 ft), so distant ground steps dramatically instead of
+    // reading as a plain. fbm01 keeps it additive: hills rise from the plains
+    // rather than digging swamps below sea level.
+    let hills_amp_ft = match biome {
+        AussieBiome::Ocean => 0.0,
+        AussieBiome::TropicalSavanna => 5.0,
+        AussieBiome::AridOutback => 6.0,
+        AussieBiome::Pilbara => 9.0,
+        AussieBiome::Mediterranean => 7.0,
+        AussieBiome::TemperateForest => 11.0,
+        AussieBiome::CoastalBush => 7.0,
+        AussieBiome::Tasmania => 13.0,
+    };
+    let hills_ft = fbm01(x / 320.0, z / 320.0, seed(30), 3) * hills_amp_ft;
+
+    // Mountain ranges: long-wavelength ridged peaks. The subtraction keeps the
+    // plains flat while the ridge lines climb toward the 80 ft ceiling —
+    // Minecraft-grade relief, worm-graded.
+    let mountain_amp_ft = match biome {
+        AussieBiome::Ocean => 0.0,
+        AussieBiome::TropicalSavanna => 24.0,
+        AussieBiome::AridOutback => 28.0,
+        AussieBiome::Pilbara => 55.0,
+        AussieBiome::Mediterranean => 30.0,
+        AussieBiome::TemperateForest => 70.0,
+        AussieBiome::CoastalBush => 24.0,
+        AussieBiome::Tasmania => 80.0,
+    };
+    let mountains_ft =
+        (ridged(x / 900.0, z / 900.0, seed(32), 3) - 0.22).max(0.0) * mountain_amp_ft * 1.28;
+
+    // Worm-mountain mounds: ~95 ft wavelength, so the streamed neighbourhood
+    // itself always holds a full rise and fall. To a 3-inch worm these 2–6 ft
+    // molehills ARE mountains — a 6 ft climb is ~25 worm-lengths of ascent.
+    let mounds_ft = fbm(x / 95.0, z / 95.0, seed(31), 3) * (hills_amp_ft * 0.45);
+
     // Inch-scale roughness everywhere — soil is never billiard-flat to a worm.
     let fine_ft = fbm(x / 3.5, z / 3.5, seed(22), 2) * 0.2;
 
-    let h_ft = (regional_ft + micro_ft + fine_ft) * coast_openness(world_x, world_z);
+    // Regional forms doubled: the originals were authored against a 16 ft
+    // ceiling; with 80 ft of headroom the escarpments and ranges can loom.
+    let h_ft = (regional_ft * 2.0 + mountains_ft + hills_ft + mounds_ft + micro_ft + fine_ft)
+        * coast_openness(world_x, world_z);
     ((h_ft * VOXELS_PER_FOOT as f32).round() as i32).clamp(1, MAX_SURFACE_VOXEL_Y)
 }
 
@@ -117,8 +158,94 @@ fn coast_openness(world_x: f32, world_z: f32) -> f32 {
     0.2 + 0.8 * (land as f32 / 4.0)
 }
 
+/// The cave web, decided on a world-aligned 4-voxel (8-inch) lattice so
+/// tunnels run seamlessly across chunk borders and the gravity floor can ask
+/// the exact same question the chunk generator answered. Takes WORLD voxel
+/// coords plus the column's surface voxel; quantisation happens inside.
+///
+/// Shape is Minecraft-style: two 3D noises pinching near zero make spaghetti
+/// tunnels (wider with depth); a third opens caverns down deep. A thin surface
+/// skin keeps the ground solid except where a strong tunnel core punches a
+/// natural entrance.
+pub const CAVE_CELL_VOXELS: i32 = 4;
+
+pub fn is_cave_cell(world_vx: i32, world_vy: i32, world_vz: i32, surface_vy: i32) -> bool {
+    let q = |v: i32| (v.div_euclid(CAVE_CELL_VOXELS) * CAVE_CELL_VOXELS + CAVE_CELL_VOXELS / 2);
+    let (cx, cy, cz) = (q(world_vx), q(world_vy), q(world_vz));
+
+    let depth = surface_vy - cy;
+    if depth < 0 {
+        return false;
+    }
+
+    let c = world_to_continental(cx as f32 * VOXEL_SIZE, cz as f32 * VOXEL_SIZE);
+    let y_ft = cy as f32 * VOXEL_SIZE;
+
+    // Tunnels: 1–2 ft wide near the skin, opening up with depth.
+    let n1 = fbm3(c.x / 7.0, y_ft / 4.5, c.y / 7.0, seed(40), 2);
+    let n2 = fbm3(c.x / 9.0, y_ft / 5.5, c.y / 9.0, seed(41), 2);
+    let tunnel = n1.abs().max(n2.abs());
+    let mut width = 0.085 + 0.05 * (depth as f32 / 60.0).min(1.0);
+    if depth < 4 {
+        // Surface skin: only the strongest tunnel cores break through as
+        // natural cave mouths.
+        width *= 0.35;
+    }
+    if tunnel < width {
+        return true;
+    }
+
+    // Caverns in the deep dark.
+    depth > 20 && fbm3(c.x / 16.0, y_ft / 8.0, c.y / 16.0, seed(42), 2) > 0.62
+}
+
 fn seed(n: u32) -> u32 {
     (WORLD_SEED as u32).wrapping_mul(0x9E37_79B9) ^ n.wrapping_mul(0x85EB_CA6B)
+}
+
+fn lattice_hash3(ix: i32, iy: i32, iz: i32, seed: u32) -> f32 {
+    let mut h = (ix as u32).wrapping_mul(0x8DA6_B343)
+        ^ (iy as u32).wrapping_mul(0xD816_3841)
+        ^ (iz as u32).wrapping_mul(0xCB1A_B31F)
+        ^ seed.wrapping_mul(0x9E37_79B9);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x7FEB_352D);
+    h ^= h >> 15;
+    h as f32 / u32::MAX as f32
+}
+
+/// Smoothly interpolated 3D lattice value noise in [0, 1].
+fn value_noise3(x: f32, y: f32, z: f32, seed: u32) -> f32 {
+    let (x0, y0, z0) = (x.floor(), y.floor(), z.floor());
+    let (tx, ty, tz) = (smooth(x - x0), smooth(y - y0), smooth(z - z0));
+    let (ix, iy, iz) = (x0 as i32, y0 as i32, z0 as i32);
+
+    let mut corners = [0f32; 8];
+    for (k, corner) in corners.iter_mut().enumerate() {
+        let (dx, dy, dz) = ((k & 1) as i32, ((k >> 1) & 1) as i32, ((k >> 2) & 1) as i32);
+        *corner = lattice_hash3(ix + dx, iy + dy, iz + dz, seed);
+    }
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let xy0 = lerp(lerp(corners[0], corners[1], tx), lerp(corners[2], corners[3], tx), ty);
+    let xy1 = lerp(lerp(corners[4], corners[5], tx), lerp(corners[6], corners[7], tx), ty);
+    lerp(xy0, xy1, tz)
+}
+
+/// Fractal 3D value noise in [-1, 1].
+fn fbm3(x: f32, y: f32, z: f32, seed: u32, octaves: u32) -> f32 {
+    let mut sum = 0.0;
+    let mut amp = 1.0;
+    let mut norm = 0.0;
+    let (mut fx, mut fy, mut fz) = (x, y, z);
+    for o in 0..octaves {
+        sum += value_noise3(fx, fy, fz, seed.wrapping_add(o * 97)) * amp;
+        norm += amp;
+        amp *= 0.5;
+        fx *= 2.0;
+        fy *= 2.0;
+        fz *= 2.0;
+    }
+    (sum / norm) * 2.0 - 1.0
 }
 
 fn lattice_hash(ix: i32, iz: i32, seed: u32) -> f32 {
@@ -256,6 +383,36 @@ mod tests {
             "Tasmania ({tasmania_ranges}) should be rougher than the savanna plains ({savanna_plain})"
         );
         assert!(tasmania_ranges >= 24, "Tasmanian highlands too flat: {tasmania_ranges}");
+    }
+
+    /// Caves exist underground at a sane density: enough to stumble into,
+    /// nowhere near enough to swiss-cheese the world hollow.
+    #[test]
+    fn caves_exist_at_sane_density() {
+        let w = geo_to_world_offset(-35.0, 146.0);
+        let mut cave = 0u32;
+        let mut total = 0u32;
+        for i in 0..60 {
+            for j in 0..60 {
+                let x = w.x + i as f32 * 21.0;
+                let z = w.y + j as f32 * 17.0;
+                let surface = surface_height_voxels(x, z);
+                let vx = (x / VOXEL_SIZE) as i32;
+                let vz = (z / VOXEL_SIZE) as i32;
+                // Probe the tunnel band under the skin.
+                for depth in [6, 14, 22, 30] {
+                    total += 1;
+                    if is_cave_cell(vx, surface - depth, vz, surface) {
+                        cave += 1;
+                    }
+                }
+            }
+        }
+        let density = cave as f32 / total as f32;
+        assert!(
+            (0.005..0.35).contains(&density),
+            "cave density {density:.4} out of the sane band"
+        );
     }
 
     /// A worm crawling ~50 ft in any biome must cross real ups and downs — the
