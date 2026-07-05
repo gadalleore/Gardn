@@ -646,22 +646,27 @@ fn worm_gravity(
     let here_col = ColumnProbe::at(&chunk_world, tf.translation.x, tf.translation.z);
     let here = here_col.floor_below(tf.translation.y + 0.02);
 
-    // Pre-climb: peek one worm-length ahead on each axis and start mounting
-    // climbable rises *before* touching them, so ascent begins early and the
-    // worm never clips into a block face.
-    const CLIMB_LOOKAHEAD_FT: f32 = 0.25;
-    let mut floor = here;
+    // Glide path: a 3-inch worm spans several 1-inch columns, so its ride
+    // height is the FOOTPRINT AVERAGE of the ground around it — block steps
+    // become gradients, and approaching a ledge starts the rise early.
+    // Samples more than a climbable step away (cliff lips, pit edges) are
+    // ignored so the average never floats the worm off a wall.
+    const CLIMB_LOOKAHEAD_FT: f32 = 0.22;
+    let mut floor_sum = here;
+    let mut floor_n = 1.0;
     for (dx, dz) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
         let col = ColumnProbe::at(
             &chunk_world,
             tf.translation.x + dx * CLIMB_LOOKAHEAD_FT,
             tf.translation.z + dz * CLIMB_LOOKAHEAD_FT,
         );
-        let ahead = col.floor_below(tf.translation.y + CLIMB_LIMIT_FT);
-        if ahead > floor && ahead - here <= CLIMB_LIMIT_FT {
-            floor = ahead;
+        let sample = col.floor_below(tf.translation.y + CLIMB_LIMIT_FT);
+        if (sample - here).abs() <= CLIMB_LIMIT_FT {
+            floor_sum += sample;
+            floor_n += 1.0;
         }
     }
+    let floor = floor_sum / floor_n;
 
     // Space = reach: the worm stretches up to a full extra worm-length to get
     // its mouth at higher blocks. No jumping — that's a legs feature.
@@ -679,17 +684,18 @@ fn worm_gravity(
     let stand = (floor + WORM_EYE_HEIGHT + god.reach).min(ceiling - 0.03).max(floor + 0.02);
     let dy = stand - tf.translation.y;
 
-    // Rate-limited vertical follow: uphill is a steady angled glide, small
-    // downhill steps settle smoothly, and only real drops turn ballistic —
-    // no more per-block camera snapping.
-    const CLIMB_SPEED_FT_S: f32 = 2.4;
+    // Eased vertical follow: the camera glides toward ride height on an
+    // exponential curve — no fixed-rate starts and stops, no per-block
+    // snapping. Rate caps keep cliffs from yanking it; only real drops
+    // (beyond a body length) turn ballistic.
+    const CLIMB_SPEED_FT_S: f32 = 2.6;
     const SETTLE_SPEED_FT_S: f32 = 4.0;
+    const GLIDE_STIFFNESS: f32 = 9.0;
     let dt = time.delta_secs();
-    if dy > 0.0 {
-        tf.translation.y += dy.min(CLIMB_SPEED_FT_S * dt);
-        god.fall_speed = 0.0;
-    } else if -dy <= 0.35 {
-        tf.translation.y -= (-dy).min(SETTLE_SPEED_FT_S * dt);
+    if dy > -0.35 {
+        let ease = 1.0 - (-dt * GLIDE_STIFFNESS).exp();
+        let step = (dy * ease).clamp(-SETTLE_SPEED_FT_S * dt, CLIMB_SPEED_FT_S * dt);
+        tf.translation.y += step;
         god.fall_speed = 0.0;
     } else {
         god.fall_speed = (god.fall_speed + GRAVITY_FT_S2 * dt).min(TERMINAL_FALL_FT_S);
@@ -814,13 +820,13 @@ struct PendingTree {
     tree_seed: u64,
 }
 
-/// A completed bite: which voxel came out of which chunk, plus the freshly
-/// rebuilt terrain mesh, all computed off the main thread.
+/// A completed bite: a worm-sized ball of voxels carved around the bite
+/// point — possibly straddling a chunk border — plus each affected chunk's
+/// freshly rebuilt terrain mesh, all computed off the main thread.
 struct BurrowResult {
-    coord: IVec2,
-    local: IVec3,
     block: BlockType,
-    mesh: Mesh,
+    /// Per affected chunk: carved voxels (chunk-local) and the rebuilt mesh.
+    chunks: Vec<(IVec2, Vec<IVec3>, Mesh)>,
 }
 
 /// An in-flight burrow (probe + carve + remesh) on the async pool. Only one at
@@ -1943,15 +1949,68 @@ fn probe_and_carve(
     }
 
     let (coord, local, block) = hit?;
-    let mut voxels = voxel_cache.remove(&coord).expect("probed chunk is cached");
-    voxels.clear_cell(local.x, local.y, local.z);
 
-    Some(BurrowResult {
-        coord,
-        local,
-        block,
-        mesh: terrain::build_colored_terrain_mesh(&voxels),
-    })
+    // A worm doesn't nibble single cubes — every bite scoops a worm-sized
+    // BALL out of the ground (~4 inches across at 1-inch voxels), spilling
+    // into neighbouring chunks when the bite straddles a border. Bedrock and
+    // water are never carved.
+    const BITE_RADIUS_VOX: f32 = 2.2;
+    let center = IVec3::new(
+        coord.x * CHUNK_VOXELS + local.x,
+        local.y,
+        coord.y * CHUNK_VOXELS + local.z,
+    );
+    let reach = BITE_RADIUS_VOX.ceil() as i32;
+    let mut carved: HashMap<IVec2, Vec<IVec3>> = HashMap::new();
+
+    for dy in -reach..=reach {
+        for dz in -reach..=reach {
+            for dx in -reach..=reach {
+                let d = IVec3::new(dx, dy, dz);
+                if d.as_vec3().length_squared() > BITE_RADIUS_VOX * BITE_RADIUS_VOX {
+                    continue;
+                }
+                let w = center + d;
+                let ccoord =
+                    IVec2::new(w.x.div_euclid(CHUNK_VOXELS), w.z.div_euclid(CHUNK_VOXELS));
+                let Some((_, seed, edits)) = records.iter().find(|(c, _, _)| *c == ccoord)
+                else {
+                    continue;
+                };
+                if !voxel_cache.contains_key(&ccoord) {
+                    let mut v =
+                        generate_chunk_blocks(ccoord, chunk_world_origin(ccoord), *seed);
+                    apply_edits(&mut v, edits);
+                    voxel_cache.insert(ccoord, v);
+                }
+                let voxels = voxel_cache.get_mut(&ccoord).expect("just inserted");
+
+                let clocal =
+                    IVec3::new(w.x.rem_euclid(CHUNK_VOXELS), w.y, w.z.rem_euclid(CHUNK_VOXELS));
+                let Some(b) = voxels.get(clocal.x, clocal.y, clocal.z) else {
+                    continue;
+                };
+                if b == BlockType::Water || clocal.y <= voxels.floor_y() {
+                    continue;
+                }
+                voxels.clear_cell(clocal.x, clocal.y, clocal.z);
+                carved.entry(ccoord).or_default().push(clocal);
+            }
+        }
+    }
+
+    let chunks: Vec<(IVec2, Vec<IVec3>, Mesh)> = carved
+        .into_iter()
+        .map(|(ccoord, locals)| {
+            let mesh = terrain::build_colored_terrain_mesh(&voxel_cache[&ccoord]);
+            (ccoord, locals, mesh)
+        })
+        .collect();
+
+    if chunks.is_empty() {
+        return None;
+    }
+    Some(BurrowResult { block, chunks })
 }
 
 /// Land finished bites: record the edit, swap the chunk's terrain mesh, munch.
@@ -1979,37 +2038,45 @@ fn finish_burrow_tasks(
             continue;
         };
 
-        // Persist the bite wherever the chunk lives now (it may have streamed
-        // out mid-chew — the tunnel still has to be there on revisit).
-        if let Some(record) = chunk_world.active_records.get_mut(&result.coord) {
-            record.edits.insert(result.local);
-        } else if let Some(record) = archive.saved.get_mut(&result.coord) {
-            record.edits.insert(result.local);
-            continue; // No live mesh to swap.
-        } else {
-            continue;
-        }
+        // Persist each affected chunk's carved voxels wherever that chunk
+        // lives now (it may have streamed out mid-chew — the tunnel still has
+        // to be there on revisit), and swap in the rebuilt meshes.
+        let mut ate_something = false;
+        for (coord, locals, mesh) in result.chunks {
+            if let Some(record) = chunk_world.active_records.get_mut(&coord) {
+                record.edits.extend(locals.iter().copied());
+            } else if let Some(record) = archive.saved.get_mut(&coord) {
+                record.edits.extend(locals.iter().copied());
+                continue; // No live mesh to swap.
+            } else {
+                continue;
+            }
+            ate_something = true;
 
-        let Some(&chunk_entity) = chunk_world.loaded.get(&result.coord) else {
-            continue;
-        };
-        if let Ok(children) = children_q.get(chunk_entity) {
-            for child in children {
-                if surface_q.get(*child).is_ok() {
-                    commands.entity(*child).despawn();
+            let Some(&chunk_entity) = chunk_world.loaded.get(&coord) else {
+                continue;
+            };
+            if let Ok(children) = children_q.get(chunk_entity) {
+                for child in children {
+                    if surface_q.get(*child).is_ok() {
+                        commands.entity(*child).despawn();
+                    }
                 }
             }
+            let mesh = meshes.add(mesh);
+            commands.entity(chunk_entity).with_children(|chunk| {
+                chunk.spawn((
+                    Mesh3d(mesh),
+                    MeshMaterial3d(terrain_materials.vertex_color_terrain.clone()),
+                    Transform::IDENTITY,
+                    TerrainSurface,
+                ));
+            });
         }
-        let mesh = meshes.add(result.mesh);
-        commands.entity(chunk_entity).with_children(|chunk| {
-            chunk.spawn((
-                Mesh3d(mesh),
-                MeshMaterial3d(terrain_materials.vertex_color_terrain.clone()),
-                Transform::IDENTITY,
-                TerrainSurface,
-            ));
-        });
 
+        if !ate_something {
+            continue;
+        }
         commands.spawn((
             AudioPlayer::new(sounds.munch.clone()),
             PlaybackSettings::DESPAWN,
@@ -2017,7 +2084,7 @@ fn finish_burrow_tasks(
         if let Ok(cam) = cam_q.get_single() {
             spawn_worm_casting(&mut commands, &castings, &chunk_world, cam);
         }
-        println!("🪱 Burrowed through a mouthful of {:?}.", result.block);
+        println!("🪱 Scooped a worm-sized bite of {:?}.", result.block);
     }
 }
 
