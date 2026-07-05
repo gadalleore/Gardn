@@ -232,44 +232,35 @@ struct GrassClump {
     freq: f32,
 }
 
-/// Grass clumps match the collectible leaves in width (~3 worm-lengths).
+/// Grass clumps match the collectible leaves in width (~3 worm-lengths) and
+/// stand three widths tall — grass towers over a worm.
 const GRASS_WIDTH: f32 = WORM_LENGTH * 3.0;
+const GRASS_HEIGHT: f32 = GRASS_WIDTH * 3.0;
 
-/// Two crossed vertical quads (an X from above), origin at the base centre,
-/// with a bottom→top vertex-colour gradient that tints the white sprite.
-fn grass_cross_mesh(
+/// One flat vertical quad, origin at the base centre, double-sided, with a
+/// bottom→top vertex-colour gradient that tints the white sprite.
+fn grass_quad_mesh(
     width: f32,
     height: f32,
     y_offset: f32,
     base: (f32, f32, f32),
     tip: (f32, f32, f32),
 ) -> Mesh {
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut normals: Vec<[f32; 3]> = Vec::new();
-    let mut uvs: Vec<[f32; 2]> = Vec::new();
-    let mut colors: Vec<[f32; 4]> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
     let h = width * 0.5;
     let (y0, y1) = (y_offset, y_offset + height);
     let base = [base.0, base.1, base.2, 1.0];
     let tip = [tip.0, tip.1, tip.2, 1.0];
 
-    for (a, b, normal) in [
-        ([-h, 0.0], [h, 0.0], [0.0, 0.0, 1.0f32]),
-        ([0.0, -h], [0.0, h], [1.0, 0.0, 0.0]),
-    ] {
-        let i0 = positions.len() as u32;
-        positions.extend_from_slice(&[
-            [a[0], y0, a[1]],
-            [b[0], y0, b[1]],
-            [b[0], y1, b[1]],
-            [a[0], y1, a[1]],
-        ]);
-        normals.extend([normal; 4]);
-        uvs.extend_from_slice(&[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]);
-        colors.extend_from_slice(&[base, base, tip, tip]);
-        indices.extend_from_slice(&[i0, i0 + 1, i0 + 2, i0, i0 + 2, i0 + 3]);
-    }
+    let positions: Vec<[f32; 3]> = vec![
+        [-h, y0, 0.0],
+        [h, y0, 0.0],
+        [h, y1, 0.0],
+        [-h, y1, 0.0],
+    ];
+    let normals: Vec<[f32; 3]> = vec![[0.0, 0.0, 1.0]; 4];
+    let uvs: Vec<[f32; 2]> = vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    let colors: Vec<[f32; 4]> = vec![base, base, tip, tip];
+    let indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
 
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
@@ -281,22 +272,43 @@ fn grass_cross_mesh(
 }
 
 /// Grass shivers fast and light — same wind and gusts as the trees, higher
-/// frequency, and it flattens progressively in a gale.
+/// frequency, flattening progressively in a gale. And it makes way for the
+/// worm: clumps near the little guy bend away, springing back as he passes.
 fn sway_grass(
     time: Res<Time>,
     wind: Res<Wind>,
-    mut clumps: Query<(&GrassClump, &mut Transform)>,
+    cam_q: Query<&Transform, (With<Camera>, Without<GrassClump>)>,
+    mut clumps: Query<(&GrassClump, &GlobalTransform, &mut Transform)>,
 ) {
     let t = time.elapsed_secs();
     let gust = 0.5 + 0.5 * ((t * 0.11).sin() * 0.6 + (t * 0.043).sin() * 0.4);
-    let lean_axis = Vec3::new(-wind.dir.y, 0.0, wind.dir.x);
+    let wind_axis = Vec3::new(-wind.dir.y, 0.0, wind.dir.x);
     let force = wind.strength / 5.0;
+    let cam_pos = cam_q.get_single().map(|c| c.translation).ok();
 
-    for (clump, mut tf) in &mut clumps {
-        let angle = force
+    // How close the worm must be before grass yields, and how hard it bends.
+    const PUSH_RADIUS: f32 = 0.9;
+    const PUSH_MAX_RAD: f32 = 1.25;
+
+    for (clump, global, mut tf) in &mut clumps {
+        let wind_angle = force
             * ((0.06 + 0.11 * gust) * (t * clump.freq + clump.phase).sin() + 0.35 * gust);
-        tf.rotation =
-            Quat::from_axis_angle(lean_axis, angle) * Quat::from_rotation_y(clump.yaw);
+        let mut rotation = Quat::from_axis_angle(wind_axis, wind_angle);
+
+        if let Some(cam) = cam_pos {
+            let world = global.translation();
+            let away = Vec3::new(world.x - cam.x, 0.0, world.z - cam.z);
+            let dist = away.length();
+            if dist < PUSH_RADIUS && dist > 0.001 {
+                let strength = 1.0 - dist / PUSH_RADIUS;
+                let bend_axis = Vec3::Y.cross(away / dist);
+                rotation =
+                    Quat::from_axis_angle(bend_axis, PUSH_MAX_RAD * strength * strength)
+                        * rotation;
+            }
+        }
+
+        tf.rotation = rotation * Quat::from_rotation_y(clump.yaw);
     }
 }
 
@@ -1147,19 +1159,19 @@ fn setup_garden(
         })
     };
     let mitchell = GrassSpecies {
-        mesh: meshes.add(grass_cross_mesh(
+        mesh: meshes.add(grass_quad_mesh(
             GRASS_WIDTH,
-            GRASS_WIDTH,
+            GRASS_HEIGHT,
             0.0,
             (0.34, 0.44, 0.26),
             (0.55, 0.60, 0.34),
         )),
         material: grass_mat(&mut materials, asset_server.load("grass/mitchell.png")),
         top: Some((
-            meshes.add(grass_cross_mesh(
+            meshes.add(grass_quad_mesh(
                 GRASS_WIDTH,
-                GRASS_WIDTH,
-                GRASS_WIDTH * 0.7,
+                GRASS_HEIGHT * 0.6,
+                GRASS_HEIGHT * 0.55,
                 (0.72, 0.62, 0.38),
                 (0.82, 0.74, 0.46),
             )),
@@ -1167,9 +1179,9 @@ fn setup_garden(
         )),
     };
     let kangaroo = GrassSpecies {
-        mesh: meshes.add(grass_cross_mesh(
+        mesh: meshes.add(grass_quad_mesh(
             GRASS_WIDTH,
-            GRASS_WIDTH,
+            GRASS_HEIGHT,
             0.0,
             (0.24, 0.40, 0.18),
             (0.60, 0.36, 0.22),
@@ -1178,9 +1190,9 @@ fn setup_garden(
         top: None,
     };
     let button = GrassSpecies {
-        mesh: meshes.add(grass_cross_mesh(
+        mesh: meshes.add(grass_quad_mesh(
             GRASS_WIDTH,
-            GRASS_WIDTH,
+            GRASS_HEIGHT,
             0.0,
             (0.28, 0.38, 0.20),
             (0.52, 0.50, 0.30),
