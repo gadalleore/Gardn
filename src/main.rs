@@ -481,6 +481,87 @@ fn ground_world_y(chunk_world: &ChunkWorld, x: f32, z: f32) -> f32 {
     (top + 1) as f32 * VOXEL_SIZE
 }
 
+/// One column's collision data, computed once per (x, z) query: real top (post
+/// caves/burrows where loaded), bedrock band, and per-voxel solidity.
+struct ColumnProbe<'a> {
+    surface: i32,
+    top: i32,
+    bedrock: i32,
+    vx: i32,
+    vz: i32,
+    local: IVec2,
+    record: Option<&'a ChunkRecord>,
+}
+
+impl ColumnProbe<'_> {
+    fn at(chunk_world: &ChunkWorld, x: f32, z: f32) -> ColumnProbe<'_> {
+        let surface = surface_height_voxels(x, z);
+        let vx = (x / VOXEL_SIZE).floor() as i32;
+        let vz = (z / VOXEL_SIZE).floor() as i32;
+        let coord = IVec2::new(vx.div_euclid(CHUNK_VOXELS), vz.div_euclid(CHUNK_VOXELS));
+        let local = IVec2::new(vx.rem_euclid(CHUNK_VOXELS), vz.rem_euclid(CHUNK_VOXELS));
+        let top = chunk_world
+            .surface_tops
+            .get(&coord)
+            .map(|tops| tops[(local.y * CHUNK_VOXELS + local.x) as usize])
+            .unwrap_or(surface);
+        ColumnProbe {
+            surface,
+            top,
+            bedrock: surface - CHUNK_DEPTH_VOXELS + 2,
+            vx,
+            vz,
+            local,
+            record: chunk_world.active_records.get(&coord),
+        }
+    }
+
+    /// Exact voxel solidity — the rule blocks live by: nothing above the top,
+    /// bedrock always solid, otherwise solid unless eaten or a cave cell.
+    fn solid(&self, vy: i32) -> bool {
+        if vy > self.top {
+            return false;
+        }
+        if vy <= self.bedrock {
+            return true;
+        }
+        if self
+            .record
+            .is_some_and(|r| r.edits.contains(&IVec3::new(self.local.x, vy, self.local.y)))
+        {
+            return false;
+        }
+        !is_cave_cell(self.vx, vy, self.vz, self.surface)
+    }
+
+    fn solid_at_ft(&self, y_ft: f32) -> bool {
+        self.solid((y_ft / VOXEL_SIZE).floor() as i32)
+    }
+
+    /// Top face of the first solid voxel at or below `from_ft` — the local
+    /// floor, correct inside tunnels and under roofs (a heightfield is not).
+    fn floor_below(&self, from_ft: f32) -> f32 {
+        let mut vy = ((from_ft / VOXEL_SIZE).floor() as i32).min(self.top);
+        while vy > self.bedrock && !self.solid(vy) {
+            vy -= 1;
+        }
+        (vy + 1) as f32 * VOXEL_SIZE
+    }
+
+    /// Bottom face of the first solid voxel above `from_ft` — the roof, or
+    /// effectively-infinity under open sky.
+    fn ceiling_above(&self, from_ft: f32) -> f32 {
+        let mut vy = (from_ft / VOXEL_SIZE).floor() as i32 + 1;
+        while vy <= self.top {
+            if self.solid(vy) {
+                return vy as f32 * VOXEL_SIZE;
+            }
+            vy += 1;
+        }
+        f32::MAX
+    }
+}
+
 /// Pull the worm down to the ground unless god mode is on. Runs after the
 /// flycam has moved the camera, just before transforms propagate.
 fn worm_gravity(
@@ -534,20 +615,24 @@ fn worm_gravity(
         tf.translation.z += wind.dir.y * shove;
     }
 
-    // A worm grips well but doesn't scale walls: any rise steeper than about
-    // 45° (more than a worm-height over one worm-length ahead) is a CLIFF.
-    // Movement into a cliff face is cancelled — sliding along whichever axis
-    // stays legal — so mesa walls, ridge bands, and cave shafts are real
-    // obstacles instead of things the camera teleports up.
+    // Solid blocks BLOCK — the worm's body is tested against the actual
+    // voxels, so cave walls, roofs, and cliff faces all stop movement dead.
+    // A column is passable if the worm fits at its current height, or one
+    // climbable step higher (that's how small ledges stay mountable). Blocked
+    // movement slides along whichever axis stays open.
     const CLIMB_LIMIT_FT: f32 = 0.26;
     if let Some(prev) = god.prev_pos {
-        let base = ground_world_y(&chunk_world, prev.x, prev.z);
-        let rise =
-            |x: f32, z: f32| -> f32 { ground_world_y(&chunk_world, x, z) - base };
-        if rise(tf.translation.x, tf.translation.z) > CLIMB_LIMIT_FT {
-            if rise(tf.translation.x, prev.z) <= CLIMB_LIMIT_FT {
+        let fits = |x: f32, z: f32, y: f32| -> bool {
+            let col = ColumnProbe::at(&chunk_world, x, z);
+            !col.solid_at_ft(y) && !col.solid_at_ft(y - WORM_EYE_HEIGHT * 0.6)
+        };
+        let passable = |x: f32, z: f32| -> bool {
+            fits(x, z, tf.translation.y) || fits(x, z, tf.translation.y + CLIMB_LIMIT_FT)
+        };
+        if !passable(tf.translation.x, tf.translation.z) {
+            if passable(tf.translation.x, prev.z) {
                 tf.translation.z = prev.z;
-            } else if rise(prev.x, tf.translation.z) <= CLIMB_LIMIT_FT {
+            } else if passable(prev.x, tf.translation.z) {
                 tf.translation.x = prev.x;
             } else {
                 tf.translation.x = prev.x;
@@ -556,7 +641,10 @@ fn worm_gravity(
         }
     }
 
-    let here = ground_world_y(&chunk_world, tf.translation.x, tf.translation.z);
+    // The floor is wherever solid ground actually is BELOW the worm — inside
+    // a tunnel that's the tunnel floor, never some surface high overhead.
+    let here_col = ColumnProbe::at(&chunk_world, tf.translation.x, tf.translation.z);
+    let here = here_col.floor_below(tf.translation.y + 0.02);
 
     // Pre-climb: peek one worm-length ahead on each axis and start mounting
     // climbable rises *before* touching them, so ascent begins early and the
@@ -564,11 +652,12 @@ fn worm_gravity(
     const CLIMB_LOOKAHEAD_FT: f32 = 0.25;
     let mut floor = here;
     for (dx, dz) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
-        let ahead = ground_world_y(
+        let col = ColumnProbe::at(
             &chunk_world,
             tf.translation.x + dx * CLIMB_LOOKAHEAD_FT,
             tf.translation.z + dz * CLIMB_LOOKAHEAD_FT,
         );
+        let ahead = col.floor_below(tf.translation.y + CLIMB_LIMIT_FT);
         if ahead > floor && ahead - here <= CLIMB_LIMIT_FT {
             floor = ahead;
         }
@@ -584,7 +673,10 @@ fn worm_gravity(
     let blend = (time.delta_secs() * 10.0).min(1.0);
     god.reach += (reach_target - god.reach) * blend;
 
-    let stand = floor + WORM_EYE_HEIGHT + god.reach;
+    // Roofs are real: standing height (and stretching) stops under the first
+    // solid voxel overhead instead of poking through it.
+    let ceiling = here_col.ceiling_above(floor + 0.01);
+    let stand = (floor + WORM_EYE_HEIGHT + god.reach).min(ceiling - 0.03).max(floor + 0.02);
     let dy = stand - tf.translation.y;
 
     // Rate-limited vertical follow: uphill is a steady angled glide, small
