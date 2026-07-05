@@ -237,57 +237,63 @@ struct GrassClump {
 const GRASS_WIDTH: f32 = WORM_LENGTH * 3.0;
 const GRASS_HEIGHT: f32 = GRASS_WIDTH * 3.0;
 
-/// Grass slab thickness — a whisker under half an inch, like the extruded
-/// leaves: enough that blades read as things, not paper.
-const GRASS_DEPTH: f32 = GRASS_WIDTH * 0.06;
-
-/// One mildly extruded blade panel: matching front and back cutout faces a
-/// small depth apart, origin at the base centre, with a bottom→top
-/// vertex-colour gradient that tints the white sprite. The parallax between
-/// the two faces gives every blade visible thickness.
-fn grass_quad_mesh(
+/// Lego grass: every opaque pixel of the player's sprite becomes a solid box
+/// one pixel deep — genuine 3D pixel art with joined faces on every side,
+/// meshed with the same culled-voxel builder the trees use, then rescaled to
+/// world size and tinted with a bottom→tip gradient. Oversized sprites are
+/// downsampled to lego resolution first.
+fn grass_lego_mesh(
+    path: &str,
     width: f32,
     height: f32,
     y_offset: f32,
     base: (f32, f32, f32),
     tip: (f32, f32, f32),
 ) -> Mesh {
-    let h = width * 0.5;
-    let d = GRASS_DEPTH * 0.5;
-    let (y0, y1) = (y_offset, y_offset + height);
-    let base = [base.0, base.1, base.2, 1.0];
-    let tip = [tip.0, tip.1, tip.2, 1.0];
+    let img = image::open(path)
+        .unwrap_or_else(|e| panic!("failed to load grass sprite {path}: {e}"))
+        .to_rgba8();
+    let img = if img.width() > 48 || img.height() > 48 {
+        image::imageops::resize(&img, 32, 32, image::imageops::FilterType::Nearest)
+    } else {
+        img
+    };
+    let (w, h) = img.dimensions();
 
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut normals: Vec<[f32; 3]> = Vec::new();
-    let mut uvs: Vec<[f32; 2]> = Vec::new();
-    let mut colors: Vec<[f32; 4]> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
-
-    for (z, n) in [(d, 1.0f32), (-d, -1.0)] {
-        let i0 = positions.len() as u32;
-        positions.extend_from_slice(&[
-            [-h, y0, z],
-            [h, y0, z],
-            [h, y1, z],
-            [-h, y1, z],
-        ]);
-        normals.extend([[0.0, 0.0, n]; 4]);
-        uvs.extend_from_slice(&[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]);
-        colors.extend_from_slice(&[base, base, tip, tip]);
-        if n > 0.0 {
-            indices.extend_from_slice(&[i0, i0 + 1, i0 + 2, i0, i0 + 2, i0 + 3]);
-        } else {
-            indices.extend_from_slice(&[i0, i0 + 2, i0 + 1, i0, i0 + 3, i0 + 2]);
+    let mut cells: HashSet<IVec3> = HashSet::new();
+    for py in 0..h {
+        for px in 0..w {
+            if img.get_pixel(px, py)[3] > 128 {
+                cells.insert(IVec3::new(px as i32, (h - 1 - py) as i32, 0));
+            }
         }
     }
 
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    let mut mesh = build_culled_voxel_mesh(&cells, 1.0);
+
+    // Rescale pixel units to world feet (centred on x, one pixel of depth
+    // centred on z) and paint the height gradient into vertex colours.
+    let sx = width / w as f32;
+    let sy = height / h as f32;
+    let cx = w as f32 * 0.5;
+    let mut colors: Vec<[f32; 4]> = Vec::new();
+    if let Some(bevy::render::mesh::VertexAttributeValues::Float32x3(positions)) =
+        mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
+    {
+        for p in positions.iter_mut() {
+            let t = (p[1] / h as f32).clamp(0.0, 1.0);
+            colors.push([
+                base.0 + (tip.0 - base.0) * t,
+                base.1 + (tip.1 - base.1) * t,
+                base.2 + (tip.2 - base.2) * t,
+                1.0,
+            ]);
+            p[0] = (p[0] - cx) * sx;
+            p[1] = p[1] * sy + y_offset;
+            p[2] = (p[2] - 0.5) * sx;
+        }
+    }
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-    mesh.insert_indices(Indices::U32(indices));
     mesh
 }
 
@@ -364,10 +370,12 @@ fn scatter_chunk_grass(
                 phase: rng.range(0.0, std::f32::consts::TAU),
                 freq: rng.range(2.2, 3.6),
             };
+            // Wild size spread: anything from a 5% sprout barely clearing the
+            // soil to a 200% monster clump twice standard height.
             let transform = Transform {
                 translation: Vec3::new(lx, y, lz),
                 rotation: Quat::from_rotation_y(clump.yaw),
-                scale: Vec3::splat(rng.range(0.75, 1.35)),
+                scale: Vec3::splat(rng.range(0.05, 2.0)),
             };
 
             if let Some((top_mesh, top_mat)) = &species.top {
@@ -1166,58 +1174,58 @@ fn setup_garden(
         }),
     });
 
-    // Grass: player-painted white cutout sprites on crossed quads, tinted per
-    // species with base→tip gradients. Mitchell grass stacks straw seed heads
-    // over blue-green blades.
-    let grass_mat = |materials: &mut Assets<StandardMaterial>, tex: Handle<Image>| {
-        materials.add(StandardMaterial {
-            base_color_texture: Some(tex),
-            alpha_mode: AlphaMode::Mask(0.5),
-            cull_mode: None,
-            perceptual_roughness: 1.0,
-            ..default()
-        })
-    };
+    // Lego grass: the player's sprites pixel-extruded into solid 3D — one
+    // shared opaque vertex-colour material for everything (no cutout, no
+    // sorting). Mitchell stacks straw seed heads over blue-green blades.
+    let grass_material = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        perceptual_roughness: 1.0,
+        ..default()
+    });
     let mitchell = GrassSpecies {
-        mesh: meshes.add(grass_quad_mesh(
+        mesh: meshes.add(grass_lego_mesh(
+            "assets/grass/mitchell.png",
             GRASS_WIDTH,
             GRASS_HEIGHT,
             0.0,
             (0.34, 0.44, 0.26),
             (0.55, 0.60, 0.34),
         )),
-        material: grass_mat(&mut materials, asset_server.load("grass/mitchell.png")),
+        material: grass_material.clone(),
         top: Some((
-            meshes.add(grass_quad_mesh(
+            meshes.add(grass_lego_mesh(
+                "assets/grass/mitchell_top.png",
                 GRASS_WIDTH,
                 GRASS_HEIGHT * 0.6,
                 GRASS_HEIGHT * 0.55,
                 (0.72, 0.62, 0.38),
                 (0.82, 0.74, 0.46),
             )),
-            grass_mat(&mut materials, asset_server.load("grass/mitchell_top.png")),
+            grass_material.clone(),
         )),
     };
     let kangaroo = GrassSpecies {
-        mesh: meshes.add(grass_quad_mesh(
+        mesh: meshes.add(grass_lego_mesh(
+            "assets/grass/kangaroo.png",
             GRASS_WIDTH,
             GRASS_HEIGHT,
             0.0,
             (0.24, 0.40, 0.18),
             (0.60, 0.36, 0.22),
         )),
-        material: grass_mat(&mut materials, asset_server.load("grass/kangaroo.png")),
+        material: grass_material.clone(),
         top: None,
     };
     let button = GrassSpecies {
-        mesh: meshes.add(grass_quad_mesh(
+        mesh: meshes.add(grass_lego_mesh(
+            "assets/grass/button.png",
             GRASS_WIDTH,
             GRASS_HEIGHT,
             0.0,
             (0.28, 0.38, 0.20),
             (0.52, 0.50, 0.30),
         )),
-        material: grass_mat(&mut materials, asset_server.load("grass/button.png")),
+        material: grass_material,
         top: None,
     };
 
