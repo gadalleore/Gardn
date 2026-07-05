@@ -600,6 +600,9 @@ struct FoliageLod {
 /// the old behaviour) for inspecting the giants.
 const GRAVITY_FT_S2: f32 = 32.0;
 const TERMINAL_FALL_FT_S: f32 = 90.0;
+/// Crawl speed, and the god-mode flight multiplier on top of it.
+const WORM_SPEED: f32 = 1.8;
+const GOD_SPEED_MULT: f32 = 3.0;
 
 #[derive(Resource)]
 struct GodMode {
@@ -626,13 +629,19 @@ impl GodMode {
     }
 }
 
-fn toggle_god_mode(keys: Res<ButtonInput<KeyCode>>, mut god: ResMut<GodMode>) {
+fn toggle_god_mode(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut god: ResMut<GodMode>,
+    mut movement: ResMut<MovementSettings>,
+) {
     if keys.just_pressed(KeyCode::KeyG) {
         god.enabled = !god.enabled;
         god.fall_speed = 0.0;
         if god.enabled {
-            println!("👼 God mode ON — free flight.");
+            movement.speed = WORM_SPEED * GOD_SPEED_MULT;
+            println!("👼 God mode ON — 3× flight (the world stays solid).");
         } else {
+            movement.speed = WORM_SPEED;
             println!("🪱 God mode OFF — gravity has you.");
         }
     }
@@ -765,13 +774,45 @@ fn worm_gravity(
     chunk_world: Res<ChunkWorld>,
     mut cam_q: Query<&mut Transform, With<Camera>>,
 ) {
-    if god.enabled {
-        god.prev_pos = None;
-        return;
-    }
     let Ok(mut tf) = cam_q.get_single_mut() else {
         return;
     };
+
+    if god.enabled {
+        // God mode: no gravity, 3× flight — but the world stays solid. The
+        // same body test blocks flying into walls (with axis sliding), a
+        // vertical revert stops phasing through roofs and floors, and a
+        // final clamp keeps the camera out of the ground.
+        if let Some(prev) = god.prev_pos {
+            let fits = |x: f32, z: f32, y: f32| -> bool {
+                let col = ColumnProbe::at(&chunk_world, x, z);
+                !col.solid_at_ft(y) && !col.solid_at_ft(y - WORM_EYE_HEIGHT * 0.6)
+            };
+            let y = tf.translation.y;
+            if !fits(tf.translation.x, tf.translation.z, y) {
+                if fits(tf.translation.x, prev.z, y) {
+                    tf.translation.z = prev.z;
+                } else if fits(prev.x, tf.translation.z, y) {
+                    tf.translation.x = prev.x;
+                } else {
+                    tf.translation.x = prev.x;
+                    tf.translation.z = prev.z;
+                }
+            }
+            // Still inside solid after the horizontal slide (dived or rose
+            // into it): undo the vertical part too.
+            if !fits(tf.translation.x, tf.translation.z, tf.translation.y) {
+                tf.translation.y = prev.y;
+            }
+        }
+        let col = ColumnProbe::at(&chunk_world, tf.translation.x, tf.translation.z);
+        let floor = col.floor_below(tf.translation.y + 0.02);
+        if tf.translation.y < floor + WORM_EYE_HEIGHT * 0.5 {
+            tf.translation.y = floor + WORM_EYE_HEIGHT * 0.5;
+        }
+        god.prev_pos = Some(tf.translation);
+        return;
+    }
 
     // Wind vs. crawl: split this frame's movement into downwind, upwind, and
     // crosswind parts. Tailwinds help a little; headwinds drag harder with
@@ -1030,6 +1071,13 @@ struct PendingBurrow {
 }
 
 fn main() {
+    let god_mode = GodMode::from_env();
+    let start_speed = if god_mode.enabled {
+        WORM_SPEED * GOD_SPEED_MULT
+    } else {
+        WORM_SPEED
+    };
+
     App::new()
         .add_plugins(DefaultPlugins
             // Nearest for the pixel-art look; Repeat so block-skin UVs that run
@@ -1062,12 +1110,12 @@ fn main() {
         .add_plugins(PlayerPlugin) // Adds WASD + mouse look camera automatically
         .insert_resource(MovementSettings {
             sensitivity: 0.00012,
-            speed: 1.8, // Slow crawl — we're a tiny worm
+            speed: start_speed, // Slow crawl — we're a tiny worm (3× in god mode)
             ..default()
         })
         .insert_resource(ClearColor(Color::srgb(0.58, 0.72, 0.88))) // Soft garden sky
         .insert_resource(DayCycle::from_env())
-        .insert_resource(GodMode::from_env())
+        .insert_resource(god_mode)
         .insert_resource(SunDirection(Vec3::new(0.6, 0.6, 0.35).normalize()))
         .init_resource::<Wind>()
         .init_resource::<ChunkWorld>()
