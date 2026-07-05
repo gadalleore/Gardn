@@ -529,14 +529,34 @@ fn worm_gravity(
         tf.translation.z += wind.dir.y * shove;
     }
 
+    // A worm grips well but doesn't scale walls: any rise steeper than about
+    // 45° (more than a worm-height over one worm-length ahead) is a CLIFF.
+    // Movement into a cliff face is cancelled — sliding along whichever axis
+    // stays legal — so mesa walls, ridge bands, and cave shafts are real
+    // obstacles instead of things the camera teleports up.
+    const CLIMB_LIMIT_FT: f32 = 0.26;
+    if let Some(prev) = god.prev_pos {
+        let base = ground_world_y(&chunk_world, prev.x, prev.z);
+        let rise =
+            |x: f32, z: f32| -> f32 { ground_world_y(&chunk_world, x, z) - base };
+        if rise(tf.translation.x, tf.translation.z) > CLIMB_LIMIT_FT {
+            if rise(tf.translation.x, prev.z) <= CLIMB_LIMIT_FT {
+                tf.translation.z = prev.z;
+            } else if rise(prev.x, tf.translation.z) <= CLIMB_LIMIT_FT {
+                tf.translation.x = prev.x;
+            } else {
+                tf.translation.x = prev.x;
+                tf.translation.z = prev.z;
+            }
+        }
+    }
+
     let here = ground_world_y(&chunk_world, tf.translation.x, tf.translation.z);
 
-    // Pre-climb: peek a couple of voxels ahead on each axis and mount small
-    // ledges *before* touching them, so the worm rides up onto a block
-    // instead of clipping into its face first. Rises taller than a step
-    // (real walls and cliffs) don't trigger it.
-    const CLIMB_LOOKAHEAD_FT: f32 = 2.5 * VOXEL_SIZE;
-    const MAX_STEP_FT: f32 = 8.0 * VOXEL_SIZE;
+    // Pre-climb: peek one worm-length ahead on each axis and start mounting
+    // climbable rises *before* touching them, so ascent begins early and the
+    // worm never clips into a block face.
+    const CLIMB_LOOKAHEAD_FT: f32 = 0.25;
     let mut floor = here;
     for (dx, dz) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
         let ahead = ground_world_y(
@@ -544,7 +564,7 @@ fn worm_gravity(
             tf.translation.x + dx * CLIMB_LOOKAHEAD_FT,
             tf.translation.z + dz * CLIMB_LOOKAHEAD_FT,
         );
-        if ahead > floor && ahead - here <= MAX_STEP_FT {
+        if ahead > floor && ahead - here <= CLIMB_LIMIT_FT {
             floor = ahead;
         }
     }
@@ -560,20 +580,26 @@ fn worm_gravity(
     god.reach += (reach_target - god.reach) * blend;
 
     let stand = floor + WORM_EYE_HEIGHT + god.reach;
+    let dy = stand - tf.translation.y;
 
-    // The flycam still nudges Y a little each frame (Space/Shift); anything
-    // within a small tolerance of standing height counts as grounded and gets
-    // snapped, so those nudges can't accumulate into a hover.
-    if tf.translation.y > stand + 0.05 {
-        god.fall_speed =
-            (god.fall_speed + GRAVITY_FT_S2 * time.delta_secs()).min(TERMINAL_FALL_FT_S);
-        tf.translation.y = (tf.translation.y - god.fall_speed * time.delta_secs()).max(stand);
-    } else {
-        // Grounded (or crawling uphill): hug the surface.
-        tf.translation.y = stand;
-    }
-    if tf.translation.y <= stand {
+    // Rate-limited vertical follow: uphill is a steady angled glide, small
+    // downhill steps settle smoothly, and only real drops turn ballistic —
+    // no more per-block camera snapping.
+    const CLIMB_SPEED_FT_S: f32 = 2.4;
+    const SETTLE_SPEED_FT_S: f32 = 4.0;
+    let dt = time.delta_secs();
+    if dy > 0.0 {
+        tf.translation.y += dy.min(CLIMB_SPEED_FT_S * dt);
         god.fall_speed = 0.0;
+    } else if -dy <= 0.35 {
+        tf.translation.y -= (-dy).min(SETTLE_SPEED_FT_S * dt);
+        god.fall_speed = 0.0;
+    } else {
+        god.fall_speed = (god.fall_speed + GRAVITY_FT_S2 * dt).min(TERMINAL_FALL_FT_S);
+        tf.translation.y = (tf.translation.y - god.fall_speed * dt).max(stand);
+        if tf.translation.y <= stand {
+            god.fall_speed = 0.0;
+        }
     }
 
     god.prev_pos = Some(tf.translation);
@@ -1047,13 +1073,13 @@ fn start_tree_build_tasks(
             let tree: VoxelTreeData = generate_tree(species, &mut rng);
             // Bark and foliage are both rasterised on the world voxel grid —
             // one block size for the whole world.
-            let bark_mesh = build_culled_voxel_mesh(&tree.bark, VOXEL_SIZE);
+            let bark_mesh = build_culled_voxel_mesh(&tree.bark, TREE_VOXEL_SIZE);
             let foliage_meshes = FOLIAGE_LOD_FACTORS.map(|factor| {
                 if factor == 1 {
-                    build_culled_voxel_mesh(&tree.foliage, VOXEL_SIZE)
+                    build_culled_voxel_mesh(&tree.foliage, TREE_VOXEL_SIZE)
                 } else {
                     let coarse = downsample_blocks(&tree.foliage, factor, FOLIAGE_LOD_FILL);
-                    build_culled_voxel_mesh(&coarse, VOXEL_SIZE * factor as f32)
+                    build_culled_voxel_mesh(&coarse, TREE_VOXEL_SIZE * factor as f32)
                 }
             });
 
@@ -1061,7 +1087,7 @@ fn start_tree_build_tasks(
             let mut min = Vec3::splat(f32::MAX);
             let mut max = Vec3::splat(f32::MIN);
             for v in &tree.foliage {
-                let p = v.as_vec3() * VOXEL_SIZE;
+                let p = v.as_vec3() * TREE_VOXEL_SIZE;
                 min = min.min(p);
                 max = max.max(p);
             }
@@ -1792,7 +1818,7 @@ fn probe_and_carve(
     let mut hit: Option<(IVec2, IVec3, BlockType)> = None;
 
     'rays: for dir in [forward, Vec3::NEG_Y] {
-        for step in 0..16 {
+        for step in 0..32 {
             let p = cam_pos + dir * (step as f32 * VOXEL_SIZE * 0.5);
             let vx = (p.x / VOXEL_SIZE).floor() as i32;
             let vy = (p.y / VOXEL_SIZE).floor() as i32;

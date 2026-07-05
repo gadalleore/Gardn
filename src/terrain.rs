@@ -207,10 +207,13 @@ pub fn generate_chunk_blocks(
         return voxels;
     }
 
-    const STRIDE: i32 = 8;
+    // Strides are in (1-inch) voxels — layer/height sampling stays at the same
+    // physical spacing it had on the old 2-inch grid, so noise cost per chunk
+    // is unchanged even though the voxel grid is 4× denser.
+    const STRIDE: i32 = 16;
     // Height lattice is finer than the layer lattice so worm-scale micro-relief
     // (5 ft wavelengths) survives the interpolation.
-    const HEIGHT_STRIDE: i32 = 4;
+    const HEIGHT_STRIDE: i32 = 8;
     let cols = CHUNK_VOXELS as usize;
 
     // Biome topography: sample the height function on a sparse lattice and
@@ -797,6 +800,27 @@ pub fn build_culled_voxel_mesh(blocks: &HashSet<IVec3>, block_size: f32) -> Mesh
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_indices(Indices::U32(indices));
     mesh
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::{chunk_seed, chunk_world_origin, WORLD_SEED};
+
+    /// The 1-inch ground grid must stay affordable: one full chunk generates,
+    /// meshes, and lands under a sane vertex ceiling.
+    #[test]
+    fn chunk_generation_stays_within_budget() {
+        let coord = IVec2::new(3, -1);
+        let origin = chunk_world_origin(coord);
+        let blocks = generate_chunk_blocks(coord, origin, chunk_seed(WORLD_SEED, coord));
+        assert!(!blocks.is_empty(), "chunk generated no voxels");
+        let verts = build_colored_terrain_mesh(&blocks).count_vertices();
+        assert!(
+            verts > 0 && verts < 2_500_000,
+            "chunk mesh has {verts} vertices — too heavy for streaming"
+        );
+    }
 }
 
 /// Marks a chunk's terrain mesh child — burrowing despawns and rebuilds it.

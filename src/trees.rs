@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use std::collections::{HashMap, HashSet};
 
-use crate::world::{GardenRng, VOXELS_PER_FOOT, VOXEL_INCHES};
+use crate::world::{GardenRng, TREE_VOXELS_PER_FOOT, TREE_VOXEL_INCHES};
 
 const MAX_BRANCH_DROOP_RATIO: f32 = 0.7;
 
@@ -441,11 +441,11 @@ fn generate_form_tree(rng: &mut GardenRng, form: &TreeForm) -> VoxelTreeData {
 }
 
 fn build_trunk(rng: &mut GardenRng, form: &TreeForm) -> HashSet<IVec3> {
-    let height_voxels = (rng.range_i(form.height_ft.0, form.height_ft.1) * VOXELS_PER_FOOT).max(4);
-    let radius_voxels = (form.radius_in / VOXEL_INCHES).max(1) as f32;
-    let flare_voxels = form.base_flare_in as f32 / VOXEL_INCHES as f32;
-    let wobble_clamp = (form.wobble_clamp_in / VOXEL_INCHES).max(1);
-    let bottle_radius = radius_voxels + rng.range_i(-4, 8) as f32 / VOXEL_INCHES as f32;
+    let height_voxels = (rng.range_i(form.height_ft.0, form.height_ft.1) * TREE_VOXELS_PER_FOOT).max(4);
+    let radius_voxels = (form.radius_in / TREE_VOXEL_INCHES).max(1) as f32;
+    let flare_voxels = form.base_flare_in as f32 / TREE_VOXEL_INCHES as f32;
+    let wobble_clamp = (form.wobble_clamp_in / TREE_VOXEL_INCHES).max(1);
+    let bottle_radius = radius_voxels + rng.range_i(-4, 8) as f32 / TREE_VOXEL_INCHES as f32;
 
     let mut center_x = 0i32;
     let mut center_z = 0i32;
@@ -515,7 +515,7 @@ fn build_trunk(rng: &mut GardenRng, form: &TreeForm) -> HashSet<IVec3> {
         let mut fz = center_z;
         let fork_dx = rng.choice_i(&[-1, 1]);
         let fork_dz = rng.choice_i(&[-1, 1]);
-        let fork_len = rng.range_i(18, 42) / VOXEL_INCHES;
+        let fork_len = rng.range_i(18, 42) / TREE_VOXEL_INCHES;
 
         for i in 0..fork_len {
             let y = fork_start + i;
@@ -574,7 +574,7 @@ fn build_branches(
 
         let dir = sample_branch_direction(rng, outward, form);
         let length_voxels =
-            (rng.range_i(form.branch_len_in.0, form.branch_len_in.1) / VOXEL_INCHES).max(2);
+            (rng.range_i(form.branch_len_in.0, form.branch_len_in.1) / TREE_VOXEL_INCHES).max(2);
         let path = rasterize_branch(start, dir, length_voxels);
 
         let mut tip = None;
@@ -703,7 +703,7 @@ fn rasterize_branch(start: IVec3, dir: Vec3, length_voxels: i32) -> Vec<IVec3> {
 /// Pom-pom leaf cloud at a branch tip — rounded, slightly irregular, sized in
 /// real inches and rasterised straight onto the world voxel grid.
 fn pom_foliage(rng: &mut GardenRng, tip: IVec3, scale: f32) -> HashSet<IVec3> {
-    let jitter = 8 / VOXEL_INCHES;
+    let jitter = 8 / TREE_VOXEL_INCHES;
     let center = tip
         + IVec3::new(
             rng.range_i(-jitter, jitter),
@@ -712,9 +712,9 @@ fn pom_foliage(rng: &mut GardenRng, tip: IVec3, scale: f32) -> HashSet<IVec3> {
         );
 
     let mut cloud = HashSet::new();
-    let radius_x = rng.range(26.0, 46.0) * scale / VOXEL_INCHES as f32;
-    let radius_y = rng.range(19.0, 34.0) * scale / VOXEL_INCHES as f32;
-    let radius_z = rng.range(26.0, 46.0) * scale / VOXEL_INCHES as f32;
+    let radius_x = rng.range(26.0, 46.0) * scale / TREE_VOXEL_INCHES as f32;
+    let radius_y = rng.range(19.0, 34.0) * scale / TREE_VOXEL_INCHES as f32;
+    let radius_z = rng.range(26.0, 46.0) * scale / TREE_VOXEL_INCHES as f32;
     // Lumpy but SOLID: the ellipsoid's radius is eaten into by chunky noise,
     // giving a ragged, sun-pierced silhouette while the interior stays filled
     // (only the shell ever becomes mesh faces).
@@ -761,8 +761,8 @@ fn apex_crown(
     let apex = trunk_centroid_at_y(trunk, max_y);
 
     let scale = form.blob_scale * 1.25;
-    let spread = ((64.0 * form.blob_scale) as i32 / VOXEL_INCHES).max(1);
-    let dip = (14 / VOXEL_INCHES).max(1);
+    let spread = ((64.0 * form.blob_scale) as i32 / TREE_VOXEL_INCHES).max(1);
+    let dip = (14 / TREE_VOXEL_INCHES).max(1);
 
     let mut wood = HashSet::new();
     let mut cloud = HashSet::new();
@@ -806,12 +806,12 @@ fn apex_crown(
 fn dome_canopy(rng: &mut GardenRng, trunk: &HashSet<IVec3>, rx_in: f32, ry_in: f32) -> HashSet<IVec3> {
     let max_y = trunk.iter().map(|p| p.y).max().unwrap_or(0);
     let crown = trunk_centroid_at_y(trunk, max_y);
-    let lift = 8 / VOXEL_INCHES;
+    let lift = 8 / TREE_VOXEL_INCHES;
     let center = IVec3::new(crown.x, max_y + lift, crown.z);
 
-    let rx = rx_in / VOXEL_INCHES as f32 * rng.range(0.85, 1.2);
+    let rx = rx_in / TREE_VOXEL_INCHES as f32 * rng.range(0.85, 1.2);
     let rz = rx * rng.range(0.85, 1.15);
-    let ry = ry_in / VOXEL_INCHES as f32 * rng.range(0.85, 1.2);
+    let ry = ry_in / TREE_VOXEL_INCHES as f32 * rng.range(0.85, 1.2);
 
     let mut cloud = HashSet::new();
     let salt = rng.next_u32();
@@ -849,9 +849,9 @@ fn cone_canopy(rng: &mut GardenRng, trunk: &HashSet<IVec3>) -> HashSet<IVec3> {
     let min_y = trunk.iter().map(|p| p.y).min().unwrap_or(0);
     let max_y = trunk.iter().map(|p| p.y).max().unwrap_or(0);
     let start_y = min_y + ((max_y - min_y) as f32 * 0.3) as i32;
-    let top_y = max_y + 8 / VOXEL_INCHES;
+    let top_y = max_y + 8 / TREE_VOXEL_INCHES;
 
-    let base_radius = rng.range(90.0, 140.0) / VOXEL_INCHES as f32;
+    let base_radius = rng.range(90.0, 140.0) / TREE_VOXEL_INCHES as f32;
     let salt = rng.next_u32();
     let centroids = trunk_centroids(trunk);
 
@@ -889,9 +889,9 @@ fn cone_canopy(rng: &mut GardenRng, trunk: &HashSet<IVec3>) -> HashSet<IVec3> {
 /// Soft tree fern: skinny fibrous trunk, no branches, a crown of long drooping
 /// fronds traced as drooping arcs of leaf voxels.
 fn generate_tree_fern(rng: &mut GardenRng) -> VoxelTreeData {
-    let height_voxels = (rng.range_i(20, 40) * VOXELS_PER_FOOT).max(4);
-    let trunk_r = (8 / VOXEL_INCHES).max(1); // ~16-inch fibrous trunk
-    let clamp = (4 / VOXEL_INCHES).max(1);
+    let height_voxels = (rng.range_i(20, 40) * TREE_VOXELS_PER_FOOT).max(4);
+    let trunk_r = (8 / TREE_VOXEL_INCHES).max(1); // ~16-inch fibrous trunk
+    let clamp = (4 / TREE_VOXEL_INCHES).max(1);
 
     let mut center_x = 0i32;
     let mut center_z = 0i32;
@@ -914,7 +914,7 @@ fn generate_tree_fern(rng: &mut GardenRng) -> VoxelTreeData {
     let mut foliage = HashSet::new();
 
     // Small tuft right at the crown.
-    let tuft = 12 / VOXEL_INCHES;
+    let tuft = 12 / TREE_VOXEL_INCHES;
     for dx in -tuft..=tuft {
         for dz in -tuft..=tuft {
             if dx * dx + dz * dz <= tuft * tuft {
@@ -935,7 +935,7 @@ fn generate_tree_fern(rng: &mut GardenRng) -> VoxelTreeData {
             crown.y as f32 + 2.0,
             crown.z as f32 + 0.5,
         );
-        let frond_len = rng.range_i(110, 200) / VOXEL_INCHES;
+        let frond_len = rng.range_i(110, 200) / TREE_VOXEL_INCHES;
 
         for _ in 0..frond_len {
             pos += dir;

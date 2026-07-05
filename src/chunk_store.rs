@@ -5,7 +5,7 @@ use crate::australia::{biome_profile, AussieBiome};
 use crate::topography::surface_height_voxels;
 use crate::trees::{species_colors, TreeSpecies};
 use crate::world::{
-    chunk_seed, chunk_world_origin, GardenRng, CHUNK_SIZE, VOXEL_SIZE, WORLD_SEED,
+    chunk_seed, chunk_world_origin, GardenRng, CHUNK_SIZE, VOXEL_INCHES, VOXEL_SIZE, WORLD_SEED,
 };
 
 /// Compact on-disk-style snapshot of a chunk column — not every voxel, just what
@@ -118,7 +118,12 @@ fn plan_trees(coord: IVec2) -> Vec<SavedTree> {
         // terrain even on steep worm-mountains, where the chunk mesh's
         // interpolated height can differ by a few voxels from this point sample.
         let surface_y = surface_height_voxels(world_base.x, world_base.z);
-        let local_base = Vec3::new(local_x, (surface_y - 8) as f32 * VOXEL_SIZE, local_z);
+        let root_depth_voxels = 16 / VOXEL_INCHES; // ~16 inches into the soil
+        let local_base = Vec3::new(
+            local_x,
+            (surface_y - root_depth_voxels) as f32 * VOXEL_SIZE,
+            local_z,
+        );
 
         if placed
             .iter()

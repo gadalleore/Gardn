@@ -41,15 +41,15 @@ struct SpawnedSil {
     factor: i32,
 }
 
-/// Far-ground block size by chunk distance: 16-inch blocks in the nearest far
-/// ring, 32-inch beyond that, 64-inch out at the horizon.
+/// Far-ground block size by chunk distance (in 1-inch voxels): 16-inch blocks
+/// in the nearest far ring, 32-inch beyond that, 64-inch out at the horizon.
 fn far_ground_factor(dist: i32) -> i32 {
     if dist <= 8 {
-        8
-    } else if dist <= 14 {
         16
-    } else {
+    } else if dist <= 14 {
         32
+    } else {
+        64
     }
 }
 
@@ -636,7 +636,7 @@ mod tests {
     fn far_ground_meshes_shrink_with_distance() {
         let coord = IVec2::new(3, -2);
         let mut prev = usize::MAX;
-        for factor in [8, 16, 32] {
+        for factor in [16, 32, 64] {
             let mesh = build_far_ground_mesh(coord, factor);
             let verts = mesh.count_vertices();
             assert!(verts > 0, "factor {factor} made an empty ground mesh");

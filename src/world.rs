@@ -1,12 +1,19 @@
 use bevy::prelude::*;
 use std::sync::OnceLock;
 
-/// World units are feet. One shared 2-inch voxel for everything — ground,
-/// trunks, and foliage — so a 3-inch worm reads every block as worm-sized.
+/// World units are feet. Ground runs on a fine 1-inch voxel so terrain reads
+/// as soil rather than masonry to a 3-inch worm; trees keep their own chunkier
+/// 2-inch grid (halving tree voxels would 8× their voxel volume and blow the
+/// VRAM budgets for the giants).
 pub const INCH: f32 = 1.0 / 12.0;
-pub const VOXEL_INCHES: i32 = 2;
+pub const VOXEL_INCHES: i32 = 1;
 pub const VOXEL_SIZE: f32 = VOXEL_INCHES as f32 * INCH;
 pub const VOXELS_PER_FOOT: i32 = 12 / VOXEL_INCHES;
+
+/// Tree voxel grid — bark and foliage rasterise at this size.
+pub const TREE_VOXEL_INCHES: i32 = 2;
+pub const TREE_VOXEL_SIZE: f32 = TREE_VOXEL_INCHES as f32 * INCH;
+pub const TREE_VOXELS_PER_FOOT: i32 = 12 / TREE_VOXEL_INCHES;
 
 pub const WORM_LENGTH: f32 = 3.0 * INCH;
 pub const WORM_EYE_HEIGHT: f32 = 2.5 * INCH;
@@ -17,9 +24,9 @@ pub const WORM_REACH: f32 = 3.0 * INCH;
 /// (chunk shrinks with the voxel so per-chunk generation cost stays constant).
 pub const CHUNK_SIZE: f32 = 32.0;
 pub const CHUNK_VOXELS: i32 = (CHUNK_SIZE / VOXEL_SIZE) as i32;
-/// Underground depth in voxels below the chunk's lowest surface (40 × 2″ ≈
-/// 6.7 ft — that's ~27 worm-lengths of diggable dark, enough for real caves).
-pub const CHUNK_DEPTH_VOXELS: i32 = 40;
+/// Underground depth in voxels below the chunk's lowest surface (48 × 1″ =
+/// 4 ft — 16 worm-lengths of diggable dark; caves live in this band).
+pub const CHUNK_DEPTH_VOXELS: i32 = 48;
 /// Sea level: ocean water tops out at voxel y = 0; land surface rises above it.
 pub const SEA_LEVEL_VOXEL_Y: i32 = 0;
 /// Tallest terrain in voxels above sea level (150 ft — BIG mountains: to a

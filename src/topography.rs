@@ -185,8 +185,9 @@ pub fn is_cave_cell(world_vx: i32, world_vy: i32, world_vz: i32, surface_vy: i32
     let n1 = fbm3(c.x / 7.0, y_ft / 4.5, c.y / 7.0, seed(40), 2);
     let n2 = fbm3(c.x / 9.0, y_ft / 5.5, c.y / 9.0, seed(41), 2);
     let tunnel = n1.abs().max(n2.abs());
-    let mut width = 0.085 + 0.05 * (depth as f32 / 60.0).min(1.0);
-    if depth < 4 {
+    // Depth thresholds are in (1-inch) voxels: skin ~8 in, caverns below ~40 in.
+    let mut width = 0.085 + 0.05 * (depth as f32 / 120.0).min(1.0);
+    if depth < 8 {
         // Surface skin: only the strongest tunnel cores break through as
         // natural cave mouths.
         width *= 0.35;
@@ -196,7 +197,7 @@ pub fn is_cave_cell(world_vx: i32, world_vy: i32, world_vz: i32, surface_vy: i32
     }
 
     // Caverns in the deep dark.
-    depth > 20 && fbm3(c.x / 16.0, y_ft / 8.0, c.y / 16.0, seed(42), 2) > 0.62
+    depth > 40 && fbm3(c.x / 16.0, y_ft / 8.0, c.y / 16.0, seed(42), 2) > 0.62
 }
 
 fn seed(n: u32) -> u32 {
@@ -400,7 +401,7 @@ mod tests {
                 let vx = (x / VOXEL_SIZE) as i32;
                 let vz = (z / VOXEL_SIZE) as i32;
                 // Probe the tunnel band under the skin.
-                for depth in [6, 14, 22, 30] {
+                for depth in [12, 28, 44, 60] {
                     total += 1;
                     if is_cave_cell(vx, surface - depth, vz, surface) {
                         cave += 1;
