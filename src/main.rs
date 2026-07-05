@@ -225,7 +225,13 @@ fn update_wind_streamers(
     let dt = time.delta_secs();
     let t = time.elapsed_secs();
 
-    let desired = (wind.strength * 6.0).round() as usize;
+    // Streamer population: none on a calm day, a handful in light air, a
+    // blizzard of them in a gale.
+    let desired = if wind.strength < 0.4 {
+        0
+    } else {
+        ((wind.strength * 10.0).round() as usize).max(4)
+    };
 
     let mut alive = 0usize;
     for (entity, mut streamer, mut tf) in &mut streamers {
@@ -250,12 +256,11 @@ fn update_wind_streamers(
     while to_spawn > 0 {
         to_spawn -= 1;
         let side = Vec3::new(-dir3.z, 0.0, dir3.x);
-        let mut pos = cam_pos - dir3 * wind.rng.range(8.0, 30.0)
-            + side * wind.rng.range(-18.0, 18.0)
-            + Vec3::Y * wind.rng.range(-0.5, 4.5);
-        pos.y = pos
-            .y
-            .max(ground_world_y(&chunk_world, pos.x, pos.z) + 0.25);
+        // Low worm-level airspace, close by — streamers a worm actually sees,
+        // hugging the ground it crawls on.
+        let mut pos =
+            cam_pos - dir3 * wind.rng.range(3.0, 18.0) + side * wind.rng.range(-10.0, 10.0);
+        pos.y = ground_world_y(&chunk_world, pos.x, pos.z) + wind.rng.range(0.15, 2.2);
 
         let speed = 4.0 + wind.strength * 3.0 + wind.rng.range(0.0, 2.0);
         commands.spawn((
@@ -271,7 +276,8 @@ fn update_wind_streamers(
             Transform {
                 translation: pos,
                 rotation: yaw,
-                ..default()
+                // Faster air draws longer streaks.
+                scale: Vec3::new(0.7 + speed * 0.1, 1.0, 1.0),
             },
         ));
     }
@@ -404,6 +410,9 @@ struct GodMode {
     /// Current upward stretch from holding Space — a worm can *reach*, not
     /// jump (jumping waits for the "legs" branch of the skill tree).
     reach: f32,
+    /// Camera position at the end of last frame's physics — the difference is
+    /// this frame's crawl input, which the wind gets to argue with.
+    prev_pos: Option<Vec3>,
 }
 
 impl GodMode {
@@ -414,6 +423,7 @@ impl GodMode {
             enabled,
             fall_speed: 0.0,
             reach: 0.0,
+            prev_pos: None,
         }
     }
 }
@@ -477,11 +487,39 @@ fn worm_gravity(
     mut cam_q: Query<&mut Transform, With<Camera>>,
 ) {
     if god.enabled {
+        god.prev_pos = None;
         return;
     }
     let Ok(mut tf) = cam_q.get_single_mut() else {
         return;
     };
+
+    // Wind vs. crawl: split this frame's movement into downwind, upwind, and
+    // crosswind parts. Tailwinds help a little; headwinds drag harder with
+    // every level; at gale strength control collapses — upwind is impossible,
+    // sideways barely works, and even going with it is a slow scramble.
+    if let Some(prev) = god.prev_pos {
+        let delta = Vec2::new(tf.translation.x - prev.x, tf.translation.z - prev.z);
+        // Ignore teleport-sized jumps (spawns, debug moves).
+        if delta.length_squared() < 25.0 && delta.length_squared() > 0.0 {
+            let s = wind.strength;
+            let along = delta.dot(wind.dir);
+            let cross = delta - wind.dir * along;
+
+            // 4/5 → gale: whatever control is left fades out fast.
+            let control = 1.0 - ((s - WIND_PUSH_FROM).clamp(0.0, 1.0) * 0.65);
+            let along_scaled = if along >= 0.0 {
+                along * (1.0 + 0.08 * s) * control
+            } else {
+                along * (1.0 - 0.2 * s).max(0.0)
+            };
+            let cross_scaled = cross * (1.0 - 0.06 * s).max(0.2) * control;
+
+            let adjusted = wind.dir * along_scaled + cross_scaled;
+            tf.translation.x = prev.x + adjusted.x;
+            tf.translation.z = prev.z + adjusted.y;
+        }
+    }
 
     // A gale shoves the worm downwind — above 4/5 the push outpaces crawling
     // into it, so find shelter or get blown across the paddock.
@@ -537,6 +575,8 @@ fn worm_gravity(
     if tf.translation.y <= stand {
         god.fall_speed = 0.0;
     }
+
+    god.prev_pos = Some(tf.translation);
 }
 
 /// One full sun cycle every 24 real hours. The clock starts at
@@ -811,12 +851,13 @@ fn setup_garden(
         }),
     });
 
-    // Wind streamers: pale ribbons ~1.4 ft long, faintly translucent, unlit
-    // so they read as moving air rather than solid geometry.
+    // Wind streamers: pale ribbons ~1.4 ft long, translucent, unlit so they
+    // read as moving air rather than solid geometry. Kept low over the ground
+    // where a worm's eye actually looks.
     commands.insert_resource(StreamerAssets {
-        mesh: meshes.add(Cuboid::new(1.4, 0.02, 0.02)),
+        mesh: meshes.add(Cuboid::new(1.4, 0.025, 0.025)),
         material: materials.add(StandardMaterial {
-            base_color: Color::srgba(1.0, 1.0, 1.0, 0.38),
+            base_color: Color::srgba(0.96, 0.97, 1.0, 0.6),
             alpha_mode: AlphaMode::Blend,
             unlit: true,
             ..default()
