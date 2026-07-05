@@ -237,8 +237,14 @@ struct GrassClump {
 const GRASS_WIDTH: f32 = WORM_LENGTH * 3.0;
 const GRASS_HEIGHT: f32 = GRASS_WIDTH * 3.0;
 
-/// One flat vertical quad, origin at the base centre, double-sided, with a
-/// bottom→top vertex-colour gradient that tints the white sprite.
+/// Grass slab thickness — a whisker under half an inch, like the extruded
+/// leaves: enough that blades read as things, not paper.
+const GRASS_DEPTH: f32 = GRASS_WIDTH * 0.06;
+
+/// One mildly extruded blade panel: matching front and back cutout faces a
+/// small depth apart, origin at the base centre, with a bottom→top
+/// vertex-colour gradient that tints the white sprite. The parallax between
+/// the two faces gives every blade visible thickness.
 fn grass_quad_mesh(
     width: f32,
     height: f32,
@@ -247,20 +253,34 @@ fn grass_quad_mesh(
     tip: (f32, f32, f32),
 ) -> Mesh {
     let h = width * 0.5;
+    let d = GRASS_DEPTH * 0.5;
     let (y0, y1) = (y_offset, y_offset + height);
     let base = [base.0, base.1, base.2, 1.0];
     let tip = [tip.0, tip.1, tip.2, 1.0];
 
-    let positions: Vec<[f32; 3]> = vec![
-        [-h, y0, 0.0],
-        [h, y0, 0.0],
-        [h, y1, 0.0],
-        [-h, y1, 0.0],
-    ];
-    let normals: Vec<[f32; 3]> = vec![[0.0, 0.0, 1.0]; 4];
-    let uvs: Vec<[f32; 2]> = vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
-    let colors: Vec<[f32; 4]> = vec![base, base, tip, tip];
-    let indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut colors: Vec<[f32; 4]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    for (z, n) in [(d, 1.0f32), (-d, -1.0)] {
+        let i0 = positions.len() as u32;
+        positions.extend_from_slice(&[
+            [-h, y0, z],
+            [h, y0, z],
+            [h, y1, z],
+            [-h, y1, z],
+        ]);
+        normals.extend([[0.0, 0.0, n]; 4]);
+        uvs.extend_from_slice(&[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]);
+        colors.extend_from_slice(&[base, base, tip, tip]);
+        if n > 0.0 {
+            indices.extend_from_slice(&[i0, i0 + 1, i0 + 2, i0, i0 + 2, i0 + 3]);
+        } else {
+            indices.extend_from_slice(&[i0, i0 + 2, i0 + 1, i0, i0 + 3, i0 + 2]);
+        }
+    }
 
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
