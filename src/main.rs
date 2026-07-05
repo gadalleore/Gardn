@@ -53,7 +53,9 @@ struct WildTree {
 
 #[derive(Component)]
 struct FloatingLeaf {
+    base_x: f32,
     base_y: f32,
+    base_z: f32,
     phase: f32,
     bob_speed: f32,
     spin_speed: f32,
@@ -203,6 +205,157 @@ struct WindStreamer {
 struct StreamerAssets {
     mesh: Handle<Mesh>,
     material: Handle<StandardMaterial>,
+}
+
+/// Grass clumps are leaf-width crossed quads wearing the player's white
+/// cutout sprites, tinted per species with a base→tip vertex-colour gradient.
+/// Mitchell grass is two-part: blades plus a separately tinted seed-head top.
+struct GrassSpecies {
+    mesh: Handle<Mesh>,
+    material: Handle<StandardMaterial>,
+    /// Optional stacked top piece (Mitchell's straw seed heads).
+    top: Option<(Handle<Mesh>, Handle<StandardMaterial>)>,
+}
+
+#[derive(Resource)]
+struct GrassAssets {
+    species: Vec<GrassSpecies>,
+    /// Per biome (`AussieBiome as usize`): species index + clumps per chunk.
+    by_biome: [Option<(usize, (i32, i32))>; 8],
+}
+
+/// One planted clump: fixed facing plus its own sway rhythm.
+#[derive(Component, Clone, Copy)]
+struct GrassClump {
+    yaw: f32,
+    phase: f32,
+    freq: f32,
+}
+
+/// Grass clumps match the collectible leaves in width (~3 worm-lengths).
+const GRASS_WIDTH: f32 = WORM_LENGTH * 3.0;
+
+/// Two crossed vertical quads (an X from above), origin at the base centre,
+/// with a bottom→top vertex-colour gradient that tints the white sprite.
+fn grass_cross_mesh(
+    width: f32,
+    height: f32,
+    y_offset: f32,
+    base: (f32, f32, f32),
+    tip: (f32, f32, f32),
+) -> Mesh {
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut colors: Vec<[f32; 4]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    let h = width * 0.5;
+    let (y0, y1) = (y_offset, y_offset + height);
+    let base = [base.0, base.1, base.2, 1.0];
+    let tip = [tip.0, tip.1, tip.2, 1.0];
+
+    for (a, b, normal) in [
+        ([-h, 0.0], [h, 0.0], [0.0, 0.0, 1.0f32]),
+        ([0.0, -h], [0.0, h], [1.0, 0.0, 0.0]),
+    ] {
+        let i0 = positions.len() as u32;
+        positions.extend_from_slice(&[
+            [a[0], y0, a[1]],
+            [b[0], y0, b[1]],
+            [b[0], y1, b[1]],
+            [a[0], y1, a[1]],
+        ]);
+        normals.extend([normal; 4]);
+        uvs.extend_from_slice(&[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]);
+        colors.extend_from_slice(&[base, base, tip, tip]);
+        indices.extend_from_slice(&[i0, i0 + 1, i0 + 2, i0, i0 + 2, i0 + 3]);
+    }
+
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
+}
+
+/// Grass shivers fast and light — same wind and gusts as the trees, higher
+/// frequency, and it flattens progressively in a gale.
+fn sway_grass(
+    time: Res<Time>,
+    wind: Res<Wind>,
+    mut clumps: Query<(&GrassClump, &mut Transform)>,
+) {
+    let t = time.elapsed_secs();
+    let gust = 0.5 + 0.5 * ((t * 0.11).sin() * 0.6 + (t * 0.043).sin() * 0.4);
+    let lean_axis = Vec3::new(-wind.dir.y, 0.0, wind.dir.x);
+    let force = wind.strength / 5.0;
+
+    for (clump, mut tf) in &mut clumps {
+        let angle = force
+            * ((0.06 + 0.11 * gust) * (t * clump.freq + clump.phase).sin() + 0.35 * gust);
+        tf.rotation =
+            Quat::from_axis_angle(lean_axis, angle) * Quat::from_rotation_y(clump.yaw);
+    }
+}
+
+/// Blanket a chunk in grass clumps — species and density by biome, planted on
+/// the chunk's REAL column tops so every clump roots exactly on the dirt.
+fn scatter_chunk_grass(
+    commands: &mut Commands,
+    chunk_entity: Entity,
+    coord: IVec2,
+    tops: &[i32],
+    grass: &GrassAssets,
+) {
+    let center = chunk_world_origin(coord) + Vec3::new(CHUNK_SIZE * 0.5, 0.0, CHUNK_SIZE * 0.5);
+    let profile = biome_profile(center.x, center.z);
+    let Some((species_idx, (lo, hi))) = grass.by_biome[profile.biome as usize] else {
+        return;
+    };
+    let species = &grass.species[species_idx];
+
+    let mut rng = GardenRng::new(chunk_seed(WORLD_SEED, coord) ^ 0x6A55_6A55);
+    let count = rng.range_i(lo, hi);
+
+    commands.entity(chunk_entity).with_children(|chunk| {
+        for _ in 0..count {
+            let lx = rng.range(0.2, CHUNK_SIZE - 0.2);
+            let lz = rng.range(0.2, CHUNK_SIZE - 0.2);
+            let cx = ((lx / VOXEL_SIZE) as i32).clamp(0, CHUNK_VOXELS - 1);
+            let cz = ((lz / VOXEL_SIZE) as i32).clamp(0, CHUNK_VOXELS - 1);
+            let y = (tops[(cz * CHUNK_VOXELS + cx) as usize] + 1) as f32 * VOXEL_SIZE;
+
+            let clump = GrassClump {
+                yaw: rng.range(0.0, std::f32::consts::TAU),
+                phase: rng.range(0.0, std::f32::consts::TAU),
+                freq: rng.range(2.2, 3.6),
+            };
+            let transform = Transform {
+                translation: Vec3::new(lx, y, lz),
+                rotation: Quat::from_rotation_y(clump.yaw),
+                scale: Vec3::splat(rng.range(0.75, 1.35)),
+            };
+
+            if let Some((top_mesh, top_mat)) = &species.top {
+                chunk.spawn((
+                    GrassClump { ..clump },
+                    Mesh3d(top_mesh.clone()),
+                    MeshMaterial3d(top_mat.clone()),
+                    NotShadowCaster,
+                    transform,
+                ));
+            }
+            chunk.spawn((
+                clump,
+                Mesh3d(species.mesh.clone()),
+                MeshMaterial3d(species.material.clone()),
+                NotShadowCaster,
+                transform,
+            ));
+        }
+    });
 }
 
 /// Keep a population of streamers proportional to wind strength flowing past
@@ -919,6 +1072,7 @@ fn main() {
                 update_foliage_lod,
                 update_wind,
                 sway_trees,
+                sway_grass,
                 update_wind_streamers,
                 update_day_cycle,
                 fade_in_materials,
@@ -978,6 +1132,75 @@ fn setup_garden(
             perceptual_roughness: 1.0,
             ..default()
         }),
+    });
+
+    // Grass: player-painted white cutout sprites on crossed quads, tinted per
+    // species with base→tip gradients. Mitchell grass stacks straw seed heads
+    // over blue-green blades.
+    let grass_mat = |materials: &mut Assets<StandardMaterial>, tex: Handle<Image>| {
+        materials.add(StandardMaterial {
+            base_color_texture: Some(tex),
+            alpha_mode: AlphaMode::Mask(0.5),
+            cull_mode: None,
+            perceptual_roughness: 1.0,
+            ..default()
+        })
+    };
+    let mitchell = GrassSpecies {
+        mesh: meshes.add(grass_cross_mesh(
+            GRASS_WIDTH,
+            GRASS_WIDTH,
+            0.0,
+            (0.34, 0.44, 0.26),
+            (0.55, 0.60, 0.34),
+        )),
+        material: grass_mat(&mut materials, asset_server.load("grass/mitchell.png")),
+        top: Some((
+            meshes.add(grass_cross_mesh(
+                GRASS_WIDTH,
+                GRASS_WIDTH,
+                GRASS_WIDTH * 0.7,
+                (0.72, 0.62, 0.38),
+                (0.82, 0.74, 0.46),
+            )),
+            grass_mat(&mut materials, asset_server.load("grass/mitchell_top.png")),
+        )),
+    };
+    let kangaroo = GrassSpecies {
+        mesh: meshes.add(grass_cross_mesh(
+            GRASS_WIDTH,
+            GRASS_WIDTH,
+            0.0,
+            (0.24, 0.40, 0.18),
+            (0.60, 0.36, 0.22),
+        )),
+        material: grass_mat(&mut materials, asset_server.load("grass/kangaroo.png")),
+        top: None,
+    };
+    let button = GrassSpecies {
+        mesh: meshes.add(grass_cross_mesh(
+            GRASS_WIDTH,
+            GRASS_WIDTH,
+            0.0,
+            (0.28, 0.38, 0.20),
+            (0.52, 0.50, 0.30),
+        )),
+        material: grass_mat(&mut materials, asset_server.load("grass/button.png")),
+        top: None,
+    };
+
+    let mut by_biome: [Option<(usize, (i32, i32))>; 8] = [None; 8];
+    by_biome[AussieBiome::TropicalSavanna as usize] = Some((0, (40, 80)));
+    by_biome[AussieBiome::AridOutback as usize] = Some((0, (8, 20)));
+    by_biome[AussieBiome::Pilbara as usize] = Some((0, (10, 24)));
+    by_biome[AussieBiome::Mediterranean as usize] = Some((1, (60, 110)));
+    // Forests get a LOT of grass.
+    by_biome[AussieBiome::TemperateForest as usize] = Some((1, (110, 180)));
+    by_biome[AussieBiome::CoastalBush as usize] = Some((1, (60, 100)));
+    by_biome[AussieBiome::Tasmania as usize] = Some((2, (70, 120)));
+    commands.insert_resource(GrassAssets {
+        species: vec![mitchell, kangaroo, button],
+        by_biome,
     });
 
     // Wind streamers: pale ribbons ~1.4 ft long, translucent, unlit so they
@@ -1647,6 +1870,7 @@ fn finish_chunk_tasks(
     mut tree_queue: ResMut<TreeSpawnQueue>,
     terrain_materials: Res<TerrainMaterials>,
     leaf_assets: Res<LeafAssets>,
+    grass_assets: Res<GrassAssets>,
     mut pending_q: Query<(Entity, &mut PendingChunk)>,
 ) {
     for (holder, mut pending) in &mut pending_q {
@@ -1689,6 +1913,13 @@ fn finish_chunk_tasks(
             });
         }
         scatter_chunk_leaves(&mut commands, chunk_entity, coord, &leaf_assets);
+        scatter_chunk_grass(
+            &mut commands,
+            chunk_entity,
+            coord,
+            &built.column_tops,
+            &grass_assets,
+        );
 
         tree_queue.0.extend(built.record.tree_jobs(chunk_entity));
         chunk_world.surface_tops.insert(coord, built.column_tops);
@@ -1735,7 +1966,9 @@ fn spawn_textured_leaves(commands: &mut Commands, leaf_assets: &LeafAssets) {
             },
             Leaf,
             FloatingLeaf {
+                base_x: pos.x,
                 base_y: pos.y,
+                base_z: pos.z,
                 phase,
                 bob_speed,
                 spin_speed,
@@ -1787,7 +2020,9 @@ fn scatter_chunk_leaves(
                 },
                 Leaf,
                 FloatingLeaf {
+                    base_x: lx,
                     base_y: y,
+                    base_z: lz,
                     phase: rng.range(0.0, std::f32::consts::TAU),
                     bob_speed: rng.range(1.2, 2.4),
                     spin_speed: rng.range(0.45, 1.3),
@@ -2089,27 +2324,40 @@ fn finish_burrow_tasks(
 }
 
 /// Animates the floating 3D leaves (now with real thickness).
-/// They bob and spin; the small extrusion gives them volume and edge highlights.
+/// They bob and spin — and they answer the wind: drifting downwind, leaning
+/// with it, and spinning faster the harder it blows.
 fn animate_floating_leaves(
     time: Res<Time>,
+    wind: Res<Wind>,
     mut query: Query<(&mut Transform, &FloatingLeaf)>,
 ) {
     let t = time.elapsed_secs();
+    let force = wind.strength / 5.0;
+    let lean_axis = Vec3::new(-wind.dir.y, 0.0, wind.dir.x);
 
     for (mut transform, floating) in &mut query {
-        // Gentle vertical bob
-        let bob = (t * floating.bob_speed + floating.phase).sin() * 0.20;
+        // Gentle vertical bob, a little choppier when the wind is up.
+        let bob = (t * floating.bob_speed * (1.0 + force * 0.8) + floating.phase).sin() * 0.20;
         transform.translation.y = floating.base_y + bob;
 
-        // Spin around Y
-        let spin = Quat::from_rotation_y(t * floating.spin_speed + floating.phase * 0.5);
+        // Downwind drift: tethered to the spawn point, straining with gusts.
+        let drift = force * (0.22 + 0.12 * (t * 1.3 + floating.phase).sin());
+        transform.translation.x = floating.base_x + wind.dir.x * drift;
+        transform.translation.z = floating.base_z + wind.dir.y * drift;
+
+        // Spin around Y — a gale whips leaves into a proper twirl.
+        let spin = Quat::from_rotation_y(
+            t * floating.spin_speed * (1.0 + force * 1.6) + floating.phase * 0.5,
+        );
 
         // Combine:
+        // - A downwind lean that grows with the wind
         // - The artistic base rotation the leaf was given at spawn
         // - Y spin for rotation
         // - Strong vertical orientation so the plane stands up instead of lying flat
+        let lean = Quat::from_axis_angle(lean_axis, force * 0.4);
         let vertical_stand = Quat::from_rotation_x(-1.4);
-        transform.rotation = spin * vertical_stand * floating.base_rotation;
+        transform.rotation = lean * spin * vertical_stand * floating.base_rotation;
     }
 }
 
