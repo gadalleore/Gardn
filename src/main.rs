@@ -263,6 +263,12 @@ fn update_wind_streamers(
         pos.y = ground_world_y(&chunk_world, pos.x, pos.z) + wind.rng.range(0.15, 2.2);
 
         let speed = 4.0 + wind.strength * 3.0 + wind.rng.range(0.0, 2.0);
+        // The streamer IS the wind gauge: a level-1 breeze draws short wisps,
+        // a level-5 gale drags long fat banners. (Direction is the streak's
+        // long axis + its motion — both point downwind.)
+        let power = wind.strength / 5.0;
+        let length = (0.4 + power * 2.6) * wind.rng.range(0.85, 1.15);
+        let girth = 0.5 + power * 2.0;
         commands.spawn((
             WindStreamer {
                 age: 0.0,
@@ -276,8 +282,7 @@ fn update_wind_streamers(
             Transform {
                 translation: pos,
                 rotation: yaw,
-                // Faster air draws longer streaks.
-                scale: Vec3::new(0.7 + speed * 0.1, 1.0, 1.0),
+                scale: Vec3::new(length, girth, girth),
             },
         ));
     }
