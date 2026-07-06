@@ -29,8 +29,9 @@ use chunk_store::{
 };
 use map_ui::{setup_map_ui, toggle_map_ui, update_map_ui, MapOverlay};
 use silhouettes::{
-    billboard_silhouettes, orient_silhouette_shadows, plan_tree_silhouettes,
-    process_silhouette_queue, setup_silhouette_assets, SilhouetteWorld,
+    begin_silhouette_fadeout, billboard_silhouettes, orient_silhouette_shadows,
+    plan_tree_silhouettes, process_silhouette_queue, setup_silhouette_assets,
+    tick_silhouette_fadeout, SilhouetteWorld,
 };
 use terrain::{
     apply_edits, build_culled_voxel_mesh, downsample_blocks, generate_chunk_blocks, BlockType,
@@ -587,6 +588,10 @@ const FOLIAGE_LOD_FILL: f32 = 0.2;
 struct FoliageLodGroup {
     center: Vec3,
     radius: f32,
+    /// Currently shown rung — remembered so the boundary has hysteresis:
+    /// stepping finer needs ~10% of slack, so grazing a cutoff can't strobe
+    /// the crown between two meshes.
+    level: usize,
 }
 
 /// On each foliage mesh child: which rung of the LOD ladder it is.
@@ -1157,6 +1162,8 @@ fn main() {
             (
                 billboard_silhouettes,
                 orient_silhouette_shadows,
+                begin_silhouette_fadeout,
+                tick_silhouette_fadeout,
                 update_foliage_lod,
                 update_wind,
                 sway_trees,
@@ -1616,6 +1623,7 @@ fn finish_tree_build_tasks(
                         FoliageLodGroup {
                             center: built.foliage_center,
                             radius: built.foliage_radius,
+                            level: 0,
                         },
                         Visibility::default(),
                         Transform::from_translation(local_base),
@@ -1670,7 +1678,7 @@ fn finish_tree_build_tasks(
 /// directly below, and sharpens again if you ever get up there.
 fn update_foliage_lod(
     cam_q: Query<&Transform, With<Camera>>,
-    trees: Query<(&GlobalTransform, &FoliageLodGroup, &Children)>,
+    mut trees: Query<(&GlobalTransform, &mut FoliageLodGroup, &Children)>,
     mut lods: Query<(&FoliageLod, &mut Visibility)>,
 ) {
     let Ok(cam) = cam_q.get_single() else {
@@ -1678,13 +1686,21 @@ fn update_foliage_lod(
     };
     let cam_pos = cam.translation;
 
-    for (tree_tf, group, children) in &trees {
+    for (tree_tf, mut group, children) in &mut trees {
         let center = tree_tf.translation() + group.center;
         let dist = (cam_pos - center).length() - group.radius;
-        let level = FOLIAGE_LOD_DISTANCES_FT
-            .iter()
-            .position(|&cutoff| dist < cutoff)
-            .unwrap_or(FOLIAGE_LOD_DISTANCES_FT.len());
+        // Step coarser the moment a cutoff is crossed, but only step finer
+        // again once ~10% inside it — hovering on the line can't flicker.
+        let mut level = group.level;
+        while level < FOLIAGE_LOD_DISTANCES_FT.len() && dist >= FOLIAGE_LOD_DISTANCES_FT[level] {
+            level += 1;
+        }
+        while level > 0 && dist < FOLIAGE_LOD_DISTANCES_FT[level - 1] * 0.9 {
+            level -= 1;
+        }
+        if group.level != level {
+            group.level = level;
+        }
 
         for child in children {
             let Ok((lod, mut vis)) = lods.get_mut(*child) else {
@@ -1990,6 +2006,13 @@ fn finish_chunk_tasks(
 
         if let Some(mesh) = built.mesh {
             let mesh = meshes.add(mesh);
+            // Real terrain spawns opaque. It must NOT fade in from transparent:
+            // chunks that load without a coarse silhouette behind them (every
+            // chunk at spawn, and anything inside the streamed neighbourhood)
+            // would show straight through the world as a gaping hole for the
+            // duration of the fade. The coarse far ground is despawned the same
+            // frame this appears (see plan_tree_silhouettes), so the hand-off is
+            // gapless, and the seam fix now lands both at the same height.
             let material = terrain_materials.vertex_color_terrain.clone();
             commands.entity(chunk_entity).with_children(|parent| {
                 parent.spawn((

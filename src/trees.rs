@@ -419,7 +419,7 @@ fn default_form() -> TreeForm {
 }
 
 fn generate_form_tree(rng: &mut GardenRng, form: &TreeForm) -> VoxelTreeData {
-    let trunk = build_trunk(rng, form);
+    let (trunk, stem_tops) = build_trunk(rng, form);
     let (branches, mut foliage) = build_branches(rng, form, &trunk);
 
     if let Some((rx_in, ry_in)) = form.dome {
@@ -432,109 +432,143 @@ fn generate_form_tree(rng: &mut GardenRng, form: &TreeForm) -> VoxelTreeData {
     bark.extend(branches);
 
     if form.dome.is_none() && !form.cone {
-        let (crown_wood, crown_leaves) = apex_crown(rng, &bark, form);
-        bark.extend(crown_wood);
-        foliage.extend(crown_leaves);
+        // A branching crown grows from every stem top, so a low-forked trunk
+        // wears one broad canopy shared across its stems.
+        for (top, base_r) in &stem_tops {
+            let (crown_wood, crown_leaves) = apex_crown(rng, *top, *base_r, form);
+            bark.extend(crown_wood);
+            foliage.extend(crown_leaves);
+        }
     }
 
     VoxelTreeData { bark, foliage }
 }
 
-fn build_trunk(rng: &mut GardenRng, form: &TreeForm) -> HashSet<IVec3> {
-    let height_voxels = (rng.range_i(form.height_ft.0, form.height_ft.1) * TREE_VOXELS_PER_FOOT).max(4);
+/// Stamp one trunk/stem cross-section at layer `y`: a filled disc, or a
+/// 2-voxel-thick ring for fat radii (fat trunks are hollow shells — the culled
+/// mesh only ever shows the surface, so interior voxels are pure waste).
+/// `solid` forces a filled disc, used to cap stem/trunk tops so crowns attach.
+fn stamp_disc(set: &mut HashSet<IVec3>, cx: i32, cz: i32, y: i32, r: f32, solid: bool) {
+    let ri = r.round().max(1.0) as i32;
+    let ri_sq = ri * ri;
+    let inner_sq = if ri >= 4 && !solid { (ri - 2) * (ri - 2) } else { -1 };
+    for dx in -ri..=ri {
+        for dz in -ri..=ri {
+            let d_sq = dx * dx + dz * dz;
+            if d_sq <= ri_sq && d_sq > inner_sq {
+                set.insert(IVec3::new(cx + dx, y, cz + dz));
+            }
+        }
+    }
+}
+
+/// Build the trunk and return it together with the crown attachment points —
+/// each `(top_centre, top_radius)`. Gum-type trees (everything that isn't a
+/// dome, cone, or bottle) fork LOW: a short flared base rises, then splits into
+/// 2–3 stems that lean out and climb to full height, so the whole tree branches
+/// from near the ground rather than being a bare pole capped with a crown. Each
+/// stem carries its own crown. Domes/cones/bottles keep a single trunk (a boab
+/// IS a fat single stem), so they return one attachment point at the apex.
+fn build_trunk(rng: &mut GardenRng, form: &TreeForm) -> (HashSet<IVec3>, Vec<(IVec3, i32)>) {
+    let height_voxels =
+        (rng.range_i(form.height_ft.0, form.height_ft.1) * TREE_VOXELS_PER_FOOT).max(4);
     let radius_voxels = (form.radius_in / TREE_VOXEL_INCHES).max(1) as f32;
     let flare_voxels = form.base_flare_in as f32 / TREE_VOXEL_INCHES as f32;
     let wobble_clamp = (form.wobble_clamp_in / TREE_VOXEL_INCHES).max(1);
-    let bottle_radius = radius_voxels + rng.range_i(-4, 8) as f32 / TREE_VOXEL_INCHES as f32;
 
-    let mut center_x = 0i32;
-    let mut center_z = 0i32;
+    let multi_stem = form.dome.is_none() && !form.cone && !form.bottle;
     let mut trunk = HashSet::new();
 
-    for y in 0..height_voxels {
-        if y > 0 {
-            if rng.chance(form.wobble) {
-                center_x += rng.choice_i(&[-1, 0, 1]);
+    if !multi_stem {
+        // Single column — dome/cone/bottle species.
+        let bottle_radius = radius_voxels + rng.range_i(-4, 8) as f32 / TREE_VOXEL_INCHES as f32;
+        let mut center_x = 0i32;
+        let mut center_z = 0i32;
+        for y in 0..height_voxels {
+            if y > 0 {
+                if rng.chance(form.wobble) { center_x += rng.choice_i(&[-1, 0, 1]); }
+                if rng.chance(form.wobble) { center_z += rng.choice_i(&[-1, 0, 1]); }
+                center_x = center_x.clamp(-wobble_clamp, wobble_clamp);
+                center_z = center_z.clamp(-wobble_clamp, wobble_clamp);
             }
-            if rng.chance(form.wobble) {
-                center_z += rng.choice_i(&[-1, 0, 1]);
-            }
-            center_x = center_x.clamp(-wobble_clamp, wobble_clamp);
-            center_z = center_z.clamp(-wobble_clamp, wobble_clamp);
-        }
-
-        let t = y as f32 / height_voxels as f32;
-        let mut r = radius_voxels;
-        if form.bottle {
-            r = if t < 0.55 {
-                bottle_radius * (1.06 - 0.18 * t)
+            let t = y as f32 / height_voxels as f32;
+            let mut r = radius_voxels;
+            if form.bottle {
+                r = if t < 0.55 {
+                    bottle_radius * (1.06 - 0.18 * t)
+                } else {
+                    let k = ((t - 0.55) / 0.45).powf(0.8);
+                    let shoulder = bottle_radius * 0.96;
+                    shoulder + (2.5 - shoulder) * k
+                };
             } else {
-                let k = ((t - 0.55) / 0.45).powf(0.8);
-                let shoulder = bottle_radius * 0.96;
-                shoulder + (2.5 - shoulder) * k
-            };
-        } else {
-            if flare_voxels > 0.0 && t < 0.1 {
-                r += flare_voxels * (1.0 - t / 0.1);
+                if flare_voxels > 0.0 && t < 0.1 { r += flare_voxels * (1.0 - t / 0.1); }
+                if form.top_taper > 0.0 && t > 0.72 { r *= 1.0 - form.top_taper * ((t - 0.72) / 0.28); }
             }
-            if form.top_taper > 0.0 && t > 0.72 {
-                r *= 1.0 - form.top_taper * ((t - 0.72) / 0.28);
-            }
+            stamp_disc(&mut trunk, center_x, center_z, y, r, y + 1 >= height_voxels);
         }
-        let ri = r.round().max(1.0) as i32;
-        let ri_sq = ri * ri;
-        // Fat trunks are hollow shells (a 2-voxel-thick ring): the culled mesh
-        // only ever shows the surface, so interior voxels are pure waste. Thin
-        // trunks and the capping top layer stay solid.
-        let inner_sq = if ri >= 4 && y + 1 < height_voxels {
-            let inner = ri - 2;
-            inner * inner
-        } else {
-            -1
-        };
-
-        for dx in -ri..=ri {
-            for dz in -ri..=ri {
-                let d_sq = dx * dx + dz * dz;
-                if d_sq <= ri_sq && d_sq > inner_sq {
-                    trunk.insert(IVec3::new(center_x + dx, y, center_z + dz));
-                }
-            }
-        }
+        let apex = trunk_centroid_at_y(&trunk, height_voxels - 1);
+        return (trunk, vec![(apex, radius_voxels.round().max(1.0) as i32)]);
     }
 
-    // Optional crown forks — classic wattle / snow gum multi-stem silhouette.
-    let fork_count = if form.forks.1 > 0 {
-        rng.range_i(form.forks.0, form.forks.1)
-    } else {
-        0
-    };
-    let fork_start = height_voxels * 7 / 10;
-    for _ in 0..fork_count {
-        let mut fx = center_x;
-        let mut fz = center_z;
-        let fork_dx = rng.choice_i(&[-1, 1]);
-        let fork_dz = rng.choice_i(&[-1, 1]);
-        let fork_len = rng.range_i(18, 42) / TREE_VOXEL_INCHES;
-
-        for i in 0..fork_len {
-            let y = fork_start + i;
-            fx += if i > 0 && rng.chance(0.35) { fork_dx.signum() } else { 0 };
-            fz += if i > 0 && rng.chance(0.35) { fork_dz.signum() } else { 0 };
-
-            let stem_r = rng.range_i(2, 4);
-            let stem_r_sq = stem_r * stem_r;
-            for dx in -stem_r..=stem_r {
-                for dz in -stem_r..=stem_r {
-                    if dx * dx + dz * dz <= stem_r_sq {
-                        trunk.insert(IVec3::new(fx + dx, y, fz + dz));
-                    }
-                }
-            }
+    // Multi-stem: a short trunk that FLARES at the ground and TAPERS to a neck,
+    // then forks. Splitting low (10–20% of height) and necking down means the
+    // base reads as a dividing trunk, not a fat log capped with a crown.
+    let split_y = (((height_voxels as f32) * rng.range(0.1, 0.2)) as i32)
+        .clamp(3, (height_voxels - 4).max(3));
+    let neck_r = radius_voxels * 0.6;
+    let ground_r = radius_voxels + flare_voxels;
+    let mut cx = 0i32;
+    let mut cz = 0i32;
+    for y in 0..=split_y {
+        if y > 0 {
+            if rng.chance(form.wobble) { cx += rng.choice_i(&[-1, 0, 1]); }
+            if rng.chance(form.wobble) { cz += rng.choice_i(&[-1, 0, 1]); }
+            cx = cx.clamp(-wobble_clamp, wobble_clamp);
+            cz = cz.clamp(-wobble_clamp, wobble_clamp);
         }
+        let tt = y as f32 / split_y as f32;
+        let r = neck_r + (ground_r - neck_r) * (1.0 - tt);
+        // Cap the top of the neck solid so the hollow shell never shows as an
+        // open collar where the stems emerge.
+        stamp_disc(&mut trunk, cx, cz, y, r, y >= split_y - 2);
     }
 
-    trunk
+    let n_stems = rng.range_i(2, 3);
+    let mut stem_tops = Vec::new();
+    for s in 0..n_stems {
+        let az = (s as f32 / n_stems as f32) * std::f32::consts::TAU + rng.range(-0.6, 0.6);
+        let (dirx, dirz) = (az.cos(), az.sin());
+        let stem_r0 = radius_voxels * rng.range(0.42, 0.58);
+        // Stems separate to their offset over the lower quarter, then rise
+        // nearly VERTICALLY. A vertical hollow tube has a clean, cheap shell; a
+        // continuously leaning one staircases and multiplies mesh faces, which
+        // on a 1000-voxel-tall giant blows the vertex budget several times over.
+        // Stems fork only gently and climb near-vertical: a wide splay makes
+        // the diverging pair span wider up high than the trunk is at the base,
+        // reading as the tree "getting thicker" toward the top. It must taper.
+        let spread = radius_voxels * rng.range(0.25, 0.5);
+        let target_x = cx as f32 + dirx * spread;
+        let target_z = cz as f32 + dirz * spread;
+        let top = height_voxels - rng.range_i(0, (height_voxels / 8).max(1));
+        let mut last = IVec3::new(cx, split_y, cz);
+        for y in split_y..=top {
+            let t = (y - split_y) as f32 / (top - split_y).max(1) as f32;
+            let e = (t / 0.28).min(1.0);
+            let se = e * e * (3.0 - 2.0 * e);
+            let sx = cx as f32 + (target_x - cx as f32) * se;
+            let sz = cz as f32 + (target_z - cz as f32) * se;
+            let r = (stem_r0 * (1.0 - 0.68 * t)).max(1.5);
+            let ix = sx.round() as i32;
+            let iz = sz.round() as i32;
+            stamp_disc(&mut trunk, ix, iz, y, r, y >= top - 1);
+            last = IVec3::new(ix, y, iz);
+        }
+        let top_r = (stem_r0 * 0.5).round().clamp(2.0, 10.0) as i32;
+        stem_tops.push((last, top_r));
+    }
+
+    (trunk, stem_tops)
 }
 
 fn build_branches(
@@ -748,57 +782,143 @@ fn pom_foliage(rng: &mut GardenRng, tip: IVec3, scale: f32) -> HashSet<IVec3> {
     cloud
 }
 
-/// Leafy cap on the trunk apex: a cluster of enlarged pom blobs around the top
-/// of the tree, each held up by a real 4-inch branchlet grown from the trunk
-/// apex out to the tuft — leaves have weight, so wood must carry them; nothing
-/// floats. Returns (supporting wood, leaves).
+/// Branching crown on the trunk apex: the trunk top divides into several main
+/// leaders that climb up and out, and each recursively splits into smaller,
+/// thinner, shorter branches until fine twigs hold tufts of leaves — the
+/// natural continuation of the trunk breaking apart, not a blunt log capped by
+/// blobs. Leaves ride only the fine tips (plus a little where mid-limbs fork),
+/// and every tuft is carried by real wood. Returns (supporting wood, leaves).
 fn apex_crown(
     rng: &mut GardenRng,
-    trunk: &HashSet<IVec3>,
+    apex: IVec3,
+    base_r: i32,
     form: &TreeForm,
 ) -> (HashSet<IVec3>, HashSet<IVec3>) {
-    let max_y = trunk.iter().map(|p| p.y).max().unwrap_or(0);
-    let apex = trunk_centroid_at_y(trunk, max_y);
-
-    let scale = form.blob_scale * 1.25;
-    let spread = ((64.0 * form.blob_scale) as i32 / TREE_VOXEL_INCHES).max(1);
-    let dip = (14 / TREE_VOXEL_INCHES).max(1);
+    let trunk_r = base_r.max(1);
 
     let mut wood = HashSet::new();
-    let mut cloud = HashSet::new();
-    let tuft_count = rng.range_i(2, 4);
-    for _ in 0..tuft_count {
-        let offset = IVec3::new(
-            rng.range_i(-spread, spread),
-            rng.range_i(-dip, dip / 2),
-            rng.range_i(-spread, spread),
-        );
-        let target = apex + offset;
+    let mut leaves = HashSet::new();
 
-        let reach = offset.as_vec3();
-        if reach.length_squared() > 1.0 {
-            // rasterize_branch advances ~0.55 voxel per step, so oversample
-            // the step count to actually span the offset.
-            let steps = (reach.length() * 1.9).ceil() as i32;
-            for block in rasterize_branch(apex, reach.normalize(), steps) {
-                for d in [
-                    IVec3::ZERO,
-                    IVec3::X,
-                    IVec3::Y,
-                    IVec3::Z,
-                    IVec3::new(1, 1, 0),
-                    IVec3::new(1, 0, 1),
-                    IVec3::new(0, 1, 1),
-                    IVec3::new(1, 1, 1),
-                ] {
-                    wood.insert(block + d);
+    // A limb queued to grow: where it starts, which way it heads, how far and
+    // thick, and how many splits still remain below it.
+    struct Limb {
+        start: IVec3,
+        dir: Vec3,
+        length: i32,
+        radius: i32,
+        depth: i32,
+    }
+
+    let ft = TREE_VOXELS_PER_FOOT;
+    // Crown WIDTH scales with the TRUNK, not just foliage vigour, so the treetop
+    // always overhangs the trunk — a giant log gets a giant head, never a
+    // little hat. The width comes from long, wide-fanning leaders (cheap: just
+    // length and angle), NOT from piling on tufts — so the branching depth and
+    // tuft count stay bounded to respect the giants' voxel budget.
+    // Crown reach stays modest so the top tapers to something smaller than the
+    // trunk base — a real tree narrows toward its crown, it doesn't balloon.
+    let main_len =
+        ((trunk_r as f32 * 1.3 + 2.5 * ft as f32) * rng.range(0.9, 1.15)).round().max(6.0) as i32;
+    // Leaders are only ~a third of the trunk's girth and taper hard each split,
+    // so limbs read as branches thinning to twigs — not fat wooden beams.
+    let start_r = (trunk_r as f32 * 0.32).round().clamp(2.0, 7.0) as i32;
+    let max_depth = 3;
+
+    // A crown grows per stem, so each one is kept lean (2–3 leaders); together
+    // the stems' crowns mass into one broad canopy without blowing the budget.
+    let mut stack: Vec<Limb> = Vec::new();
+    let leaders = rng.range_i(2, 3);
+    for i in 0..leaders {
+        let az = (i as f32 / leaders as f32) * std::f32::consts::TAU + rng.range(-0.5, 0.5);
+        // Climb up AND out: low enough to fan the crown wide, high enough that
+        // it still reads as a dome rising off the trunk rather than a sprawl.
+        let elev = rng.range(42.0, 60.0_f32).to_radians();
+        let dir = Vec3::new(elev.cos() * az.cos(), elev.sin(), elev.cos() * az.sin())
+            .normalize_or_zero();
+        stack.push(Limb { start: apex, dir, length: main_len, radius: start_r, depth: 0 });
+    }
+
+    while let Some(limb) = stack.pop() {
+        let tip = grow_limb(&mut wood, limb.start, limb.dir, limb.length, limb.radius);
+
+        if limb.depth >= max_depth || limb.radius <= 1 {
+            // Fine twig: a moderate tuft of leaves. Spread wide by the long
+            // leaders and massed across ~two dozen tips, they overlap into a
+            // crown broader than the trunk without each blob having to be huge.
+            let tuft_scale = form.blob_scale * rng.range(0.38, 0.55);
+            leaves.extend(pom_foliage(rng, tip, tuft_scale));
+        } else {
+            for _ in 0..2 {
+                // Keep the splay upward-biased so limbs climb and fan rather
+                // than throwing sideways beams.
+                let spread = rng.range(0.4, 0.8);
+                let child_dir = diverge_upward(rng, limb.dir, spread);
+                let child_len =
+                    ((limb.length as f32) * rng.range(0.6, 0.75)).round().max(3.0) as i32;
+                let child_r = ((limb.radius as f32) * 0.55).round().max(1.0) as i32;
+                stack.push(Limb {
+                    start: tip,
+                    dir: child_dir,
+                    length: child_len,
+                    radius: child_r,
+                    depth: limb.depth + 1,
+                });
+            }
+            // A little foliage at the fork keeps the crown leafy through its
+            // middle, not only at the extreme tips.
+            if rng.chance(0.3) {
+                leaves.extend(pom_foliage(rng, tip, form.blob_scale * 0.4));
+            }
+        }
+    }
+
+    (wood, leaves)
+}
+
+/// Rasterise one limb as a solid tube of `radius` voxels along `dir`, returning
+/// its tip. The culled mesher only ever shows the tube's surface, so a fat limb
+/// costs mesh only at its skin.
+fn grow_limb(
+    wood: &mut HashSet<IVec3>,
+    start: IVec3,
+    dir: Vec3,
+    length: i32,
+    radius: i32,
+) -> IVec3 {
+    // rasterize_branch advances ~0.55 voxel/step; oversample to span `length`.
+    let steps = ((length as f32) / 0.55).ceil().max(1.0) as i32;
+    let path = rasterize_branch(start, dir.normalize_or_zero(), steps);
+    let r_sq = radius * radius;
+    for block in &path {
+        for dx in -radius..=radius {
+            for dy in -radius..=radius {
+                for dz in -radius..=radius {
+                    if dx * dx + dy * dy + dz * dz <= r_sq {
+                        wood.insert(*block + IVec3::new(dx, dy, dz));
+                    }
                 }
             }
         }
-
-        cloud.extend(pom_foliage(rng, target, scale));
     }
-    (wood, cloud)
+    *path.last().unwrap_or(&start)
+}
+
+/// A child-branch direction: mostly along the parent but splayed sideways by
+/// `spread`, with a slight upward bias so the limbs climb rather than droop.
+fn diverge_upward(rng: &mut GardenRng, parent: Vec3, spread: f32) -> Vec3 {
+    let r = Vec3::new(
+        rng.range(-1.0, 1.0),
+        rng.range(-1.0, 1.0),
+        rng.range(-1.0, 1.0),
+    )
+    .normalize_or_zero();
+    // Component of the random vector perpendicular to the parent axis.
+    let perp = (r - parent * r.dot(parent)).normalize_or_zero();
+    // Keep pushing away from the vertical trunk axis so each split widens the
+    // crown instead of curling back over the trunk, with a gentle upward bias
+    // so twigs still climb.
+    let outward = Vec3::new(parent.x, 0.0, parent.z).normalize_or_zero();
+    (parent + perp * spread + outward * 0.35 + Vec3::Y * 0.15).normalize_or_zero()
 }
 
 /// Dense ellipsoid crown capping the whole tree — figs, banksias, beeches.

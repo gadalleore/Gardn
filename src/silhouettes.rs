@@ -28,13 +28,18 @@ use crate::world::{
 pub struct SilhouetteWorld {
     spawned: HashMap<IVec2, SpawnedSil>,
     queue: VecDeque<(IVec2, i32)>,
+    /// Chunks whose distance band changed: their ground gets re-meshed at the
+    /// new block size *in place* (the old mesh stays up until the swap), so a
+    /// band change reads as the land sharpening, never as it vanishing.
+    rezone_queue: VecDeque<IVec2>,
     last_player_chunk: Option<IVec2>,
 }
 
 struct SpawnedSil {
     root: Entity,
-    /// The coarse ground mesh child — despawned as soon as the real chunk
-    /// terrain loads (the cutout trees linger until the real trees stand).
+    /// The coarse ground mesh child — despawned the same frame the real chunk
+    /// terrain spawns opaque in its place (the cutout trees linger until the
+    /// real trees stand).
     ground: Option<Entity>,
     /// Ground block-size factor this chunk was meshed at (fine voxels per
     /// coarse block edge); when the distance band changes it gets re-meshed.
@@ -167,8 +172,13 @@ const WATER_COLOR: [f32; 4] = [0.22, 0.42, 0.68, 1.0];
 const SAND_COLOR: [f32; 4] = [0.82, 0.74, 0.48, 1.0];
 
 /// Coarse blocky ground for one far chunk (chunk-local coords): the real
-/// topography sampled per coarse cell and quantised to `factor`-sized voxel
-/// steps, meshed as flat block tops with walls dropping to lower neighbours.
+/// topography sampled per coarse cell at its *exact* surface height, meshed as
+/// flat cell tops with walls dropping to lower neighbours. X/Z stays coarse
+/// (bigger cells the farther the ring) for LOD density, but the tops trace the
+/// true hills — so a far chunk lines up with the real 1-inch terrain at the
+/// streaming boundary, and with the neighbouring ring across a factor change,
+/// instead of stepping off a height-quantisation cliff. A downward perimeter
+/// skirt covers any residual sub-cell mismatch at those boundaries.
 /// Underwater cells become a flat sea sheet; near-sea land reads as beach.
 pub fn build_far_ground_mesh(coord: IVec2, factor: i32) -> Mesh {
     let cell = VOXEL_SIZE * factor as f32;
@@ -186,17 +196,21 @@ pub fn build_far_ground_mesh(coord: IVec2, factor: i32) -> Mesh {
             let wx = origin.x + (i as f32 + 0.5) * cell;
             let wz = origin.z + (j as f32 + 0.5) * cell;
             let h = surface_height_voxels(wx, wz);
-            let (top, col) = if h < 0 {
+            let biome = biome_at_world(wx, wz);
+            // Ocean is keyed off the biome, not `h`: surface_height_voxels
+            // never goes negative (0 at sea, clamped ≥1 on land), so the old
+            // `h < 0` test never fired and sea cells rendered as raised sand.
+            let (top, col) = if biome == AussieBiome::Ocean {
                 (water_top, WATER_COLOR)
             } else {
-                let units = ((h + 1) as f32 / factor as f32).round().max(1.0);
                 let col = if h < 6 {
                     SAND_COLOR
                 } else {
-                    let (r, g, b) = ground_color(biome_at_world(wx, wz));
+                    let (r, g, b) = ground_color(biome);
                     [r, g, b, 1.0]
                 };
-                (units * cell, col)
+                // Exact top face, matching the real terrain's (h+1)*VOXEL_SIZE.
+                ((h + 1) as f32 * VOXEL_SIZE, col)
             };
             tops[idx(i, j)] = top;
             cols[idx(i, j)] = col;
@@ -266,6 +280,64 @@ pub fn build_far_ground_mesh(coord: IVec2, factor: i32) -> Mesh {
         }
     }
 
+    // Perimeter skirt: a downward apron just outside each chunk edge. A
+    // neighbouring chunk in a different LOD ring — or the real 1-inch terrain
+    // at the streaming boundary — samples the surface at a different spacing,
+    // so their shared edge can disagree by a fraction of a cell. This apron
+    // hangs below the rim to cover any such crack without the mesher needing to
+    // know the neighbour's geometry. Depth scales with cell size (coarser rings
+    // risk bigger mismatches); nudged a hair outward so it never z-fights the
+    // in-chunk step walls.
+    let skirt = (cell * 2.5).max(2.0);
+    let eps = VOXEL_SIZE * 0.5;
+    let span = n as f32 * cell;
+    let edge_col = |i: i32, j: i32| {
+        let c = cols[idx(i, j)];
+        [c[0] * 0.7, c[1] * 0.7, c[2] * 0.7, 1.0]
+    };
+    for k in 0..n {
+        let a = k as f32 * cell;
+        let b = a + cell;
+
+        let t = tops[idx(0, k)];
+        quad(
+            [[-eps, t - skirt, b], [-eps, t, b], [-eps, t, a], [-eps, t - skirt, a]],
+            [-1.0, 0.0, 0.0],
+            edge_col(0, k),
+        );
+
+        let t = tops[idx(n - 1, k)];
+        quad(
+            [
+                [span + eps, t - skirt, a],
+                [span + eps, t, a],
+                [span + eps, t, b],
+                [span + eps, t - skirt, b],
+            ],
+            [1.0, 0.0, 0.0],
+            edge_col(n - 1, k),
+        );
+
+        let t = tops[idx(k, 0)];
+        quad(
+            [[a, t - skirt, -eps], [a, t, -eps], [b, t, -eps], [b, t - skirt, -eps]],
+            [0.0, 0.0, -1.0],
+            edge_col(k, 0),
+        );
+
+        let t = tops[idx(k, n - 1)];
+        quad(
+            [
+                [b, t - skirt, span + eps],
+                [b, t, span + eps],
+                [a, t, span + eps],
+                [a, t - skirt, span + eps],
+            ],
+            [0.0, 0.0, 1.0],
+            edge_col(k, n - 1),
+        );
+    }
+
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
@@ -325,6 +397,24 @@ pub fn setup_silhouette_assets(
     });
 }
 
+/// Marks a cutout-chunk root whose real trees are all standing: instead of
+/// blinking out under the still-fading real trees, its planes get throwaway
+/// blend materials and fade away — a true cross-fade between the two worlds.
+#[derive(Component)]
+pub struct SilhouetteRetiring;
+
+/// A retiring cutout root mid-fade: alpha ramps down on the cloned materials,
+/// then the whole subtree despawns.
+#[derive(Component)]
+pub struct SilhouetteFadeOut {
+    timer: Timer,
+    materials: Vec<Handle<StandardMaterial>>,
+}
+
+/// Matches TREE_FADE_SECS closely enough that the cutout dissolves while the
+/// last real trees are still ramping up — the eye always has a tree to rest on.
+const CUTOUT_FADE_SECS: f32 = 1.2;
+
 /// Decide which unmaterialised chunks should show silhouettes. Cheap enough to
 /// run every frame: the full ring scan only happens when the player crosses a
 /// chunk border.
@@ -342,7 +432,9 @@ pub fn plan_tree_silhouettes(
 
     // A chunk is only "fully live" once its real terrain AND all its async
     // trees are standing — cutout trees hold the pose until then, so a distant
-    // tree never blinks out ahead of the real one popping in.
+    // tree never blinks out ahead of the real one popping in. Even then the
+    // cutouts don't blink: they hand off through a fade-out that overlaps the
+    // real trees' fade-in.
     let fully_live = |coord: &IVec2| -> bool {
         chunk_world
             .loaded
@@ -350,13 +442,26 @@ pub fn plan_tree_silhouettes(
             .is_some_and(|e| trees_pending.get(*e).map(|p| p.0 == 0).unwrap_or(true))
     };
 
+    let to_retire: Vec<IVec2> = sil
+        .spawned
+        .keys()
+        .copied()
+        .filter(fully_live)
+        .collect();
+    for coord in to_retire {
+        if let Some(spawned) = sil.spawned.remove(&coord) {
+            commands.entity(spawned.root).insert(SilhouetteRetiring);
+        }
+    }
+
+    // Chunks a ring beyond the horizon: gone for real — the distance fog
+    // swallowed them long before this fires.
     let to_remove: Vec<IVec2> = sil
         .spawned
         .keys()
         .copied()
         .filter(|coord| {
-            fully_live(coord)
-                || chunk_chebyshev_distance(*coord, player_chunk) > SILHOUETTE_CHUNK_DISTANCE + 1
+            chunk_chebyshev_distance(*coord, player_chunk) > SILHOUETTE_CHUNK_DISTANCE + 1
         })
         .collect();
     for coord in to_remove {
@@ -365,8 +470,11 @@ pub fn plan_tree_silhouettes(
         }
     }
 
-    // Real terrain is up but trees are still building: drop just the coarse
-    // ground so it can't poke through the true surface; the cutouts stay.
+    // Real terrain is up: drop the coarse ground the same frame the real
+    // terrain spawned (opaque) in its place, so the hand-off is gapless — the
+    // seam fix lands both at the same height, so the swap reads as the blocks
+    // sharpening, not snapping. The cutout trees stay until their real trees
+    // stand, then cross-fade out.
     let ground_done: Vec<IVec2> = sil
         .spawned
         .iter()
@@ -376,9 +484,9 @@ pub fn plan_tree_silhouettes(
     for coord in ground_done {
         if let Some(spawned) = sil.spawned.get_mut(&coord) {
             if let Some(ground) = spawned.ground.take() {
-                // despawn_recursive (not plain despawn) detaches the child
-                // from its parent's Children first — a stale reference there
-                // makes the root's later recursive despawn warn (B0003).
+                // despawn_recursive (not plain despawn) detaches the child from
+                // its parent's Children first — a stale reference there makes
+                // the root's later recursive despawn warn (B0003).
                 commands.entity(ground).despawn_recursive();
             }
         }
@@ -389,21 +497,20 @@ pub fn plan_tree_silhouettes(
     }
     sil.last_player_chunk = Some(player_chunk);
 
-    // Chunks whose distance band changed get re-meshed at their new block size
-    // (finer approaching, coarser receding) by despawning and re-queueing.
+    // Chunks whose distance band changed get their ground re-meshed in place
+    // (finer approaching, coarser receding) — never despawned, so the world
+    // stays solid while it re-details.
+    sil.rezone_queue.clear();
     let rezone: Vec<IVec2> = sil
         .spawned
         .iter()
         .filter(|(coord, s)| {
-            s.factor != far_ground_factor(chunk_chebyshev_distance(**coord, player_chunk))
+            s.ground.is_some()
+                && s.factor != far_ground_factor(chunk_chebyshev_distance(**coord, player_chunk))
         })
         .map(|(c, _)| *c)
         .collect();
-    for coord in rezone {
-        if let Some(spawned) = sil.spawned.remove(&coord) {
-            commands.entity(spawned.root).despawn_recursive();
-        }
-    }
+    sil.rezone_queue.extend(rezone);
 
     sil.queue.clear();
     let mut needed = Vec::new();
@@ -439,6 +546,35 @@ pub fn process_silhouette_queue(
     chunk_world: Res<crate::ChunkWorld>,
     mut sil: ResMut<SilhouetteWorld>,
 ) {
+    // Band-change re-meshes first: each swaps a new ground mesh onto the live
+    // entity in one frame — the old blocks stand until the finer ones replace
+    // them, so a rezone can never open a hole in the world.
+    let player_chunk = sil.last_player_chunk;
+    for _ in 0..SILHOUETTES_PER_FRAME {
+        let Some(coord) = sil.rezone_queue.pop_front() else {
+            break;
+        };
+        let Some(player_chunk) = player_chunk else {
+            break;
+        };
+        // Re-derive the band at drain time — the queue may be a few frames
+        // stale — and skip chunks that retired or already match.
+        let factor = far_ground_factor(chunk_chebyshev_distance(coord, player_chunk));
+        let Some(spawned) = sil.spawned.get_mut(&coord) else {
+            continue;
+        };
+        if spawned.factor == factor {
+            continue;
+        }
+        let Some(ground) = spawned.ground else {
+            continue;
+        };
+        commands
+            .entity(ground)
+            .insert(Mesh3d(meshes.add(build_far_ground_mesh(coord, factor))));
+        spawned.factor = factor;
+    }
+
     for _ in 0..SILHOUETTES_PER_FRAME {
         let Some((coord, factor)) = sil.queue.pop_front() else {
             break;
@@ -646,6 +782,125 @@ mod tests {
             );
             assert!(verts < 20_000, "factor {factor} ground too heavy: {verts}");
             prev = verts;
+        }
+    }
+
+    /// The far ground must present the same top face as the real 1-inch
+    /// terrain — no quantisation cliff at the streaming boundary, and the same
+    /// height at every LOD factor so neighbouring rings line up too. Reads the
+    /// generated mesh back and checks every land top-face quad sits exactly on
+    /// `surface_top_world_y` at its cell centre.
+    #[test]
+    fn far_ground_tops_sit_on_real_terrain() {
+        use crate::topography::surface_top_world_y;
+        use bevy::render::mesh::VertexAttributeValues::Float32x3;
+
+        let coord = IVec2::new(5, 3);
+        let origin = chunk_world_origin(coord);
+        for factor in [16, 32, 64] {
+            let mesh = build_far_ground_mesh(coord, factor);
+            let pos = match mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap() {
+                Float32x3(v) => v,
+                _ => panic!("positions not Float32x3"),
+            };
+            let nrm = match mesh.attribute(Mesh::ATTRIBUTE_NORMAL).unwrap() {
+                Float32x3(v) => v,
+                _ => panic!("normals not Float32x3"),
+            };
+            let mut checked = 0;
+            for q in 0..pos.len() / 4 {
+                let vs = &pos[q * 4..q * 4 + 4];
+                let ns = &nrm[q * 4..q * 4 + 4];
+                // Top-face quads only (skip the side/skirt walls).
+                if !ns.iter().all(|n| *n == [0.0, 1.0, 0.0]) {
+                    continue;
+                }
+                // Opposite corners → the cell centre the height was sampled at.
+                let cx = origin.x + (vs[0][0] + vs[2][0]) * 0.5;
+                let cz = origin.z + (vs[0][2] + vs[2][2]) * 0.5;
+                if biome_at_world(cx, cz) == AussieBiome::Ocean {
+                    continue;
+                }
+                let expected = surface_top_world_y(cx, cz);
+                assert!(
+                    (vs[0][1] - expected).abs() < 1e-3,
+                    "factor {factor}: far top {} != real terrain {} at ({cx}, {cz})",
+                    vs[0][1],
+                    expected
+                );
+                checked += 1;
+            }
+            assert!(checked > 0, "factor {factor}: no land top faces to verify");
+        }
+    }
+}
+
+/// Start the cross-fade on freshly retiring cutout roots: every visible plane
+/// gets a private blend-material clone (the originals are shared per species
+/// and must not dim other chunks), shadow twins go instantly (the real trees
+/// cast true shadows already), and any in-flight FadeIn is stripped so it
+/// can't snap a material back to opaque mid-dissolve.
+pub fn begin_silhouette_fadeout(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    roots: Query<Entity, Added<SilhouetteRetiring>>,
+    children_q: Query<&Children>,
+    shadows: Query<(), With<SilhouetteShadow>>,
+    mesh_mats: Query<&MeshMaterial3d<StandardMaterial>>,
+) {
+    for root in &roots {
+        let mut clones = Vec::new();
+        let mut stack: Vec<Entity> = vec![root];
+        while let Some(entity) = stack.pop() {
+            if shadows.get(entity).is_ok() {
+                commands.entity(entity).despawn_recursive();
+                continue;
+            }
+            if let Ok(children) = children_q.get(entity) {
+                stack.extend(children.iter().copied());
+            }
+            let Ok(mat_handle) = mesh_mats.get(entity) else {
+                continue;
+            };
+            if let Some(src) = materials.get(&mat_handle.0) {
+                let mut clone = src.clone();
+                clone.alpha_mode = AlphaMode::Blend;
+                let handle = materials.add(clone);
+                commands
+                    .entity(entity)
+                    .insert(MeshMaterial3d(handle.clone()))
+                    .remove::<crate::FadeIn>();
+                clones.push(handle);
+            }
+        }
+        commands
+            .entity(root)
+            .insert(SilhouetteFadeOut {
+                timer: Timer::from_seconds(CUTOUT_FADE_SECS, TimerMode::Once),
+                materials: clones,
+            })
+            .remove::<SilhouetteRetiring>();
+    }
+}
+
+/// Ramp retiring cutouts down to nothing, then despawn the whole subtree.
+pub fn tick_silhouette_fadeout(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut fades: Query<(Entity, &mut SilhouetteFadeOut)>,
+) {
+    for (root, mut fade) in &mut fades {
+        fade.timer.tick(time.delta());
+        let t = fade.timer.fraction();
+        let alpha = 1.0 - t * t * (3.0 - 2.0 * t);
+        for handle in &fade.materials {
+            if let Some(mat) = materials.get_mut(handle) {
+                mat.base_color = mat.base_color.with_alpha(alpha);
+            }
+        }
+        if fade.timer.finished() {
+            commands.entity(root).despawn_recursive();
         }
     }
 }
