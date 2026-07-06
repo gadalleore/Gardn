@@ -802,6 +802,45 @@ pub fn build_culled_voxel_mesh(blocks: &HashSet<IVec3>, block_size: f32) -> Mesh
     mesh
 }
 
+/// Cull-and-mesh a set of coloured blocks (each cell carries its own vertex
+/// colour). Used for the distant coarse voxel trees, where several species'
+/// downsampled bark and foliage are merged into one chunk mesh — vertex colours
+/// let the one shared vertex-colour material draw them all. Faces are emitted
+/// per cell (no strip merging across colours), which is fine at the small block
+/// counts a coarse tree produces.
+pub fn build_colored_block_mesh(blocks: &HashMap<IVec3, [f32; 4]>, block_size: f32) -> Mesh {
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut colors: Vec<[f32; 4]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    for (&pos, &color) in blocks {
+        for (neighbor, normal, corners, _) in FACE_DIRS {
+            if blocks.contains_key(&(pos + neighbor)) {
+                continue;
+            }
+            let i0 = positions.len() as u32;
+            for corner in corners {
+                positions.push([
+                    (pos.x + corner[0]) as f32 * block_size,
+                    (pos.y + corner[1]) as f32 * block_size,
+                    (pos.z + corner[2]) as f32 * block_size,
+                ]);
+                normals.push(normal);
+                colors.push(color);
+            }
+            indices.extend_from_slice(&[i0, i0 + 1, i0 + 2, i0, i0 + 2, i0 + 3]);
+        }
+    }
+
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,19 +1,69 @@
 use bevy::asset::RenderAssetUsages;
-use bevy::pbr::{NotShadowCaster, NotShadowReceiver};
+use bevy::pbr::NotShadowCaster;
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
-use bevy::render::view::RenderLayers;
+use bevy::tasks::futures_lite::future;
+use bevy::tasks::{block_on, AsyncComputeTaskPool, Task};
 use std::collections::{HashMap, VecDeque};
 
 use crate::australia::{biome_at_world, AussieBiome};
-use crate::chunk_store::{ChunkArchive, ChunkRecord};
-use crate::terrain::TerrainMaterials;
+use crate::chunk_store::{ChunkArchive, ChunkRecord, SavedTree};
+use crate::terrain::{build_colored_block_mesh, downsample_blocks, TerrainMaterials};
 use crate::topography::surface_height_voxels;
-use crate::trees::{silhouette_spec, species_colors, TreeSpecies, ALL_SPECIES};
+use crate::trees::{generate_tree, species_colors};
 use crate::world::{
-    chunk_chebyshev_distance, chunk_world_origin, world_to_chunk, CHUNK_SIZE,
-    CHUNK_UNLOAD_DISTANCE, SILHOUETTES_PER_FRAME, SILHOUETTE_CHUNK_DISTANCE, VOXEL_SIZE,
+    chunk_chebyshev_distance, chunk_world_origin, world_to_chunk, GardenRng, CHUNK_SIZE,
+    CHUNK_UNLOAD_DISTANCE, MAX_CONCURRENT_SILHOUETTE_BUILDS, SILHOUETTES_PER_FRAME,
+    SILHOUETTE_CHUNK_DISTANCE, TREE_VOXEL_SIZE, VOXEL_SIZE,
 };
+
+/// The coloured coarse blocks of one chunk's trees at one LOD.
+type TreeBlocks = HashMap<IVec3, [f32; 4]>;
+
+/// Generate each of a chunk's trees as real voxels ONCE and downsample to all
+/// three far LOD block sizes, merged per chunk — returned finest-first. Because
+/// each tree is the SAME `generate_tree(seed)` the streamer builds up close, the
+/// blocks sit exactly where the real leaves and bark will, so stepping between
+/// LODs (and finally handing off to the real trees) only sharpens the shape, it
+/// never morphs. The chunk caches these maps, so refining as you approach is a
+/// cheap re-mesh rather than a regeneration.
+fn build_far_trees_lods(trees: &[SavedTree]) -> [TreeBlocks; 3] {
+    let mut lods: [TreeBlocks; 3] = [HashMap::new(), HashMap::new(), HashMap::new()];
+
+    for tree in trees {
+        let mut rng = GardenRng::new(tree.tree_seed);
+        let vt = generate_tree(tree.species, &mut rng);
+        let (b, f) = species_colors(tree.species);
+        let bark_col = [b.0, b.1, b.2, 1.0];
+        let foliage_col = [f.0, f.1, f.2, 1.0];
+
+        for (i, &factor) in FAR_FACTORS.iter().enumerate() {
+            let tree_factor = (factor / 2).max(1);
+            let block_size = tree_factor as f32 * TREE_VOXEL_SIZE;
+            // Tree-local coords are relative to the tree base; shift onto the
+            // coarse grid at the tree's spot in the chunk.
+            let off = IVec3::new(
+                (tree.local_base.x / block_size).round() as i32,
+                (tree.local_base.y / block_size).round() as i32,
+                (tree.local_base.z / block_size).round() as i32,
+            );
+            for cell in downsample_blocks(&vt.bark, tree_factor, 0.08) {
+                lods[i].insert(cell + off, bark_col);
+            }
+            for cell in downsample_blocks(&vt.foliage, tree_factor, 0.12) {
+                // Foliage overwrites bark where they share a coarse cell.
+                lods[i].insert(cell + off, foliage_col);
+            }
+        }
+    }
+
+    lods
+}
+
+/// Mesh one cached LOD's blocks at the block size its ground `factor` implies.
+fn lod_mesh(blocks: &TreeBlocks, factor: i32) -> Mesh {
+    build_colored_block_mesh(blocks, factor as f32 * VOXEL_SIZE)
+}
 
 /// Distant world past the streamed chunks:
 /// - every tree is a camera-facing paper-cutout billboard (one quad trunk + one
@@ -38,119 +88,50 @@ pub struct SilhouetteWorld {
 struct SpawnedSil {
     root: Entity,
     /// The coarse ground mesh child — despawned the same frame the real chunk
-    /// terrain spawns opaque in its place (the cutout trees linger until the
+    /// terrain spawns opaque in its place (the coarse trees linger until the
     /// real trees stand).
     ground: Option<Entity>,
-    /// Ground block-size factor this chunk was meshed at (fine voxels per
-    /// coarse block edge); when the distance band changes it gets re-meshed.
+    /// The merged coarse-voxel-trees mesh child (the whole chunk's distant trees
+    /// in one mesh at the current LOD), or None until its build lands.
+    trees: Option<Entity>,
+    /// Cached coarse-tree blocks at all three LOD levels (finest first), so a
+    /// band change is a cheap re-mesh, never a regeneration.
+    lods: Option<[TreeBlocks; 3]>,
+    /// Ground block-size factor this chunk is meshed at; a band change re-meshes
+    /// the ground and swaps the trees to the matching cached LOD.
     factor: i32,
 }
 
-/// Far-ground block size by chunk distance (in 1-inch voxels): 16-inch blocks
-/// in the nearest far ring, 32-inch beyond that, 64-inch out at the horizon.
+/// The three far LOD block sizes, in 3-inch ground voxels: ×3 inch gives 24-inch
+/// (2 ft) just outside the streamed ring, 36-inch (3 ft), then 48-inch (4 ft) at
+/// the horizon. A distant chunk steps down through these — finer as you
+/// approach — then hands off to the real 6-inch trees. (These are ÷3 of the old
+/// values so the coarser voxel grid doesn't inflate them into mega-blocks.)
+const FAR_FACTORS: [i32; 3] = [8, 12, 16];
+
+/// Far-ground / far-tree block size by chunk distance, spread across the ~16
+/// chunk silhouette ring so all three LOD steps are visible as you approach.
 fn far_ground_factor(dist: i32) -> i32 {
-    if dist <= 8 {
-        16
-    } else if dist <= 14 {
-        32
+    if dist <= 7 {
+        FAR_FACTORS[0]
+    } else if dist <= 11 {
+        FAR_FACTORS[1]
     } else {
-        64
+        FAR_FACTORS[2]
     }
 }
 
-#[derive(Resource)]
-pub struct SilhouetteAssets {
-    trunk_mesh: Handle<Mesh>,
-    crown_mesh: Handle<Mesh>,
-    cone_mesh: Handle<Mesh>,
-    /// Per species: (trunk material, crown material) — dark, lit, fog-aware.
-    materials: HashMap<TreeSpecies, (Handle<StandardMaterial>, Handle<StandardMaterial>)>,
-    /// Material for the shadow-only planes — never drawn by the camera.
-    shadow_material: Handle<StandardMaterial>,
+/// Which cached LOD level a ground factor maps to (finest = 0).
+fn far_lod_index(factor: i32) -> usize {
+    FAR_FACTORS.iter().position(|&f| f == factor).unwrap_or(FAR_FACTORS.len() - 1)
 }
 
-/// A silhouette tree that spins to face the camera (yaw only).
+/// An in-flight background build of one chunk's coarse-tree LOD block maps.
 #[derive(Component)]
-pub struct SilhouetteBillboard {
-    world_x: f32,
-    world_z: f32,
-}
-
-/// Root of a cutout tree's invisible shadow planes. Lives on render layer 1
-/// (only the sun/moon look there), and faces the light instead of the camera,
-/// so the shadow keeps its full tree shape no matter where the player stands.
-#[derive(Component)]
-pub struct SilhouetteShadow;
-
-/// Turn all cutout shadow planes to face the current shadow-casting body.
-pub fn orient_silhouette_shadows(
-    sun: Res<crate::SunDirection>,
-    mut shadows: Query<&mut Transform, With<SilhouetteShadow>>,
-) {
-    let rotation = Quat::from_rotation_y(sun.0.x.atan2(sun.0.z));
-    for mut tf in &mut shadows {
-        tf.rotation = rotation;
-    }
-}
-
-/// Unit canopy cutout: a lumpy cloud, wider than tall, with a flattened
-/// underside — the profile of a real crown (apex blobs and branch pom-poms),
-/// not a lollipop ball. Spans x,y ∈ [-0.5, 0.5]; fan-triangulated around the
-/// centroid so the lumpy outline stays valid.
-fn canopy_mesh() -> Mesh {
-    let n = 22usize;
-    let mut ring: Vec<[f32; 2]> = Vec::with_capacity(n);
-    let mut y_min = f32::MAX;
-    let mut y_max = f32::MIN;
-    for i in 0..n {
-        let a = i as f32 / n as f32 * std::f32::consts::TAU;
-        // Three broad lobes with a phase twist read as clumped foliage.
-        let lump = 0.72 + 0.28 * ((a * 3.0 + 0.7).sin() * 0.5 + 0.5);
-        let x = a.cos() * 0.5 * lump;
-        let mut y = a.sin() * 0.5 * lump;
-        // Tall billowing top, squashed underside.
-        y *= if y > 0.0 { 1.0 } else { 0.45 };
-        y_min = y_min.min(y);
-        y_max = y_max.max(y);
-        ring.push([x, y]);
-    }
-    // Normalise the squashed profile back to a unit-height span.
-    let scale = 1.0 / (y_max - y_min);
-    let shift = (y_max + y_min) * 0.5;
-    for p in &mut ring {
-        p[1] = (p[1] - shift) * scale;
-    }
-
-    let mut positions: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0]];
-    positions.extend(ring.iter().map(|&[x, y]| [x, y, 0.0]));
-    let normals: Vec<[f32; 3]> = vec![[0.0, 0.0, 1.0]; positions.len()];
-    let mut indices: Vec<u32> = Vec::with_capacity(n * 3);
-    for i in 0..n as u32 {
-        indices.extend_from_slice(&[0, 1 + i, 1 + (i + 1) % n as u32]);
-    }
-
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-    mesh.insert_indices(Indices::U32(indices));
-    mesh
-}
-
-/// One flat polygon in the XY plane, fan-triangulated. Cutouts get billboarded
-/// toward the camera, so a single plane is all a tree needs.
-fn plane_mesh(points: &[[f32; 2]]) -> Mesh {
-    let positions: Vec<[f32; 3]> = points.iter().map(|&[u, v]| [u, v, 0.0]).collect();
-    let normals: Vec<[f32; 3]> = vec![[0.0, 0.0, 1.0]; points.len()];
-    let mut indices: Vec<u32> = Vec::new();
-    for i in 1..points.len() as u32 - 1 {
-        indices.extend_from_slice(&[0, i, i + 1]);
-    }
-
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-    mesh.insert_indices(Indices::U32(indices));
-    mesh
+pub struct PendingSilTrees {
+    task: Task<Option<[TreeBlocks; 3]>>,
+    /// The silhouette chunk root these trees belong under.
+    coord: IVec2,
 }
 
 /// Matches the dominant surface block of each biome so the coarse far ground
@@ -346,55 +327,89 @@ pub fn build_far_ground_mesh(coord: IVec2, factor: i32) -> Mesh {
     mesh
 }
 
-pub fn setup_silhouette_assets(
+/// Kick off a background build of one chunk's merged coarse-trees mesh at the
+/// ground `factor` (trees downsample to their own 2-inch grid, so the tree
+/// factor is half). Off-thread because generating each tree's full voxels is
+/// the same work the streamer does up close.
+fn spawn_tree_mesh_task(commands: &mut Commands, coord: IVec2, trees: Vec<SavedTree>) -> bool {
+    if trees.is_empty() {
+        return false;
+    }
+    let pool = AsyncComputeTaskPool::get();
+    let task = pool.spawn(async move { Some(build_far_trees_lods(&trees)) });
+    commands.spawn(PendingSilTrees { task, coord });
+    true
+}
+
+/// (Re)mesh a chunk's trees at the LOD its `factor` implies, from the cached
+/// blocks — replacing any existing (coarser or finer) trees mesh. The old mesh
+/// stands until the new one is built here, so a band change never opens a gap.
+fn attach_tree_lod(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    material: &Handle<StandardMaterial>,
+    spawned: &mut SpawnedSil,
+    factor: i32,
+) {
+    let Some(lods) = &spawned.lods else {
+        return;
+    };
+    let blocks = &lods[far_lod_index(factor)];
+    if blocks.is_empty() {
+        return;
+    }
+    let mesh = meshes.add(lod_mesh(blocks, factor));
+    if let Some(old) = spawned.trees.take() {
+        commands.entity(old).despawn_recursive();
+    }
+    let ent = commands
+        .spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(material.clone()),
+            NotShadowCaster,
+            Transform::IDENTITY,
+        ))
+        .set_parent(spawned.root)
+        .id();
+    spawned.trees = Some(ent);
+}
+
+/// Land finished coarse-trees meshes: attach each under its chunk root, fading
+/// in like the ground, and replace any older (coarser) trees mesh. Builds whose
+/// chunk retired or rezoned meanwhile are dropped.
+pub fn finish_sil_tree_tasks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    terrain_materials: Res<TerrainMaterials>,
+    mut sil: ResMut<SilhouetteWorld>,
+    mut pending_q: Query<(Entity, &mut PendingSilTrees)>,
 ) {
-    // Unit trunk: 1×1 rectangle rising from y=0.
-    let trunk_mesh = meshes.add(plane_mesh(&[
-        [-0.5, 0.0],
-        [0.5, 0.0],
-        [0.5, 1.0],
-        [-0.5, 1.0],
-    ]));
-
-    // Unit crown: lumpy canopy cloud capping the trunk.
-    let crown_mesh = meshes.add(canopy_mesh());
-
-    // Unit conifer: triangle rising from y=0.
-    let cone_mesh = meshes.add(plane_mesh(&[[-0.5, 0.0], [0.5, 0.0], [0.0, 1.0]]));
-
-    let mut mats = HashMap::new();
-    for species in ALL_SPECIES {
-        let (bark, foliage) = species_colors(species);
-        // Lit (not unlit) so the camera's distance fog applies — faraway
-        // cutouts haze into the sky like real distant trees. Kept dark and
-        // fully rough so they still read as silhouettes.
-        let dark = |c: (f32, f32, f32), k: f32| StandardMaterial {
-            base_color: Color::srgb(c.0 * k, c.1 * k, c.2 * k),
-            perceptual_roughness: 1.0,
-            reflectance: 0.0,
-            cull_mode: None,
-            ..default()
+    for (holder, mut pending) in &mut pending_q {
+        let Some(result) = block_on(future::poll_once(&mut pending.task)) else {
+            continue;
         };
-        mats.insert(
-            species,
-            (materials.add(dark(bark, 0.30)), materials.add(dark(foliage, 0.32))),
+        commands.entity(holder).despawn();
+
+        let coord = pending.coord;
+        let Some(spawned) = sil.spawned.get_mut(&coord) else {
+            continue;
+        };
+        let Some(lods) = result else {
+            continue;
+        };
+        // Cache all LODs, then pop the current one straight in on the opaque
+        // shared material — no fade, the blocky trees appear discretely the way
+        // voxel leaves do.
+        spawned.lods = Some(lods);
+        let factor = spawned.factor;
+        attach_tree_lod(
+            &mut commands,
+            &mut meshes,
+            &terrain_materials.vertex_color_terrain,
+            spawned,
+            factor,
         );
     }
-
-    commands.insert_resource(SilhouetteAssets {
-        trunk_mesh,
-        crown_mesh,
-        cone_mesh,
-        materials: mats,
-        shadow_material: materials.add(StandardMaterial {
-            base_color: Color::BLACK,
-            unlit: true,
-            ..default()
-        }),
-    });
 }
 
 /// Marks a cutout-chunk root whose real trees are all standing: instead of
@@ -411,9 +426,10 @@ pub struct SilhouetteFadeOut {
     materials: Vec<Handle<StandardMaterial>>,
 }
 
-/// Matches TREE_FADE_SECS closely enough that the cutout dissolves while the
-/// last real trees are still ramping up — the eye always has a tree to rest on.
-const CUTOUT_FADE_SECS: f32 = 1.2;
+/// Matched to TREE_FADE_SECS so the coarse chunk dissolves out over exactly the
+/// window the real trees fade in — a clean cross-fade, the blocky version
+/// sharpening into the detailed one rather than one blinking out.
+const CUTOUT_FADE_SECS: f32 = 1.6;
 
 /// Decide which unmaterialised chunks should show silhouettes. Cheap enough to
 /// run every frame: the full ring scan only happens when the player crosses a
@@ -533,22 +549,37 @@ pub fn plan_tree_silhouettes(
         .extend(needed.into_iter().map(|(dist, c)| (c, far_ground_factor(dist))));
 }
 
-/// Drain a few queued chunks per frame; each spawns one cheap parent entity
-/// holding the chunk's ground tile plus a billboard cutout for every tree the
-/// chunk will eventually grow.
+/// Drain a few queued chunks per frame; each spawns one parent entity holding
+/// the chunk's coarse ground tile and kicks off a background build of its
+/// merged coarse-voxel-trees mesh.
 pub fn process_silhouette_queue(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    assets: Res<SilhouetteAssets>,
     terrain_materials: Res<TerrainMaterials>,
     archive: Res<ChunkArchive>,
     chunk_world: Res<crate::ChunkWorld>,
     mut sil: ResMut<SilhouetteWorld>,
+    pending_trees: Query<(), With<PendingSilTrees>>,
 ) {
-    // Band-change re-meshes first: each swaps a new ground mesh onto the live
-    // entity in one frame — the old blocks stand until the finer ones replace
-    // them, so a rezone can never open a hole in the world.
+    // The trees a far chunk will grow: archived chunks keep their exact ones;
+    // unvisited chunks get the same deterministic plan the streamer will build.
+    let trees_for = |coord: IVec2| -> Vec<SavedTree> {
+        let origin = chunk_world_origin(coord);
+        if biome_at_world(origin.x + CHUNK_SIZE * 0.5, origin.z + CHUNK_SIZE * 0.5)
+            == AussieBiome::Ocean
+        {
+            return Vec::new();
+        }
+        match archive.saved.get(&coord) {
+            Some(record) => record.trees.clone(),
+            None => ChunkRecord::generate(coord).trees,
+        }
+    };
+
+    // Band-change re-bakes: the ground mesh swaps in place; the trees re-bake
+    // off-thread at the finer/coarser resolution (the old mesh stays up until
+    // the new one lands, so a rezone never opens a hole).
     let player_chunk = sil.last_player_chunk;
     for _ in 0..SILHOUETTES_PER_FRAME {
         let Some(coord) = sil.rezone_queue.pop_front() else {
@@ -557,25 +588,39 @@ pub fn process_silhouette_queue(
         let Some(player_chunk) = player_chunk else {
             break;
         };
-        // Re-derive the band at drain time — the queue may be a few frames
-        // stale — and skip chunks that retired or already match.
         let factor = far_ground_factor(chunk_chebyshev_distance(coord, player_chunk));
-        let Some(spawned) = sil.spawned.get_mut(&coord) else {
-            continue;
+        let ground = match sil.spawned.get(&coord) {
+            Some(s) if s.factor != factor => s.ground,
+            _ => continue,
         };
-        if spawned.factor == factor {
-            continue;
-        }
-        let Some(ground) = spawned.ground else {
+        let Some(ground) = ground else {
             continue;
         };
         commands
             .entity(ground)
             .insert(Mesh3d(meshes.add(build_far_ground_mesh(coord, factor))));
-        spawned.factor = factor;
+        // Ground re-details AND the trees step to the matching cached LOD — a
+        // cheap re-mesh from the blocks we already have, no regeneration.
+        if let Some(s) = sil.spawned.get_mut(&coord) {
+            s.factor = factor;
+            attach_tree_lod(
+                &mut commands,
+                &mut meshes,
+                &terrain_materials.vertex_color_terrain,
+                s,
+                factor,
+            );
+        }
     }
 
+    // Throttle new tree builds so generation never saturates the cores the
+    // renderer needs.
+    let mut in_flight = pending_trees.iter().count();
+
     for _ in 0..SILHOUETTES_PER_FRAME {
+        if in_flight >= MAX_CONCURRENT_SILHOUETTE_BUILDS {
+            break;
+        }
         let Some((coord, factor)) = sil.queue.pop_front() else {
             break;
         };
@@ -584,178 +629,44 @@ pub fn process_silhouette_queue(
         }
 
         let origin = chunk_world_origin(coord);
-        let center_x = origin.x + CHUNK_SIZE * 0.5;
-        let center_z = origin.z + CHUNK_SIZE * 0.5;
-        let biome = biome_at_world(center_x, center_z);
-
-        // Archived chunks keep their exact trees; unvisited ones get the same
-        // deterministic plan the streamer will generate later.
-        let trees = if biome == AussieBiome::Ocean {
-            Vec::new()
-        } else {
-            match archive.saved.get(&coord) {
-                Some(record) => record.trees.clone(),
-                None => ChunkRecord::generate(coord).trees,
-            }
-        };
-
         let parent = commands
-            .spawn((
-                Transform::from_translation(origin),
-                Visibility::default(),
-            ))
+            .spawn((Transform::from_translation(origin), Visibility::default()))
             .id();
 
-        let mut ground_entity = None;
-        commands.entity(parent).with_children(|chunk| {
-            // Distant ground: the real topography in coarse blocky steps —
-            // dramatic rises and falls that sharpen as their ring approaches.
-            // It fades in through a throwaway material, then swaps back to the
-            // shared one; it receives shadows so cutout trees darken it.
-            let fade_material = materials.add(StandardMaterial {
-                base_color: Color::WHITE.with_alpha(0.0),
-                alpha_mode: AlphaMode::Blend,
-                ..default()
-            });
-            ground_entity = Some(
-                chunk
-                    .spawn((
-                        Mesh3d(meshes.add(build_far_ground_mesh(coord, factor))),
-                        MeshMaterial3d(fade_material.clone()),
-                        NotShadowCaster,
-                        Transform::IDENTITY,
-                        crate::FadeIn {
-                            material: fade_material,
-                            timer: Timer::from_seconds(
-                                crate::GROUND_FADE_SECS,
-                                TimerMode::Once,
-                            ),
-                            final_alpha_mode: AlphaMode::Opaque,
-                            swap_to: Some(terrain_materials.vertex_color_terrain.clone()),
-                        },
-                    ))
-                    .id(),
-            );
-
-            for tree in &trees {
-                let spec = silhouette_spec(tree.species, tree.tree_seed);
-                let Some((trunk_mat, crown_mat)) = assets.materials.get(&tree.species) else {
-                    continue;
-                };
-                let h = spec.height_ft;
-                let r = spec.crown_radius_ft;
-                // Canopy centre: hangs off the trunk top so its billowing rim
-                // always overtops the trunk — no bare pole above the crown.
-                let crown_y = h - 0.52 * r;
-                let crown_scale = Vec3::new(r * 2.2, r * 1.5, r * 2.2);
-
-                chunk
-                    .spawn((
-                        SilhouetteBillboard {
-                            world_x: origin.x + tree.local_base.x,
-                            world_z: origin.z + tree.local_base.z,
-                        },
-                        Transform::from_translation(tree.local_base),
-                        Visibility::default(),
-                    ))
-                    .with_children(|tree_root| {
-                        tree_root.spawn((
-                            Mesh3d(assets.trunk_mesh.clone()),
-                            MeshMaterial3d(trunk_mat.clone()),
-                            NotShadowCaster,
-                            NotShadowReceiver,
-                            Transform::from_scale(Vec3::new(
-                                spec.trunk_width_ft,
-                                h,
-                                spec.trunk_width_ft,
-                            )),
-                        ));
-                        if spec.cone {
-                            // Conifer: triangle from ~28% height past the tip.
-                            // Nudged toward the camera so the coplanar trunk
-                            // can never z-fight through it.
-                            tree_root.spawn((
-                                Mesh3d(assets.cone_mesh.clone()),
-                                MeshMaterial3d(crown_mat.clone()),
-                                NotShadowCaster,
-                                NotShadowReceiver,
-                                Transform {
-                                    translation: Vec3::new(0.0, h * 0.28, 1.0),
-                                    scale: Vec3::new(r * 2.0, h * 0.8, r * 2.0),
-                                    ..default()
-                                },
-                            ));
-                        } else {
-                            tree_root.spawn((
-                                Mesh3d(assets.crown_mesh.clone()),
-                                MeshMaterial3d(crown_mat.clone()),
-                                NotShadowCaster,
-                                NotShadowReceiver,
-                                Transform {
-                                    translation: Vec3::new(0.0, crown_y, 1.0),
-                                    scale: crown_scale,
-                                    ..default()
-                                },
-                            ));
-                        }
-                    });
-
-                // Invisible sun-facing twin on layer 1: only the lights see
-                // it, so the cutout throws a real tree-shaped shadow that the
-                // arriving voxel tree's shadow smoothly takes over from.
-                chunk
-                    .spawn((
-                        SilhouetteShadow,
-                        Transform::from_translation(tree.local_base),
-                        Visibility::default(),
-                    ))
-                    .with_children(|shadow_root| {
-                        shadow_root.spawn((
-                            Mesh3d(assets.trunk_mesh.clone()),
-                            MeshMaterial3d(assets.shadow_material.clone()),
-                            NotShadowReceiver,
-                            RenderLayers::layer(1),
-                            Transform::from_scale(Vec3::new(
-                                spec.trunk_width_ft,
-                                h,
-                                spec.trunk_width_ft,
-                            )),
-                        ));
-                        let (mesh, transform) = if spec.cone {
-                            (
-                                assets.cone_mesh.clone(),
-                                Transform {
-                                    translation: Vec3::Y * (h * 0.28),
-                                    scale: Vec3::new(r * 2.0, h * 0.8, r * 2.0),
-                                    ..default()
-                                },
-                            )
-                        } else {
-                            (
-                                assets.crown_mesh.clone(),
-                                Transform {
-                                    translation: Vec3::Y * crown_y,
-                                    scale: crown_scale,
-                                    ..default()
-                                },
-                            )
-                        };
-                        shadow_root.spawn((
-                            Mesh3d(mesh),
-                            MeshMaterial3d(assets.shadow_material.clone()),
-                            NotShadowReceiver,
-                            RenderLayers::layer(1),
-                            transform,
-                        ));
-                    });
-            }
+        // Distant ground: real topography in coarse blocky steps, fading in
+        // through a throwaway material then swapping to the shared one.
+        let fade_material = materials.add(StandardMaterial {
+            base_color: Color::WHITE.with_alpha(0.0),
+            alpha_mode: AlphaMode::Blend,
+            ..default()
         });
+        let ground_entity = commands
+            .spawn((
+                Mesh3d(meshes.add(build_far_ground_mesh(coord, factor))),
+                MeshMaterial3d(fade_material.clone()),
+                NotShadowCaster,
+                Transform::IDENTITY,
+                crate::FadeIn {
+                    material: fade_material,
+                    timer: Timer::from_seconds(crate::GROUND_FADE_SECS, TimerMode::Once),
+                    final_alpha_mode: AlphaMode::Opaque,
+                    swap_to: Some(terrain_materials.vertex_color_terrain.clone()),
+                },
+            ))
+            .set_parent(parent)
+            .id();
+
+        if spawn_tree_mesh_task(&mut commands, coord, trees_for(coord)) {
+            in_flight += 1;
+        }
 
         sil.spawned.insert(
             coord,
             SpawnedSil {
                 root: parent,
-                ground: ground_entity,
+                ground: Some(ground_entity),
+                trees: None,
+                lods: None,
                 factor,
             },
         );
@@ -835,27 +746,22 @@ mod tests {
     }
 }
 
-/// Start the cross-fade on freshly retiring cutout roots: every visible plane
-/// gets a private blend-material clone (the originals are shared per species
-/// and must not dim other chunks), shadow twins go instantly (the real trees
-/// cast true shadows already), and any in-flight FadeIn is stripped so it
-/// can't snap a material back to opaque mid-dissolve.
+/// Start the cross-fade on a freshly retiring silhouette chunk: every mesh
+/// under it (the coarse trees) gets a private blend-material clone — the shared
+/// terrain material must not dim other chunks — and any in-flight FadeIn is
+/// stripped so it can't snap the material back to opaque mid-dissolve. The real
+/// voxel trees fade in over the same window, so nothing blinks.
 pub fn begin_silhouette_fadeout(
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
     roots: Query<Entity, Added<SilhouetteRetiring>>,
     children_q: Query<&Children>,
-    shadows: Query<(), With<SilhouetteShadow>>,
     mesh_mats: Query<&MeshMaterial3d<StandardMaterial>>,
 ) {
     for root in &roots {
         let mut clones = Vec::new();
         let mut stack: Vec<Entity> = vec![root];
         while let Some(entity) = stack.pop() {
-            if shadows.get(entity).is_ok() {
-                commands.entity(entity).despawn_recursive();
-                continue;
-            }
             if let Ok(children) = children_q.get(entity) {
                 stack.extend(children.iter().copied());
             }
@@ -883,7 +789,7 @@ pub fn begin_silhouette_fadeout(
     }
 }
 
-/// Ramp retiring cutouts down to nothing, then despawn the whole subtree.
+/// Ramp a retiring silhouette chunk down to nothing, then despawn the subtree.
 pub fn tick_silhouette_fadeout(
     time: Res<Time>,
     mut commands: Commands,
@@ -902,22 +808,5 @@ pub fn tick_silhouette_fadeout(
         if fade.timer.finished() {
             commands.entity(root).despawn_recursive();
         }
-    }
-}
-
-/// Turn every cutout tree to face the camera (yaw only) — one quad each, no
-/// crossed planes, no edge-on slivers.
-pub fn billboard_silhouettes(
-    cam_q: Query<&Transform, (With<Camera>, Without<SilhouetteBillboard>)>,
-    mut boards: Query<(&SilhouetteBillboard, &mut Transform)>,
-) {
-    let Ok(cam) = cam_q.get_single() else {
-        return;
-    };
-    let cam_pos = cam.translation;
-
-    for (board, mut transform) in &mut boards {
-        let yaw = (cam_pos.x - board.world_x).atan2(cam_pos.z - board.world_z);
-        transform.rotation = Quat::from_rotation_y(yaw);
     }
 }

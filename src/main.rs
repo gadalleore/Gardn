@@ -10,6 +10,8 @@ mod world;
 use bevy::prelude::*;
 use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::bloom::Bloom;
+use bevy::core_pipeline::dof::{DepthOfField, DepthOfFieldMode};
+use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::pbr::{CascadeShadowConfigBuilder, DistanceFog, FogFalloff, NotShadowCaster};
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::RenderPlugin;
@@ -29,9 +31,8 @@ use chunk_store::{
 };
 use map_ui::{setup_map_ui, toggle_map_ui, update_map_ui, MapOverlay};
 use silhouettes::{
-    begin_silhouette_fadeout, billboard_silhouettes, orient_silhouette_shadows,
-    plan_tree_silhouettes, process_silhouette_queue, setup_silhouette_assets,
-    tick_silhouette_fadeout, SilhouetteWorld,
+    begin_silhouette_fadeout, finish_sil_tree_tasks, plan_tree_silhouettes,
+    process_silhouette_queue, tick_silhouette_fadeout, SilhouetteWorld,
 };
 use terrain::{
     apply_edits, build_culled_voxel_mesh, downsample_blocks, generate_chunk_blocks, BlockType,
@@ -356,7 +357,8 @@ fn scatter_chunk_grass(
     let species = &grass.species[species_idx];
 
     let mut rng = GardenRng::new(chunk_seed(WORLD_SEED, coord) ^ 0x6A55_6A55);
-    let count = rng.range_i(lo, hi);
+    // 3× the biome's base density — a properly lush carpet.
+    let count = rng.range_i(lo, hi) * 3;
 
     commands.entity(chunk_entity).with_children(|chunk| {
         for _ in 0..count {
@@ -944,6 +946,15 @@ fn worm_gravity(
         }
     }
 
+    // Hard anti-clip: however far the eased glide is lagging, never let the
+    // camera sit inside the ground. The coarse 3-inch steps outrun the glide,
+    // so snap up to a clear ride height above the floor directly below (capped
+    // under any ceiling so it can't shove through a low roof).
+    let min_ride = (here + WORM_EYE_HEIGHT * 0.5).min(ceiling - 0.03);
+    if tf.translation.y < min_ride {
+        tf.translation.y = min_ride;
+    }
+
     god.prev_pos = Some(tf.translation);
 }
 
@@ -953,9 +964,9 @@ fn worm_gravity(
 const DAY_LENGTH_SECS: f32 = 24.0 * 3600.0;
 const GAME_START_HOUR: f32 = 8.0;
 /// How far from the camera the sun/moon discs float — past the fog's end
-/// (680 ft) but inside the far clip (1000 ft); unlit materials skip fog, so
-/// they burn through the haze.
-const CELESTIAL_DISTANCE_FT: f32 = 880.0;
+/// (780 ft) but inside the far clip (900 ft); unlit materials skip fog, so they
+/// burn through and read as sky, not scenery.
+const CELESTIAL_DISTANCE_FT: f32 = 850.0;
 
 #[derive(Resource)]
 struct DayCycle {
@@ -1130,13 +1141,7 @@ fn main() {
         .init_resource::<MapOverlay>()
         .add_systems(
             Startup,
-            (
-                choose_spawn_location,
-                setup_garden,
-                setup_silhouette_assets,
-                setup_map_ui,
-            )
-                .chain(),
+            (choose_spawn_location, setup_garden, setup_map_ui).chain(),
         )
         // The world-structure systems are chained: each one then sees the
         // previous one's spawns/despawns actually applied. Unordered, a chunk
@@ -1152,6 +1157,7 @@ fn main() {
                 finish_tree_build_tasks,
                 plan_tree_silhouettes,
                 process_silhouette_queue,
+                finish_sil_tree_tasks,
                 eat_leaves,
                 finish_burrow_tasks,
             )
@@ -1160,8 +1166,6 @@ fn main() {
         .add_systems(
             Update,
             (
-                billboard_silhouettes,
-                orient_silhouette_shadows,
                 begin_silhouette_fadeout,
                 tick_silhouette_fadeout,
                 update_foliage_lod,
@@ -2505,14 +2509,42 @@ fn lower_worm_camera(
         camera.hdr = true;
         commands.entity(entity).insert(Bloom::NATURAL);
 
+        // Far clip a little past the silhouette ring (~512 ft) so distant trees
+        // render before being clipped; the fog hazes them into the sky short of
+        // that wall.
+        commands.entity(entity).insert(Projection::Perspective(PerspectiveProjection {
+            far: 900.0,
+            ..default()
+        }));
+
+        // Distance BLUR instead of a heavy haze: far things go soft and out of
+        // focus rather than washing out to sky colour, so the sun and the
+        // distant world keep their brilliance. DoF needs a depth prepass to
+        // compute focus, and Bevy's DoF requires MSAA off.
+        commands.entity(entity).insert((DepthPrepass, Msaa::Off));
+        commands.entity(entity).insert(DepthOfField {
+            mode: DepthOfFieldMode::Gaussian,
+            // Focus covers near-and-mid ground so it stays crisp; the distant
+            // trees fall out of focus and soften, more with depth. The big
+            // confusion-diameter cap lets the FAR blur get strong while the near
+            // (well under the cap) stays sharp.
+            focal_distance: 55.0,
+            aperture_f_stops: 3.0,
+            max_circle_of_confusion_diameter: 48.0,
+            max_depth: 700.0,
+            ..default()
+        });
+
+        // A light fog stays, only to melt the very far edge into the sky (so the
+        // ring's horizon has no hard cut) — thin enough that it barely dims and
+        // the sun still cuts through.
         commands.entity(entity).insert(DistanceFog {
-            // Matches the clear colour so fogged geometry melts into the sky.
             color: Color::srgb(0.58, 0.72, 0.88),
             directional_light_color: Color::srgba(1.0, 0.95, 0.85, 0.6),
             directional_light_exponent: 40.0,
             falloff: FogFalloff::Linear {
-                start: 120.0,
-                end: 680.0,
+                start: 420.0,
+                end: 780.0,
             },
         });
     }

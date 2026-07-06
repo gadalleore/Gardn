@@ -1,22 +1,25 @@
 use bevy::prelude::*;
 use std::sync::OnceLock;
 
-/// World units are feet. Ground runs on a fine 1-inch voxel so terrain reads
-/// as soil rather than masonry to a 3-inch worm; trees keep their own chunkier
-/// 2-inch grid (halving tree voxels would 8× their voxel volume and blow the
-/// VRAM budgets for the giants).
+/// World units are feet. Ground runs on a 3-inch voxel (chunky, worm-scale
+/// blocks) and trees on a 6-inch voxel — kept at a 1:2 ratio so the far-ground
+/// and coarse-tree LOD block sizes line up. Tripling both from the old 1"/2"
+/// grid cuts voxel volume ~27× (3³), which is the big lever on generation and
+/// render cost.
 pub const INCH: f32 = 1.0 / 12.0;
-pub const VOXEL_INCHES: i32 = 1;
+pub const VOXEL_INCHES: i32 = 3;
 pub const VOXEL_SIZE: f32 = VOXEL_INCHES as f32 * INCH;
 pub const VOXELS_PER_FOOT: i32 = 12 / VOXEL_INCHES;
 
 /// Tree voxel grid — bark and foliage rasterise at this size.
-pub const TREE_VOXEL_INCHES: i32 = 2;
+pub const TREE_VOXEL_INCHES: i32 = 6;
 pub const TREE_VOXEL_SIZE: f32 = TREE_VOXEL_INCHES as f32 * INCH;
 pub const TREE_VOXELS_PER_FOOT: i32 = 12 / TREE_VOXEL_INCHES;
 
 pub const WORM_LENGTH: f32 = 3.0 * INCH;
-pub const WORM_EYE_HEIGHT: f32 = 2.5 * INCH;
+/// The worm rides this high above the ground. Raised for the coarser 3-inch
+/// terrain so a single block step no longer clips the camera through the floor.
+pub const WORM_EYE_HEIGHT: f32 = 4.0 * INCH;
 /// Holding Space stretches the worm upward this far — reach, not flight.
 pub const WORM_REACH: f32 = 3.0 * INCH;
 
@@ -24,8 +27,9 @@ pub const WORM_REACH: f32 = 3.0 * INCH;
 /// (chunk shrinks with the voxel so per-chunk generation cost stays constant).
 pub const CHUNK_SIZE: f32 = 32.0;
 pub const CHUNK_VOXELS: i32 = (CHUNK_SIZE / VOXEL_SIZE) as i32;
-/// Underground depth in voxels below the chunk's lowest surface (48 × 1″ =
-/// 4 ft — 16 worm-lengths of diggable dark; caves live in this band).
+/// Underground depth in voxels below the chunk's lowest surface (48 × 3″ =
+/// 12 ft of diggable dark; caves live in this band). Kept at 48 voxels so the
+/// cave/ore depth logic is unchanged by the coarser grid.
 pub const CHUNK_DEPTH_VOXELS: i32 = 48;
 /// Sea level: ocean water tops out at voxel y = 0; land surface rises above it.
 pub const SEA_LEVEL_VOXEL_Y: i32 = 0;
@@ -36,10 +40,15 @@ pub const MAX_SURFACE_VOXEL_Y: i32 = 150 * VOXELS_PER_FOOT;
 pub const WORLD_SEED: u64 = 0xE0CA1E52_2026;
 pub const CHUNK_VIEW_DISTANCE: i32 = 2;
 pub const CHUNK_UNLOAD_DISTANCE: i32 = 3;
-/// Beyond the streamed chunks, tree silhouettes stay visible out to this many
-/// chunks (~640 ft) so the giants dominate the horizon without costing meshes.
-pub const SILHOUETTE_CHUNK_DISTANCE: i32 = 20;
-pub const SILHOUETTES_PER_FRAME: usize = 8;
+/// Beyond the streamed chunks, distant trees show as coarse voxel LODs out to
+/// this many chunks (~320 ft), receding into the haze. Each far chunk's trees
+/// are generated (real voxels, downsampled) off-thread, so this stays moderate.
+pub const SILHOUETTE_CHUNK_DISTANCE: i32 = 16;
+pub const SILHOUETTES_PER_FRAME: usize = 4;
+/// Cap on coarse-tree builds running on the background pool at once. Now that
+/// the coarser 6-inch tree grid makes each build ~27× cheaper, more can run
+/// concurrently (faster fill) without starving the renderer.
+pub const MAX_CONCURRENT_SILHOUETTE_BUILDS: usize = 4;
 pub const CHUNKS_PER_FRAME: usize = 1;
 /// Giant trees are built (voxels + mesh) on background compute threads; this
 /// caps how many build in parallel so the pool isn't swamped.

@@ -61,52 +61,6 @@ pub const ALL_SPECIES: [TreeSpecies; 17] = [
     TreeSpecies::MyrtleBeech,
 ];
 
-/// Approximate outline of a tree for the distant-silhouette impostors, in feet.
-/// `height_ft` replays the exact first RNG draw of the real generator, so a
-/// silhouette is the same height as the tree that eventually replaces it.
-pub struct SilhouetteSpec {
-    pub height_ft: f32,
-    pub trunk_width_ft: f32,
-    pub crown_radius_ft: f32,
-    pub cone: bool,
-}
-
-pub fn silhouette_spec(species: TreeSpecies, tree_seed: u64) -> SilhouetteSpec {
-    let mut rng = GardenRng::new(tree_seed);
-
-    if species == TreeSpecies::TreeFern {
-        let height_ft = rng.range_i(20, 40) as f32;
-        return SilhouetteSpec {
-            height_ft,
-            trunk_width_ft: 1.5,
-            crown_radius_ft: 14.0,
-            cone: false,
-        };
-    }
-
-    let form = form_for(species);
-    let height_ft = rng.range_i(form.height_ft.0, form.height_ft.1) as f32;
-    let trunk_width_ft = form.radius_in as f32 * 2.0 / 12.0;
-    let crown_radius_ft = if let Some((rx_in, _)) = form.dome {
-        rx_in / 12.0 * 1.2
-    } else if form.cone {
-        115.0 / 12.0
-    } else {
-        // Whichever reaches farther: branch tips with their pom-poms, or the
-        // apex crown capping the trunk (spread + enlarged blobs).
-        let branch_reach = form.branch_len_in.1 as f32 * 0.5 + 46.0 * form.blob_scale;
-        let apex_reach = 122.0 * form.blob_scale;
-        branch_reach.max(apex_reach) / 12.0
-    };
-
-    SilhouetteSpec {
-        height_ft,
-        trunk_width_ft,
-        crown_radius_ft,
-        cone: form.cone,
-    }
-}
-
 /// Kept for upcoming UI/fauna features (e.g. naming what the worm is under).
 #[allow(dead_code)]
 pub fn species_display_name(species: TreeSpecies) -> &'static str {
@@ -534,7 +488,9 @@ fn build_trunk(rng: &mut GardenRng, form: &TreeForm) -> (HashSet<IVec3>, Vec<(IV
         stamp_disc(&mut trunk, cx, cz, y, r, y >= split_y - 2);
     }
 
-    let n_stems = rng.range_i(2, 3);
+    // Multi-stemmed species (wattles, snow gums — those that carried `forks`)
+    // fork into an extra stem or two.
+    let n_stems = rng.range_i(2, 3 + form.forks.1.min(2));
     let mut stem_tops = Vec::new();
     for s in 0..n_stems {
         let az = (s as f32 / n_stems as f32) * std::f32::consts::TAU + rng.range(-0.6, 0.6);
