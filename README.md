@@ -1,67 +1,97 @@
 # Gardn
 
-A whimsical Bevy garden game with 3D leaves extruded directly from 2D pixel art.
+**A worm's-eye survival game set on a procedurally generated Australia — at a scale where a gum tree is a skyscraper.**
 
-## Current Features
+You begin as a worm on a vast, real-geography continent rendered in voxels. The
+world is not scaled down for you: it is kept genuinely, absurdly enormous, and
+*you* are three inches long. A tree looms like the Burj Khalifa. Grass arches
+overhead like a jungle canopy. The ocean waits miles away down a sheer coast.
+The scale is the point.
 
-- **PNG-Driven 3D Leaves** (the star of the show):
-  - `assets/leaf.png` is the single source of truth.
-  - At runtime it generates:
-    - The `StandardMaterial` base color texture.
-    - A true low-poly 3D mesh whose silhouette exactly follows the PNG's green contours (jagged 8-bit steps).
-  - Thin "coffee-coaster" extrusion with chunky, axis-aligned retro side walls.
-  - Clean "just the green" edges — no black borders, sampling lines, or visible rims (thanks to green-dominant pixel filtering, aggressive UV insetting on the perimeter, `ImagePlugin::default_nearest()`, and slight geometry insets on the end bars).
-  - Internal 8-bit art renders undistorted on the faces.
-- 7 independently animated floating leaves (random bob + spin + base tilt speeds).
-- Worm-cam fly controls (WASD + mouse look via `bevy_flycam`).
-- Eat leaves with `E` when close enough.
-- Directional sun light + real-time shadows.
-- Simple grass + rock placeholder scene.
+Built from scratch in **Rust + [Bevy](https://bevyengine.org/)**.
 
-## Running the Game
+---
+
+## The vision
+
+Gardn is growing into a **worm-to-apex evolution survival game**:
+
+1. **Start as a worm.** Survive the ground and the things that hunt it.
+2. **Find a mate**, and protect them until they lay an **egg**.
+3. **Choose an evolution** — a skill-tree branch that decides *what you become*.
+4. After the larva grows, you *become* that creature, with new abilities and new
+   predators to match.
+5. Repeat, climbing the food chain — a bird the size of a dragon today is your
+   body tomorrow.
+
+The survival/evolution loop is the roadmap. What's playable today is the world it
+happens in — the hard part: a believable, streamable, gargantuan planet.
+
+## What's in the world right now
+
+- **A whole procedural Australia.** Real (if stylised) coastline and geography,
+  eight biomes — tropical savanna, the arid Red Centre, the Pilbara, the SW
+  Mediterranean, temperate forest, coastal bush, Tasmania — each with its own
+  landforms, tree species, and grasses. Every new game washes you up on a random
+  green stretch of coast.
+- **Voxel terrain** with regional ranges, worm-scale micro-relief, and a
+  Minecraft-style cave web underground.
+- **Titan trees.** Procedurally grown, species-accurate giants — a mountain ash
+  tops **1,000 ft** (~4,000 worm-lengths) — planted sparsely so each stands as a
+  lone landmark you crawl between. Distant ones render as coarse voxel LODs that
+  cross-fade seamlessly into the real thing as you approach.
+- **Extruded pixel-art life.** Grass clumps and collectible leaves are painted as
+  small sprites and pixel-extruded into solid 3D — a file-drop art pipeline where
+  editing a PNG changes the model.
+- **Wind & gravity.** Trees and grass sway on a shared gust system; grass bends
+  away from the passing worm.
+- **A custom background-only distance blur** (`src/distance_blur.rs`): a
+  from-scratch render pass that keeps the foreground razor sharp while the distant
+  titans go dreamy — something a physical depth-of-field physically cannot do for
+  a camera sitting on the ground. Depth-aware, so near objects cut cleanly through
+  the soft background.
+- **God mode** for flying out and taking in the scale.
+- The **M-key map** is, at worm scale, gloriously useless. This is on purpose.
+
+## Controls
+
+| Key | Action |
+| --- | --- |
+| **WASD** | Crawl |
+| **Space** | Stretch / reach (never a jump — legs are a future evolution) |
+| **E** | Eat / burrow |
+| **M** | Map (a joke at this scale) |
+| **G** | God mode (flight) |
+| Mouse | Look |
+
+Close the window to exit.
+
+## Running
 
 ```bash
 cargo run
 ```
 
-Built with:
-- Bevy 0.15
-- `bevy_flycam`
-- `image` crate (for PNG contour extraction at mesh creation time)
+Release build (much smoother for the streaming world):
 
-## Controls
+```bash
+cargo run --release
+```
 
-- **Fly**: WASD + Mouse (look around, move)
-- **Eat**: `E` (when near a leaf)
-- Close the window to exit.
+## Built with
 
-## Development Notes
+- **Rust** + **Bevy 0.15**
+- `bevy_flycam` for the worm/fly camera
+- `image` for the PNG → voxel art pipeline
+- A hand-rolled voxel mesher, chunk streamer, LOD/silhouette system, and the
+  custom distance-blur render node
 
-Everything leaf-related lives in `src/main.rs` in `create_extruded_leaf_mesh` and `spawn_textured_leaves`.
+## Art & audio pipeline
 
-Key techniques used:
-- Per-row min/max green pixels (ignoring black outline/details) → closed outline polygon.
-- Rectification to pure H/V segments for retro jagged sides.
-- Local strip triangulation between left/right chains (with index remapping) for good texture fidelity.
-- UV insetting toward content center (extra on top/bottom bars) + nearest sampling so the geometric edge always samples interior green.
-- Full uniform thickness with extra geom pull + zero? No — full thickness on wide ends after iteration.
-- One shared mesh handle + cloned material for efficiency.
-
-Changing `assets/leaf.png` and rebuilding updates both the look *and* the 3D shape.
-
-## Future Plans (as discussed)
-
-- Procedural generated environment
-- Enhanced eating mechanics (animations, effects, progression?)
-
-## Assets
-
-Primary art asset: `assets/leaf.png` (high-res 8-bit style leaf with stem)
-
-Other images in `assets/` are earlier experiments/cleanups and can be ignored.
+Cosmetics are file-drop driven. Drop a grayscale sprite into `assets/` (grass,
+foliage skin, leaf) and the engine extrudes/tints it; drop tracks into
+`assets/music/` for an auto-shuffled soundtrack. Missing files fall back cleanly.
 
 ---
 
-Made with lots of iteration and a healthy dose of "let's see if we can do this entirely in code." 🌿
-
-Thanks for the fun project!
+*A deliberately over-scaled little world, made mostly in code, one worm at a time.* 🐛

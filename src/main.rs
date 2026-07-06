@@ -1,5 +1,6 @@
 mod australia;
 mod chunk_store;
+mod distance_blur;
 mod map_ui;
 mod silhouettes;
 mod terrain;
@@ -10,8 +11,6 @@ mod world;
 use bevy::prelude::*;
 use bevy::asset::RenderAssetUsages;
 use bevy::core_pipeline::bloom::Bloom;
-use bevy::core_pipeline::dof::{DepthOfField, DepthOfFieldMode};
-use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::pbr::{CascadeShadowConfigBuilder, DistanceFog, FogFalloff, NotShadowCaster};
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::RenderPlugin;
@@ -40,6 +39,7 @@ use terrain::{
 };
 use topography::{is_cave_cell, surface_height_voxels, surface_top_world_y};
 use trees::{generate_tree, TreeSpecies, VoxelTreeData};
+use distance_blur::{DistanceBlur, DistanceBlurPlugin};
 use world::*;
 
 #[derive(Component)]
@@ -235,9 +235,11 @@ struct GrassClump {
 }
 
 /// Grass clumps match the collectible leaves in width (~3 worm-lengths) and
-/// stand three widths tall — grass towers over a worm.
+/// stand five widths tall — a worm crawls through a canopy of it, and the
+/// biggest clumps (see the size spread in scatter_chunk_grass) become a jungle
+/// arching overhead, dialling up the felt scale of everything beyond.
 const GRASS_WIDTH: f32 = WORM_LENGTH * 3.0;
-const GRASS_HEIGHT: f32 = GRASS_WIDTH * 3.0;
+const GRASS_HEIGHT: f32 = GRASS_WIDTH * 5.0;
 
 /// Lego grass: every opaque pixel of the player's sprite becomes a solid box
 /// one pixel deep — genuine 3D pixel art with joined faces on every side,
@@ -374,11 +376,12 @@ fn scatter_chunk_grass(
                 freq: rng.range(2.2, 3.6),
             };
             // Wild size spread: anything from a 5% sprout barely clearing the
-            // soil to a 200% monster clump twice standard height.
+            // soil to a 300% monster clump towering three times standard height —
+            // the tallest become the worm's overhead jungle canopy.
             let transform = Transform {
                 translation: Vec3::new(lx, y, lz),
                 rotation: Quat::from_rotation_y(clump.yaw),
-                scale: Vec3::splat(rng.range(0.05, 2.0)),
+                scale: Vec3::splat(rng.range(0.05, 3.0)),
             };
 
             if let Some((top_mesh, top_mat)) = &species.top {
@@ -1124,6 +1127,7 @@ fn main() {
             })
         )
         .add_plugins(PlayerPlugin) // Adds WASD + mouse look camera automatically
+        .add_plugins(DistanceBlurPlugin) // Foreground-sharp, distance-soft blur
         .insert_resource(MovementSettings {
             sensitivity: 0.00012,
             speed: start_speed, // Slow crawl — we're a tiny worm (3× in god mode)
@@ -1577,11 +1581,14 @@ fn finish_tree_build_tasks(
                 ..default()
             });
             // The species tint multiplies the (grayscale) skin texture, so one
-            // player-drawn foliage.png colours itself per tree. Texture alpha
-            // needs blending; flat colour stays opaque (cheaper, no sorting).
-            // Strand-like foliage (fern fronds, casuarina needles) is drawn as
-            // thin ribbons of blocks — the cutout skin shreds those, so they
-            // stay solid.
+            // player-drawn foliage.png colours itself per tree. The skin's alpha
+            // is a hard leaf-shaped cutout, so we alpha-MASK it rather than
+            // blend: Mask writes depth (Blend does not), which the distance-blur
+            // post-process needs — otherwise it reads the sky behind the canopy
+            // and the leaves stay blurred even right up close. Flat colour stays
+            // opaque. Strand-like foliage (fern fronds, casuarina needles) is
+            // drawn as thin ribbons of blocks — the cutout skin shreds those, so
+            // they stay solid.
             let strand_foliage = matches!(
                 pending.species,
                 TreeSpecies::TreeFern | TreeSpecies::DesertOak
@@ -1591,14 +1598,25 @@ fn finish_tree_build_tasks(
             } else {
                 foliage_skin.0.clone()
             };
+            // Skinned foliage fades in while already in Mask mode: Mask writes
+            // depth, so the canopy dissolves in sharp instead of hanging blurred
+            // (Blend writes no depth → the distance-blur reads the sky behind it)
+            // and then snapping into focus when the fade ends — that snap was the
+            // flicker. Flat-colour foliage has no cutout to dissolve, so it keeps
+            // the classic Blend→Opaque fade.
             let foliage_final_mode = if skin.is_some() {
-                AlphaMode::Blend
+                AlphaMode::Mask(0.5)
             } else {
                 AlphaMode::Opaque
             };
+            let foliage_fade_mode = if skin.is_some() {
+                AlphaMode::Mask(0.5)
+            } else {
+                AlphaMode::Blend
+            };
             let foliage_material = materials.add(StandardMaterial {
                 base_color: built.foliage_color.with_alpha(0.0),
-                alpha_mode: AlphaMode::Blend,
+                alpha_mode: foliage_fade_mode,
                 base_color_texture: skin,
                 ..default()
             });
@@ -2509,30 +2527,31 @@ fn lower_worm_camera(
         camera.hdr = true;
         commands.entity(entity).insert(Bloom::NATURAL);
 
-        // Far clip a little past the silhouette ring (~512 ft) so distant trees
+        // Far clip a little past the silhouette ring (~768 ft) so distant trees
         // render before being clipped; the fog hazes them into the sky short of
-        // that wall.
+        // that wall. Pushed out for the titan-landmark scale — a 1000 ft crown a
+        // few hundred feet away needs real vertical room before the clip plane.
         commands.entity(entity).insert(Projection::Perspective(PerspectiveProjection {
-            far: 900.0,
+            far: 1600.0,
             ..default()
         }));
 
-        // Distance BLUR instead of a heavy haze: far things go soft and out of
-        // focus rather than washing out to sky colour, so the sun and the
-        // distant world keep their brilliance. DoF needs a depth prepass to
-        // compute focus, and Bevy's DoF requires MSAA off.
-        commands.entity(entity).insert((DepthPrepass, Msaa::Off));
-        commands.entity(entity).insert(DepthOfField {
-            mode: DepthOfFieldMode::Gaussian,
-            // Focus covers near-and-mid ground so it stays crisp; the distant
-            // trees fall out of focus and soften, more with depth. The big
-            // confusion-diameter cap lets the FAR blur get strong while the near
-            // (well under the cap) stays sharp.
-            focal_distance: 55.0,
-            aperture_f_stops: 3.0,
-            max_circle_of_confusion_diameter: 48.0,
-            max_depth: 700.0,
-            ..default()
+        // Background-only distance BLUR (see src/distance_blur.rs): the world
+        // stays razor sharp out to `start`, then softens with distance so the
+        // far titans go dreamy while the grass at the worm's nose is crisp. A
+        // physical depth-of-field can't do this — focused past the grass it
+        // blurs the near foreground at least as hard as the far trees (optics).
+        // Msaa must be off so the depth buffer is a plain (non-MSAA) texture the
+        // blur shader can sample.
+        commands.entity(entity).insert(Msaa::Off);
+        commands.entity(entity).insert(DistanceBlur {
+            // Sharp out to 50 ft (the whole near playfield + grass), fully soft
+            // by 600 ft, blur capped at 24 px (dialled back from 40). Tune
+            // `start` for where softening begins, `max_blur` for how dreamy the
+            // horizon gets.
+            start: 50.0,
+            end: 600.0,
+            max_blur: 24.0,
         });
 
         // A light fog stays, only to melt the very far edge into the sky (so the
@@ -2543,8 +2562,8 @@ fn lower_worm_camera(
             directional_light_color: Color::srgba(1.0, 0.95, 0.85, 0.6),
             directional_light_exponent: 40.0,
             falloff: FogFalloff::Linear {
-                start: 420.0,
-                end: 780.0,
+                start: 650.0,
+                end: 1350.0,
             },
         });
     }

@@ -43,7 +43,7 @@ pub const CHUNK_UNLOAD_DISTANCE: i32 = 3;
 /// Beyond the streamed chunks, distant trees show as coarse voxel LODs out to
 /// this many chunks (~320 ft), receding into the haze. Each far chunk's trees
 /// are generated (real voxels, downsampled) off-thread, so this stays moderate.
-pub const SILHOUETTE_CHUNK_DISTANCE: i32 = 16;
+pub const SILHOUETTE_CHUNK_DISTANCE: i32 = 24;
 pub const SILHOUETTES_PER_FRAME: usize = 4;
 /// Cap on coarse-tree builds running on the background pool at once. Now that
 /// the coarser 6-inch tree grid makes each build ~27× cheaper, more can run

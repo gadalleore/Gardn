@@ -83,13 +83,18 @@ fn plan_trees(coord: IVec2) -> Vec<SavedTree> {
         return Vec::new();
     }
 
-    let min_spacing = 18.0;
+    let min_spacing = 30.0;
     let spawn_clear_radius = 14.0;
     // Density is authored as trees per 64×64 ft of ground; scale to whatever
     // the chunk footprint is and roll the fractional remainder so a chunk with
     // an expected 0.4 trees gets one 40% of the time.
+    //
+    // LANDMARK SPARSITY: the old range (2.0–4.0) packed a small forest into
+    // every chunk. Cut ~7× so the titans stand alone — open ground to cross
+    // between them, each reading as a solitary skyscraper rather than woodland.
+    // Dial this up for denser bush, down for a lonelier plain.
     let area_scale = (CHUNK_SIZE * CHUNK_SIZE) / 4096.0;
-    let expected = rng.range(2.0, 4.0) * profile.tree_density * area_scale;
+    let expected = rng.range(0.3, 0.6) * profile.tree_density * area_scale;
     let target_trees =
         expected.floor() as i32 + if rng.chance(expected.fract()) { 1 } else { 0 };
     let margin = 4.0;

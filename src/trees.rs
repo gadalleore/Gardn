@@ -158,11 +158,11 @@ struct TreeForm {
 
 impl Default for TreeForm {
     // Defaults are a mature river red gum — a genuine skyscraper of a tree:
-    // 160–260 ft tall, 7 ft through the trunk, crown blobs the size of houses.
+    // 260–420 ft tall, 7 ft through the trunk, crown blobs the size of houses.
     fn default() -> Self {
         Self {
-            height_ft: (160, 260),
-            radius_in: 44,
+            height_ft: (260, 420),
+            radius_in: 56,
             base_flare_in: 0,
             top_taper: 0.0,
             bottle: false,
@@ -184,9 +184,10 @@ impl Default for TreeForm {
 }
 
 /// Erdtree rule: the player is a 3-inch worm, so trees are BIG-ASS TALL — sky-
-/// piercing towers. A mountain ash tops 650 ft here (~2,500 worm-lengths); even
-/// the "shrubs" would dwarf a house. Girth and crown reach scale with height so
-/// nothing looks like a flagpole.
+/// piercing towers. A mountain ash now tops 1000 ft here (~4,000 worm-lengths),
+/// its crown lost in the haze; even the "shrubs" would dwarf a house. Girth and
+/// crown reach scale with height so nothing looks like a flagpole. These are the
+/// lonely landmarks a worm crawls between — see the sparsity note in plan_trees.
 fn form_for(species: TreeSpecies) -> TreeForm {
     match species {
         TreeSpecies::RiverRedGum => TreeForm::default(),
@@ -210,8 +211,8 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             ..default_form()
         },
         TreeSpecies::Karri => TreeForm {
-            height_ft: (350, 550),
-            radius_in: 60,
+            height_ft: (550, 820),
+            radius_in: 78,
             wobble: 0.02,
             branch_zone: 0.78,
             branch_count: (5, 8),
@@ -229,8 +230,8 @@ fn form_for(species: TreeSpecies) -> TreeForm {
             ..default_form()
         },
         TreeSpecies::MountainAsh => TreeForm {
-            height_ft: (450, 650),
-            radius_in: 72,
+            height_ft: (700, 1000),
+            radius_in: 96,
             wobble: 0.02,
             branch_zone: 0.8,
             branch_count: (5, 8),
