@@ -16,17 +16,26 @@ Everything lives under `Documents\Projects\Gardn Master\`:
 
 ## Launching an agent
 
-One terminal tab per track:
+Spin up the whole fleet in one go — SuperClaude's fleet mode opens one Windows
+Terminal tab per clone (director + all five tracks):
 
 ```powershell
-SuperClaude "Gardn Master\Gardn-terrain"
+SuperClaude "Gardn Master"
 ```
 
-(SuperClaude accepts sub-paths — it cd's there and runs `claude`. Never run
-`SuperClaude -sync` against a clone: it appends to the tracked `.gitignore`.)
+Or launch a single clone, either form:
 
-Then paste the track's kickoff prompt below. Watch the first two replies:
-the agent should (a) confirm folder + branch, (b) read the docs before coding.
+```powershell
+SuperClaude "Gardn Master" -terrain          # fleet + member shorthand
+SuperClaude "Gardn Master\Gardn-terrain"     # full sub-path
+```
+
+(SuperClaude cd's there and runs `claude`. Never run `SuperClaude -sync`
+against a clone: it appends to the tracked `.gitignore`.)
+
+Then paste each track's kickoff prompt below into its tab. Watch the first two
+replies: the agent should (a) confirm folder + branch, (b) read the docs before
+coding.
 
 ## The merge-hub loop
 
