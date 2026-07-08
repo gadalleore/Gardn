@@ -78,6 +78,57 @@ Release build (much smoother for the streaming world):
 cargo run --release
 ```
 
+## Developing
+
+```bash
+cargo check   # fast type-check — run constantly
+cargo test    # unit tests for pure logic (meshing, generation, math)
+cargo run     # the real proof: launch and eyeball your change
+```
+
+Handy env knobs for testing:
+
+| Variable | Effect |
+| --- | --- |
+| `GARDN_HOUR=0` | Start at night (any 0–23 hour works) |
+| `GARDN_HIGH=300` | Start 300 ft airborne — great for checking LODs and streaming |
+
+## How the code is organized
+
+`src/main.rs` is deliberately thin (~190 lines): it builds the Bevy app and adds
+one `Plugin` per subsystem. Each subsystem lives in its own file and wires its
+own systems, so parallel work doesn't collide in the schedule:
+
+| Module | What it owns |
+| --- | --- |
+| `terrain.rs` / `topography.rs` | Voxel generation, meshing, heightfield, caves |
+| `streaming.rs` / `chunk_store.rs` | Chunk load/unload pipeline and persistence (core — runs in `main.rs`'s ordered chain) |
+| `trees.rs` / `foliage.rs` | Tree generation, LODs, wind sway |
+| `grass.rs` / `leaves.rs` | Extruded pixel-art grass and collectible leaves |
+| `weather.rs` / `sky.rs` | Wind gust system, day/night cycle |
+| `worm.rs` | The player: crawling, eating, burrowing |
+| `silhouettes.rs` / `distance_blur.rs` | Far-tree stand-ins and the custom background blur pass |
+| `world.rs` / `australia.rs` | Scale constants, geography, biome map |
+| `audio.rs` / `map_ui.rs` | Soundtrack shuffle, the (useless) map |
+
+The exact cross-module API — who may call what — is written down in
+[`docs/module-contracts.md`](docs/module-contracts.md). Treat it as a treaty:
+don't change a signature listed there without coordinating.
+
+## Parallel AI development
+
+This repo is built by several Claude agents working **simultaneously on
+separate tracks** (terrain, weather, trees, foliage-life, sprites), each in its
+own clone and branch, with a human as the merge hub. The machinery:
+
+- [`CLAUDE.md`](CLAUDE.md) — the rules every agent loads at session start.
+- [`docs/module-contracts.md`](docs/module-contracts.md) — the API boundaries between tracks.
+- [`coordination/`](coordination/) — one status file per track; how agents leave notes for each other.
+
+**This README is a living document.** Every PR that changes gameplay, controls,
+world features, build steps, or architecture must update the matching section
+here, in the same PR — see the documentation rule in `CLAUDE.md`.
+
 ## Built with
 
 - **Rust** + **Bevy 0.15**

@@ -63,6 +63,24 @@ routing it through the human.
 A pure code-move or self-contained change that `cargo check`s clean is almost
 certainly behaviour-identical — but anything with runtime effect, run it.
 
+## Documentation — every PR updates the docs it touches
+
+Docs ship **in the same PR** as the change, never "later":
+
+1. **`README.md`** — if your change alters gameplay, controls, world features,
+   build/run steps, or architecture, update the matching README section.
+   README is the *one* shared file every track may edit, under strict
+   discipline: touch **only the lines describing your own change** (usually one
+   bullet or table row), keep the diff minimal, and expect to rebase it. Don't
+   restructure the README from a track branch — route that through the human.
+2. **`coordination/<your-track>.md`** — always current (rule 4 above).
+3. **`docs/module-contracts.md`** — only when a cross-module signature genuinely
+   changed, and only via the human (rule 2 above).
+
+If a PR needs no README change (pure refactor, internal fix), say so in the PR
+description — "No player-visible change; README untouched" — so the human
+doesn't have to check.
+
 ## House style
 
 Match the surrounding code: dense, specific comments that explain *why*
