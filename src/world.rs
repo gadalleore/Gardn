@@ -126,9 +126,13 @@ pub fn chunk_world_origin(coord: IVec2) -> Vec3 {
     Vec3::new(coord.x as f32 * CHUNK_SIZE, 0.0, coord.y as f32 * CHUNK_SIZE)
 }
 
-pub fn chunk_chebyshev_distance(a: IVec2, b: IVec2) -> i32 {
-    let d = a - b;
-    d.x.abs().max(d.y.abs())
+/// Chunk distance for streaming, culling and LOD banding — Euclidean, not
+/// Chebyshev, so every ring (loaded terrain, silhouette LODs, the fog edge)
+/// is a *disc* centred on the worm, never a square. The iteration loops still
+/// sweep a square bounding box; this rounded distance is what decides which
+/// chunks inside that box actually belong, carving the box back to a circle.
+pub fn chunk_radial_distance(a: IVec2, b: IVec2) -> i32 {
+    (a - b).as_vec2().length().round() as i32
 }
 
 /// Where world-origin sits on the continent. Set once at startup so each new

@@ -1,10 +1,18 @@
-// Background-only distance blur.
+// Background-only distance blur, driven by HORIZONTAL distance.
 //
 // Unlike a physical depth-of-field (which blurs BOTH sides of a focal plane and,
 // for a near-ground camera, always blurs the foreground grass), this blurs only
 // with distance: everything nearer than `start` is perfectly sharp, then the
 // blur ramps up to `max_blur` by `end`. The grass at the worm's nose stays crisp
 // while the distant titans go soft.
+//
+// Crucially the distance used is HORIZONTAL only (world XZ), not straight-line
+// camera depth. A titan's trunk is horizontally near but vertically enormous, so
+// depth-based blur would soften its crown into mush; instead we reconstruct each
+// pixel's world ray and keep only its horizontal reach, so you can crane up a
+// trunk and see it razor-sharp all the way to the top — the height reads as pure
+// scale. (Camera-depth is still used for the depth-aware gather below, which is
+// about true occlusion ordering, not the blur amount.)
 //
 // Separable Gaussian: one horizontal pass then one vertical pass. Each pass
 // recomputes the blur radius per pixel from the (unchanged) depth texture.
@@ -20,6 +28,13 @@ struct Params {
     end: f32,
     // Maximum blur diameter, in pixels.
     max_blur: f32,
+    // Camera world basis + lens, for rebuilding the world ray per pixel:
+    //   forward.xyz = camera forward (unit), forward.w = tan(fov_y / 2)
+    //   right.xyz   = camera right   (unit), right.w   = aspect (width / height)
+    //   up.xyz      = camera up      (unit), up.w      = unused
+    forward: vec4<f32>,
+    right: vec4<f32>,
+    up: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -38,7 +53,24 @@ fn dist_at(coord: vec2<i32>) -> f32 {
     return 1.0e9;
 }
 
-// Blur diameter (pixels) for a given camera distance.
+// Horizontal (world XZ) distance to the fragment under `uv` whose camera view
+// distance is `d`. Reconstructs the world ray through the pixel: its forward
+// component is 1 by construction, so the fragment sits at `cam + ray * d` and
+// its horizontal displacement from the camera is `d * ray.xz`. Looking up a
+// trunk, the ray points mostly skyward, `ray.xz` is tiny, and the far crown
+// scores as near — sharp. Looking level at a distant tree, the ray is
+// horizontal, `ray.xz ~ 1`, and it scores as its full depth — soft.
+fn horizontal_dist(uv: vec2<f32>, d: f32) -> f32 {
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let t = params.forward.w;
+    let aspect = params.right.w;
+    let ray = params.forward.xyz
+        + params.right.xyz * (ndc.x * t * aspect)
+        + params.up.xyz * (ndc.y * t);
+    return d * length(vec2<f32>(ray.x, ray.z));
+}
+
+// Blur diameter (pixels) for a given (horizontal) distance.
 fn blur_diameter(dist: f32) -> f32 {
     let denom = max(params.end - params.start, 0.0001);
     let t = clamp((dist - params.start) / denom, 0.0, 1.0);
@@ -93,16 +125,21 @@ fn gaussian_blur(frag_coord: vec4<f32>, coc: f32, center_dist: f32, frag_offset:
     return vec4(sum / weight_sum, 1.0);
 }
 
+// The blur radius is sized by HORIZONTAL distance (so height doesn't blur), but
+// the gather's occlusion test still uses true camera depth `d` — that test is
+// about which surface is actually in front, which is a straight-line-depth fact.
 @fragment
 fn horizontal(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
-    let dist = dist_at(vec2<i32>(floor(in.position.xy)));
-    let coc = blur_diameter(dist);
-    return gaussian_blur(in.position, coc, dist, vec2(1.0, 0.0));
+    let dims = vec2<f32>(textureDimensions(color_texture));
+    let d = dist_at(vec2<i32>(floor(in.position.xy)));
+    let coc = blur_diameter(horizontal_dist(in.position.xy / dims, d));
+    return gaussian_blur(in.position, coc, d, vec2(1.0, 0.0));
 }
 
 @fragment
 fn vertical(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
-    let dist = dist_at(vec2<i32>(floor(in.position.xy)));
-    let coc = blur_diameter(dist);
-    return gaussian_blur(in.position, coc, dist, vec2(0.0, 1.0));
+    let dims = vec2<f32>(textureDimensions(color_texture));
+    let d = dist_at(vec2<i32>(floor(in.position.xy)));
+    let coc = blur_diameter(horizontal_dist(in.position.xy / dims, d));
+    return gaussian_blur(in.position, coc, d, vec2(0.0, 1.0));
 }

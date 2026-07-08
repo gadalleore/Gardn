@@ -73,6 +73,21 @@ impl TerrainMaterials {
     }
 }
 
+/// Owns the shared terrain material. (The voxel-generation and mesh builders in
+/// this module are plain functions the streamer/silhouettes call — no systems of
+/// their own — so this plugin just does the one bit of terrain setup.)
+pub struct TerrainPlugin;
+
+impl Plugin for TerrainPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Startup, setup_terrain_materials);
+    }
+}
+
+fn setup_terrain_materials(mut commands: Commands, mut materials: ResMut<Assets<StandardMaterial>>) {
+    commands.insert_resource(TerrainMaterials::new(&mut materials));
+}
+
 struct OreVein {
     ore: OreType,
     center: IVec3,

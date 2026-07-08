@@ -12,7 +12,7 @@ use crate::terrain::{build_colored_block_mesh, downsample_blocks, TerrainMateria
 use crate::topography::surface_height_voxels;
 use crate::trees::{generate_tree, species_colors};
 use crate::world::{
-    chunk_chebyshev_distance, chunk_world_origin, world_to_chunk, GardenRng, CHUNK_SIZE,
+    chunk_radial_distance, chunk_world_origin, world_to_chunk, GardenRng, CHUNK_SIZE,
     CHUNK_UNLOAD_DISTANCE, MAX_CONCURRENT_SILHOUETTE_BUILDS, SILHOUETTES_PER_FRAME,
     SILHOUETTE_CHUNK_DISTANCE, TREE_VOXEL_SIZE, VOXEL_SIZE,
 };
@@ -83,6 +83,19 @@ pub struct SilhouetteWorld {
     /// band change reads as the land sharpening, never as it vanishing.
     rezone_queue: VecDeque<IVec2>,
     last_player_chunk: Option<IVec2>,
+}
+
+impl SilhouetteWorld {
+    /// True once a chunk's far stand-in is fully up — coarse ground meshed AND
+    /// its tree-LOD task resolved (`lods` is set the frame the trees attach, or
+    /// determine the chunk is treeless). The chunk streamer waits on this before
+    /// dropping the real chunk behind it, so a receding tree never blinks out
+    /// into a gap before its blocky version stands.
+    pub fn stand_in_ready(&self, coord: IVec2) -> bool {
+        self.spawned
+            .get(&coord)
+            .is_some_and(|s| s.ground.is_some() && s.lods.is_some())
+    }
 }
 
 struct SpawnedSil {
@@ -366,7 +379,11 @@ fn attach_tree_lod(
         .spawn((
             Mesh3d(mesh),
             MeshMaterial3d(material.clone()),
-            NotShadowCaster,
+            // Distant trees DO cast shadows now — the coarse blocks throw
+            // chunky shadows onto the far ground, extending the up-close mood
+            // to the horizon. The sun's shadow cascades reach far enough to
+            // include them, and anything past the last cascade is frustum-culled
+            // out of the shadow pass for free, so only in-range trees pay.
             Transform::IDENTITY,
         ))
         .set_parent(spawned.root)
@@ -412,25 +429,6 @@ pub fn finish_sil_tree_tasks(
     }
 }
 
-/// Marks a cutout-chunk root whose real trees are all standing: instead of
-/// blinking out under the still-fading real trees, its planes get throwaway
-/// blend materials and fade away — a true cross-fade between the two worlds.
-#[derive(Component)]
-pub struct SilhouetteRetiring;
-
-/// A retiring cutout root mid-fade: alpha ramps down on the cloned materials,
-/// then the whole subtree despawns.
-#[derive(Component)]
-pub struct SilhouetteFadeOut {
-    timer: Timer,
-    materials: Vec<Handle<StandardMaterial>>,
-}
-
-/// Matched to TREE_FADE_SECS so the coarse chunk dissolves out over exactly the
-/// window the real trees fade in — a clean cross-fade, the blocky version
-/// sharpening into the detailed one rather than one blinking out.
-const CUTOUT_FADE_SECS: f32 = 1.6;
-
 /// Decide which unmaterialised chunks should show silhouettes. Cheap enough to
 /// run every frame: the full ring scan only happens when the player crosses a
 /// chunk border.
@@ -439,23 +437,23 @@ pub fn plan_tree_silhouettes(
     chunk_world: Res<crate::ChunkWorld>,
     mut sil: ResMut<SilhouetteWorld>,
     cam_q: Query<&Transform, With<Camera>>,
-    trees_pending: Query<&crate::TreesPending>,
+    revealed: Query<(), With<crate::streaming::ChunkTreesRevealed>>,
 ) {
     let Ok(cam) = cam_q.get_single() else {
         return;
     };
     let player_chunk = world_to_chunk(cam.translation.x, cam.translation.z);
 
-    // A chunk is only "fully live" once its real terrain AND all its async
-    // trees are standing — cutout trees hold the pose until then, so a distant
-    // tree never blinks out ahead of the real one popping in. Even then the
-    // cutouts don't blink: they hand off through a fade-out that overlaps the
-    // real trees' fade-in.
+    // A chunk is "fully live" once its real trees have all built AND been
+    // revealed (flipped from hidden to visible in one atomic frame). The blocky
+    // stand-in holds the pose until exactly then, then despawns the same frame —
+    // so the swap is an instant snap from coarse blocks to detail, never a gap
+    // (real trees not yet up) and never a ghosty cross-fade.
     let fully_live = |coord: &IVec2| -> bool {
         chunk_world
             .loaded
             .get(coord)
-            .is_some_and(|e| trees_pending.get(*e).map(|p| p.0 == 0).unwrap_or(true))
+            .is_some_and(|e| revealed.get(*e).is_ok())
     };
 
     let to_retire: Vec<IVec2> = sil
@@ -466,7 +464,7 @@ pub fn plan_tree_silhouettes(
         .collect();
     for coord in to_retire {
         if let Some(spawned) = sil.spawned.remove(&coord) {
-            commands.entity(spawned.root).insert(SilhouetteRetiring);
+            commands.entity(spawned.root).despawn_recursive();
         }
     }
 
@@ -477,7 +475,7 @@ pub fn plan_tree_silhouettes(
         .keys()
         .copied()
         .filter(|coord| {
-            chunk_chebyshev_distance(*coord, player_chunk) > SILHOUETTE_CHUNK_DISTANCE + 1
+            chunk_radial_distance(*coord, player_chunk) > SILHOUETTE_CHUNK_DISTANCE + 1
         })
         .collect();
     for coord in to_remove {
@@ -522,7 +520,7 @@ pub fn plan_tree_silhouettes(
         .iter()
         .filter(|(coord, s)| {
             s.ground.is_some()
-                && s.factor != far_ground_factor(chunk_chebyshev_distance(**coord, player_chunk))
+                && s.factor != far_ground_factor(chunk_radial_distance(**coord, player_chunk))
         })
         .map(|(c, _)| *c)
         .collect();
@@ -533,9 +531,12 @@ pub fn plan_tree_silhouettes(
     for dx in -SILHOUETTE_CHUNK_DISTANCE..=SILHOUETTE_CHUNK_DISTANCE {
         for dz in -SILHOUETTE_CHUNK_DISTANCE..=SILHOUETTE_CHUNK_DISTANCE {
             let coord = player_chunk + IVec2::new(dx, dz);
-            let dist = chunk_chebyshev_distance(coord, player_chunk);
-            // Leave the streamed neighbourhood to the real terrain and trees.
+            let dist = chunk_radial_distance(coord, player_chunk);
+            // Leave the streamed neighbourhood to the real terrain and trees,
+            // and clip the square sweep's corners so the silhouette region is a
+            // disc — the radial metric lets a corner chunk sit past the ring.
             if dist <= CHUNK_UNLOAD_DISTANCE
+                || dist > SILHOUETTE_CHUNK_DISTANCE
                 || chunk_world.loaded.contains_key(&coord)
                 || sil.spawned.contains_key(&coord)
             {
@@ -555,7 +556,6 @@ pub fn plan_tree_silhouettes(
 pub fn process_silhouette_queue(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     terrain_materials: Res<TerrainMaterials>,
     archive: Res<ChunkArchive>,
     chunk_world: Res<crate::ChunkWorld>,
@@ -588,7 +588,7 @@ pub fn process_silhouette_queue(
         let Some(player_chunk) = player_chunk else {
             break;
         };
-        let factor = far_ground_factor(chunk_chebyshev_distance(coord, player_chunk));
+        let factor = far_ground_factor(chunk_radial_distance(coord, player_chunk));
         let ground = match sil.spawned.get(&coord) {
             Some(s) if s.factor != factor => s.ground,
             _ => continue,
@@ -633,25 +633,18 @@ pub fn process_silhouette_queue(
             .spawn((Transform::from_translation(origin), Visibility::default()))
             .id();
 
-        // Distant ground: real topography in coarse blocky steps, fading in
-        // through a throwaway material then swapping to the shared one.
-        let fade_material = materials.add(StandardMaterial {
-            base_color: Color::WHITE.with_alpha(0.0),
-            alpha_mode: AlphaMode::Blend,
-            ..default()
-        });
+        // Distant ground: real topography in coarse blocky steps. Spawned
+        // straight onto the shared OPAQUE material — no alpha fade. Fading it in
+        // from alpha 0 (the old path) made a see-through hole in the ground for
+        // the fade's duration, which is exactly the "box vanishes" pop; and it
+        // buys nothing, because the blocks are meant to appear discretely, the
+        // way the foliage LODs snap between sizes. Instant + opaque = seamless.
         let ground_entity = commands
             .spawn((
                 Mesh3d(meshes.add(build_far_ground_mesh(coord, factor))),
-                MeshMaterial3d(fade_material.clone()),
+                MeshMaterial3d(terrain_materials.vertex_color_terrain.clone()),
                 NotShadowCaster,
                 Transform::IDENTITY,
-                crate::FadeIn {
-                    material: fade_material,
-                    timer: Timer::from_seconds(crate::GROUND_FADE_SECS, TimerMode::Once),
-                    final_alpha_mode: AlphaMode::Opaque,
-                    swap_to: Some(terrain_materials.vertex_color_terrain.clone()),
-                },
             ))
             .set_parent(parent)
             .id();
@@ -746,67 +739,3 @@ mod tests {
     }
 }
 
-/// Start the cross-fade on a freshly retiring silhouette chunk: every mesh
-/// under it (the coarse trees) gets a private blend-material clone — the shared
-/// terrain material must not dim other chunks — and any in-flight FadeIn is
-/// stripped so it can't snap the material back to opaque mid-dissolve. The real
-/// voxel trees fade in over the same window, so nothing blinks.
-pub fn begin_silhouette_fadeout(
-    mut commands: Commands,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    roots: Query<Entity, Added<SilhouetteRetiring>>,
-    children_q: Query<&Children>,
-    mesh_mats: Query<&MeshMaterial3d<StandardMaterial>>,
-) {
-    for root in &roots {
-        let mut clones = Vec::new();
-        let mut stack: Vec<Entity> = vec![root];
-        while let Some(entity) = stack.pop() {
-            if let Ok(children) = children_q.get(entity) {
-                stack.extend(children.iter().copied());
-            }
-            let Ok(mat_handle) = mesh_mats.get(entity) else {
-                continue;
-            };
-            if let Some(src) = materials.get(&mat_handle.0) {
-                let mut clone = src.clone();
-                clone.alpha_mode = AlphaMode::Blend;
-                let handle = materials.add(clone);
-                commands
-                    .entity(entity)
-                    .insert(MeshMaterial3d(handle.clone()))
-                    .remove::<crate::FadeIn>();
-                clones.push(handle);
-            }
-        }
-        commands
-            .entity(root)
-            .insert(SilhouetteFadeOut {
-                timer: Timer::from_seconds(CUTOUT_FADE_SECS, TimerMode::Once),
-                materials: clones,
-            })
-            .remove::<SilhouetteRetiring>();
-    }
-}
-
-/// Ramp a retiring silhouette chunk down to nothing, then despawn the subtree.
-pub fn tick_silhouette_fadeout(
-    time: Res<Time>,
-    mut commands: Commands,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut fades: Query<(Entity, &mut SilhouetteFadeOut)>,
-) {
-    for (root, mut fade) in &mut fades {
-        fade.timer.tick(time.delta());
-        let t = fade.timer.fraction();
-        let alpha = 1.0 - t * t * (3.0 - 2.0 * t);
-        for handle in &fade.materials {
-            if let Some(mat) = materials.get_mut(handle) {
-                mat.base_color = mat.base_color.with_alpha(alpha);
-            }
-        }
-        if fade.timer.finished() {
-            commands.entity(root).despawn_recursive();
-        }
-    }
-}

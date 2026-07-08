@@ -50,15 +50,27 @@ pub struct DistanceBlur {
     pub end: f32,
     /// Maximum blur diameter, in pixels.
     pub max_blur: f32,
+    /// The blur is a ground-level, worm's-eye mood; from the sky it just muddies
+    /// the view. Measured as height ABOVE the local ground (so a mountaintop
+    /// still gets full blur), the blur fades out from `sky_fade_start` feet up to
+    /// nothing by `sky_fade_end` — climb high and the world snaps crisp.
+    pub sky_fade_start: f32,
+    pub sky_fade_end: f32,
 }
 
-/// GPU-side parameters (see `Params` in `distance_blur.wgsl`).
+/// GPU-side parameters (see `Params` in `distance_blur.wgsl`). The camera basis
+/// and lens ride along so the shader can rebuild each pixel's world ray and blur
+/// by horizontal distance only. `.w` lanes carry the scalars: forward.w =
+/// tan(fov_y/2), right.w = aspect.
 #[derive(Component, Clone, Copy, ShaderType)]
 struct DistanceBlurUniform {
     near: f32,
     start: f32,
     end: f32,
     max_blur: f32,
+    forward: Vec4,
+    right: Vec4,
+    up: Vec4,
 }
 
 #[derive(Component)]
@@ -112,12 +124,30 @@ impl Plugin for DistanceBlurPlugin {
 /// can be linearised in the shader.
 fn extract_distance_blur(
     mut commands: Commands,
-    query: Extract<Query<(RenderEntity, &DistanceBlur, &Projection)>>,
+    query: Extract<Query<(RenderEntity, &DistanceBlur, &Projection, &GlobalTransform)>>,
 ) {
-    for (entity, blur, projection) in &query {
+    for (entity, blur, projection, global) in &query {
         let Projection::Perspective(perspective) = projection else {
             continue;
         };
+        // World-space camera basis, so the shader can rebuild the ray through
+        // each pixel and keep only its horizontal reach.
+        let pos = global.translation();
+        let (_, rot, _) = global.to_scale_rotation_translation();
+        let forward = rot * Vec3::NEG_Z;
+        let right = rot * Vec3::X;
+        let up = rot * Vec3::Y;
+        let tan_half_fov_y = (perspective.fov * 0.5).tan();
+
+        // Fade the blur out with height above the local ground, so a climb into
+        // the sky reveals a crisp world. `surface_top_world_y` is the same pure
+        // topography the terrain is meshed from, so this tracks real hills.
+        let ground_y = crate::topography::surface_top_world_y(pos.x, pos.z);
+        let altitude = pos.y - ground_y;
+        let denom = (blur.sky_fade_end - blur.sky_fade_start).max(0.0001);
+        let sky_t = ((altitude - blur.sky_fade_start) / denom).clamp(0.0, 1.0);
+        let max_blur = blur.max_blur * (1.0 - sky_t);
+
         if let Some(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.insert((
                 *blur,
@@ -125,7 +155,10 @@ fn extract_distance_blur(
                     near: perspective.near,
                     start: blur.start,
                     end: blur.end,
-                    max_blur: blur.max_blur,
+                    max_blur,
+                    forward: forward.extend(tan_half_fov_y),
+                    right: right.extend(perspective.aspect_ratio),
+                    up: up.extend(0.0),
                 },
             ));
         }
