@@ -510,11 +510,13 @@ fn create_extruded_leaf_mesh(meshes: &mut Assets<Mesh>) -> Handle<Mesh> {
             calc_u = u + du * 0.025;
             calc_v = orig_v - 0.005;
         }
-        let x = (calc_u - center_u) / span_u * desired_w;
-        // Negated (was `center_v - calc_v`) so the leaf isn't upside down: the
-        // sprite's top (v small) maps to −Z instead of +Z. UVs ride with each
-        // vertex and the side normals are derived from this flipped outline, so
-        // it stays consistent; double_sided covers the reflected winding.
+        // Flip the leaf upright with a 180° rotation about Y (negate BOTH x and
+        // z), NOT a mirror. Negating z alone was a reflection (det −1): it flips
+        // triangle winding and the side normals, so the front cap faced inward
+        // and you saw the mirror-image ("backwards") back cap through it.
+        // Negating x as well makes it a true rotation (det +1) — winding,
+        // normals and the leaf's handedness all stay correct, same orientation.
+        let x = (center_u - calc_u) / span_u * desired_w;
         let z = (calc_v - center_v) / span_v * desired_h;
         outline_2d.push([x, z]);
         // For UV: inset toward center. With nearest sampling (ImagePlugin::default_nearest) a small inset
