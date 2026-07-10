@@ -45,8 +45,11 @@ happens in — the hard part: a believable, streamable, gargantuan planet.
   editing a PNG changes the model. Grass grows in natural cluster families and
   leaves settle in drifts; both sprout/swell in as chunks stream instead of
   popping, and neither spawns in coastal shallows.
-- **Wind & gravity.** Trees and grass sway on a shared gust system; grass bends
-  away from the passing worm.
+- **Wind & gravity.** Trees and grass sway on a shared wind that gusts, lulls,
+  and slowly wanders the compass; grass bends away from the passing worm.
+- **A day/night sky.** A 24-hour clock walks the sun and full moon overhead —
+  blue days grade through gold, orange, and violet twilight into a moonlit
+  night under a wheeling starfield.
 - **A custom background-only distance blur** (`src/distance_blur.rs`): a
   from-scratch render pass that keeps the foreground razor sharp while the distant
   titans go dreamy — something a physical depth-of-field physically cannot do for
@@ -93,6 +96,7 @@ Handy env knobs for testing:
 | Variable | Effect |
 | --- | --- |
 | `GARDN_HOUR=0` | Start at night (any 0–23 hour works) |
+| `GARDN_DAY_SECS=120` | Compress the whole 24-h cycle into N real seconds — watch a full sunrise-to-starfield sweep in minutes |
 | `GARDN_HIGH=300` | Start 300 ft airborne — great for checking LODs and streaming |
 
 ## How the code is organized
