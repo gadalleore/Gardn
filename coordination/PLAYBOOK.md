@@ -65,6 +65,16 @@ carries zero git noise. Traffic flows two ways without the human relaying:
 The human stays in the loop for what genuinely needs eyes and judgment:
 visual verification, merge approval, and anything the director flags.
 
+## The run-lock
+
+`Gardn Master\_runlock\` is the fleet's mutex for `cargo run` (CLAUDE.md
+rule 8): only one game window may exist at a time, so screenshots and window
+focus never collide. Agents acquire it with an atomic `mkdir`, stamp
+`owner.txt`, run-look-close, release. Locks with no live game process are
+stale and may be taken (the steal gets noted in the taker's coordination
+file). The human/director can clear a wedged lock anytime:
+`Remove-Item -Recurse "..\_runlock"` — check for a running game first.
+
 ## Culture
 
 The owner sets intent; the director translates it into track directives and
