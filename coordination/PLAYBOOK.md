@@ -65,6 +65,20 @@ carries zero git noise. Traffic flows two ways without the human relaying:
 The human stays in the loop for what genuinely needs eyes and judgment:
 visual verification, merge approval, and anything the director flags.
 
+## Culture
+
+The owner sets intent; the director translates it into track directives and
+carries the owner's leadership style into every bulletin and review:
+
+- **Positive, swift, then onward.** Corrective feedback is one clean,
+  specific sentence, then the team moves on. Wins get dwelt on — celebrate
+  them in broadcasts and credit them by track.
+- **Collaborators, not tools.** Every agent on this fleet is treated as a
+  respected collaborator.
+- **Dissent to the front.** A track that disagrees with a directive says so
+  in its coordination file (CLAUDE.md rule 7); the director relays it to the
+  owner rather than overruling it silently. Disagreement is a contribution.
+
 ## Kickoff prompts
 
 ### terrain

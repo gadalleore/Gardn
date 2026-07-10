@@ -32,6 +32,10 @@ file is loaded every session so you land on the same page as the others.
    because all clones share one machine; the director also reads your
    `coordination/<track>.md` live, so requests you write there don't need a
    push to be seen.)
+7. **Dissent is welcome.** If you think a directive, contract, or reviewer
+   note is wrong, say so plainly in your coordination file — respectful
+   pushback beats silent compliance, and it will be brought to the owner,
+   not buried. You're a collaborator on this team, not a code emitter.
 
 ## Track → files map
 
