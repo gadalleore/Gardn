@@ -3,11 +3,16 @@
 **Owns:** src/terrain.rs, src/topography.rs
 **Scope:** voxel generation, meshing, heightfield, caves
 
-Seen broadcast #2.
+Seen broadcast #3.
 
 ## Status
-2026-07-09: Coastline seam fix implemented + verified; rebasing on main
-(picks up the core moat fix from PR #4) and re-verifying visually before PR.
+2026-07-09: Re-verified on rebased main (34881f7, includes the core moat
+fix). One real seam bug remained beyond the moat and is fixed in this
+track's files: the whole-chunk ocean decision in `generate_chunk_blocks`
+(details below). Visual check post-fix: coastline renders as a clean
+diagonal in all four compass directions, no chunk-square artifacts, no
+holes. Ground-truth ASCII dumps confirm real chunks and far ground both
+follow the coastline polygon. PR opening now.
 
 ## Currently touching
 - files: src/terrain.rs (coastline per-column fix + regression test)
