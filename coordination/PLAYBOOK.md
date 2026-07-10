@@ -37,6 +37,16 @@ Then paste each track's kickoff prompt below into its tab. Watch the first two
 replies: the agent should (a) confirm folder + branch, (b) read the docs before
 coding.
 
+**Thermal budget — director + two tracks, rotating.** Five Claude sessions at
+once cooks the machine, so the fleet runs at most **two** track sessions
+alongside the director. Rotate pairs in launch order (terrain + weather →
+trees + foliage-life → sprites → back around); when a track's PR merges, its
+session winds down and the next track spins up. Prefer full fleet-mode
+(`SuperClaude "Gardn Master"`) only for quick all-hands moments, not sustained
+work. A closed session isn't lost: run `claude --continue` from the clone (or
+relaunch and point the agent at its own coordination file, which is the
+durable memory).
+
 ## The merge-hub loop
 
 1. A PR lands → the director reviews it (stayed in owned files? README rule
