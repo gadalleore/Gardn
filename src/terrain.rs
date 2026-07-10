@@ -3,7 +3,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use std::collections::{HashMap, HashSet};
 
-use crate::australia::{biome_profile, AussieBiome};
+use crate::australia::{biome_at_world, biome_profile, AussieBiome};
 use crate::topography::{is_cave_cell, surface_height_voxels, CAVE_CELL_VOXELS};
 use crate::world::{
     GardenRng, CHUNK_DEPTH_VOXELS, CHUNK_SIZE, CHUNK_VOXELS, SEA_LEVEL_VOXEL_Y, VOXEL_SIZE,
@@ -211,17 +211,6 @@ pub fn generate_chunk_blocks(
     let center_world = chunk_origin + Vec3::new(CHUNK_SIZE * 0.5, 0.0, CHUNK_SIZE * 0.5);
     let profile = biome_profile(center_world.x, center_world.z);
 
-    if profile.biome == AussieBiome::Ocean {
-        let mut voxels = ChunkVoxels::new(
-            CHUNK_VOXELS,
-            CHUNK_VOXELS,
-            -CHUNK_DEPTH_VOXELS,
-            SEA_LEVEL_VOXEL_Y,
-        );
-        fill_ocean_chunk(&mut voxels, &mut rng);
-        return voxels;
-    }
-
     // Strides are in (1-inch) voxels — layer/height sampling stays at the same
     // physical spacing it had on the old 2-inch grid, so noise cost per chunk
     // is unchanged even though the voxel grid is 4× denser.
@@ -243,6 +232,46 @@ pub fn generate_chunk_blocks(
             height_grid[gz * gcols + gx] = surface_height_voxels(wx, wz) as f32;
         }
     }
+
+    // Coastline: land vs sea is decided per COLUMN, from the same polygon the
+    // height formula and the far ground sample. The old code asked once at the
+    // chunk centre and made the WHOLE chunk ocean or land, which quantised a
+    // diagonal shore into a 32-ft checkerboard — flat water squares biting
+    // into beaches and dry squares jutting into the sea, each disagreeing with
+    // its neighbours (and the per-cell far ground) at every shared chunk edge.
+    // The lattice tells us for free which chunks straddle the shore:
+    // surface_height_voxels returns 0 ONLY on ocean (land clamps to >= 1), so
+    // pure-land chunks skip the mask entirely and pay nothing. (Coast wiggles
+    // thinner than the 2-ft lattice can slip past the straddle test — a
+    // sub-lattice sliver, invisible at worm scale.)
+    let lattice_ocean = height_grid.iter().filter(|h| **h == 0.0).count();
+    let center_ocean = profile.biome == AussieBiome::Ocean;
+    if lattice_ocean == height_grid.len() && center_ocean {
+        // Open sea in every sample — the flat fast path.
+        let mut voxels = ChunkVoxels::new(
+            CHUNK_VOXELS,
+            CHUNK_VOXELS,
+            -CHUNK_DEPTH_VOXELS,
+            SEA_LEVEL_VOXEL_Y,
+        );
+        fill_ocean_chunk(&mut voxels, &mut rng);
+        return voxels;
+    }
+    let straddles_coast = lattice_ocean > 0 || center_ocean;
+    let sea_mask: Vec<bool> = if straddles_coast {
+        let mut mask = vec![false; cols * cols];
+        for lz in 0..CHUNK_VOXELS {
+            for lx in 0..CHUNK_VOXELS {
+                let wx = chunk_origin.x + (lx as f32 + 0.5) * VOXEL_SIZE;
+                let wz = chunk_origin.z + (lz as f32 + 0.5) * VOXEL_SIZE;
+                mask[lz as usize * cols + lx as usize] =
+                    biome_at_world(wx, wz) == AussieBiome::Ocean;
+            }
+        }
+        mask
+    } else {
+        vec![false; cols * cols]
+    };
 
     let mut heights = vec![0i32; cols * cols];
     let mut min_h = i32::MAX;
@@ -296,10 +325,16 @@ pub fn generate_chunk_blocks(
     // Each column's soil stack rides its own surface height. Filled solid down
     // to the chunk-wide stone floor so even the steepest worm-mountain walls
     // never expose a hollow core (interior faces are culled away, so the mesh
-    // stays the same size).
+    // stays the same size). Sea columns get the standard seabed profile
+    // instead, so a mixed coastal chunk meets a full-ocean neighbour with the
+    // exact same water/sand stack at the shared edge.
     let chunk_floor = min_h - CHUNK_DEPTH_VOXELS;
     for lz in 0..CHUNK_VOXELS {
         for lx in 0..CHUNK_VOXELS {
+            if sea_mask[lz as usize * cols + lx as usize] {
+                fill_seabed_column(&mut voxels, lx, lz, chunk_floor);
+                continue;
+            }
             let h = heights[lz as usize * cols + lx as usize];
             let layers = columns[lz as usize * cols + lx as usize];
             let soft_bottom = h - layers.dirt_depth - layers.soft_depth;
@@ -347,7 +382,14 @@ pub fn generate_chunk_blocks(
                         }
                         for dz in 0..CAVE_CELL_VOXELS {
                             for dx in 0..CAVE_CELL_VOXELS {
-                                voxels.clear_cell(lx + dx, cy, lz + dz);
+                                // Never carve a sea column — a cave cell that
+                                // straddles the waterline must not punch holes
+                                // in the water sheet or the seabed.
+                                let (cx, cz) = (lx + dx, lz + dz);
+                                if sea_mask[cz as usize * cols + cx as usize] {
+                                    continue;
+                                }
+                                voxels.clear_cell(cx, cy, cz);
                             }
                         }
                     }
@@ -403,21 +445,28 @@ fn column_layers(rng: &mut GardenRng, profile: &crate::australia::BiomeProfile) 
     }
 }
 
+/// One column of open sea: water sheet at sea level, a thin sand bed, hollow
+/// dark below, bedrock at the floor. Shared by full-ocean chunks and the sea
+/// columns of mixed coastal chunks so the two meet seamlessly at chunk edges.
+fn fill_seabed_column(voxels: &mut ChunkVoxels, lx: i32, lz: i32, floor_y: i32) {
+    for y in floor_y..=SEA_LEVEL_VOXEL_Y {
+        let block = if y >= -2 {
+            BlockType::Water
+        } else if y > -6 {
+            BlockType::Sand
+        } else if y == floor_y {
+            BlockType::Sandstone
+        } else {
+            continue;
+        };
+        voxels.set(lx, y, lz, block);
+    }
+}
+
 fn fill_ocean_chunk(voxels: &mut ChunkVoxels, rng: &mut GardenRng) {
     for lz in 0..CHUNK_VOXELS {
         for lx in 0..CHUNK_VOXELS {
-            for y in -CHUNK_DEPTH_VOXELS..=SEA_LEVEL_VOXEL_Y {
-                let block = if y >= -2 {
-                    BlockType::Water
-                } else if y > -6 {
-                    BlockType::Sand
-                } else if y == -CHUNK_DEPTH_VOXELS {
-                    BlockType::Sandstone
-                } else {
-                    continue;
-                };
-                voxels.set(lx, y, lz, block);
-            }
+            fill_seabed_column(voxels, lx, lz, -CHUNK_DEPTH_VOXELS);
             if rng.chance(0.02) {
                 voxels.set(lx, -8, lz, BlockType::Limestone);
             }
@@ -494,9 +543,12 @@ fn stamp_ore_veins(voxels: &mut ChunkVoxels, veins: &[OreVein]) {
             for z in z0..=z1 {
                 for x in x0..=x1 {
                     let idx = voxels.index(x, y, z);
-                    // Ore only replaces existing solid ground, never air/caves.
-                    if voxels.cells[idx].is_none() {
-                        continue;
+                    // Ore only replaces existing solid ground — never air/caves,
+                    // and never the sea (mixed coastal chunks have water above
+                    // the vein ceiling; ore must not gleam in the waves).
+                    match voxels.cells[idx] {
+                        None | Some(BlockType::Water) => continue,
+                        Some(_) => {}
                     }
                     let dx = (x - vein.center.x) as f32 / rx as f32;
                     let dy = (y - vein.center.y) as f32 / ry as f32;
@@ -873,6 +925,77 @@ mod tests {
         assert!(
             verts > 0 && verts < 2_500_000,
             "chunk mesh has {verts} vertices — too heavy for streaming"
+        );
+    }
+
+    /// A chunk straddling the coastline must carry BOTH sea and land columns,
+    /// each matching the coastline polygon at that column — the old
+    /// whole-chunk ocean test quantised a diagonal shore into 32-ft all-water
+    /// or all-land squares that disagreed with their neighbours (and the
+    /// per-cell far ground) at every shared chunk edge.
+    #[test]
+    fn coastal_chunks_split_land_and_water_per_column() {
+        use crate::world::geo_to_world_offset;
+
+        // Walk south across the Victorian west coast (unshifted geo mapping)
+        // until the chunk-centre land/ocean answer flips, then test the chunks
+        // around the crossing.
+        let inland = geo_to_world_offset(-38.0, 141.0);
+        let start = crate::world::world_to_chunk(inland.x, inland.y);
+        let mut mixed = None;
+        let mut prev_ocean = None;
+        'scan: for dz in 0..4000 {
+            let coord = start + IVec2::new(0, dz);
+            let origin = chunk_world_origin(coord);
+            // A chunk is a candidate once its 4 corners disagree about the sea.
+            let mut corners_ocean = 0;
+            for (cx, cz) in [(0.0, 0.0), (CHUNK_SIZE, 0.0), (0.0, CHUNK_SIZE), (CHUNK_SIZE, CHUNK_SIZE)]
+            {
+                if biome_at_world(origin.x + cx, origin.z + cz) == AussieBiome::Ocean {
+                    corners_ocean += 1;
+                }
+            }
+            if corners_ocean > 0 && corners_ocean < 4 {
+                mixed = Some(coord);
+                break 'scan;
+            }
+            let all_ocean = corners_ocean == 4;
+            if prev_ocean == Some(false) && all_ocean {
+                // Crossed the coast between two rows without a corner-mixed
+                // chunk (coast ran between corners) — very unlikely, but bail
+                // rather than assert on nothing.
+                break 'scan;
+            }
+            prev_ocean = Some(all_ocean);
+        }
+        let coord = mixed.expect("no coast-straddling chunk found along the scan");
+
+        let origin = chunk_world_origin(coord);
+        let voxels = generate_chunk_blocks(coord, origin, chunk_seed(WORLD_SEED, coord));
+
+        let mut sea_cols = 0;
+        let mut land_cols = 0;
+        for lz in 0..CHUNK_VOXELS {
+            for lx in 0..CHUNK_VOXELS {
+                let wx = origin.x + (lx as f32 + 0.5) * VOXEL_SIZE;
+                let wz = origin.z + (lz as f32 + 0.5) * VOXEL_SIZE;
+                let polygon_sea = biome_at_world(wx, wz) == AussieBiome::Ocean;
+                let has_water = voxels.get(lx, SEA_LEVEL_VOXEL_Y, lz) == Some(BlockType::Water);
+                assert_eq!(
+                    polygon_sea, has_water,
+                    "column ({lx},{lz}) of chunk {coord:?}: polygon says sea={polygon_sea} \
+                     but generated water={has_water}"
+                );
+                if polygon_sea {
+                    sea_cols += 1;
+                } else {
+                    land_cols += 1;
+                }
+            }
+        }
+        assert!(
+            sea_cols > 0 && land_cols > 0,
+            "chunk {coord:?} should straddle the coast (sea {sea_cols}, land {land_cols})"
         );
     }
 }
