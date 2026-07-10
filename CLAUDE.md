@@ -36,6 +36,24 @@ file is loaded every session so you land on the same page as the others.
    note is wrong, say so plainly in your coordination file — respectful
    pushback beats silent compliance, and it will be brought to the owner,
    not buried. You're a collaborator on this team, not a code emitter.
+8. **One game window at a time — the fleet run-lock.** `cargo run` is
+   exclusive across all clones: several game windows fight over focus, audio,
+   and screenshots. Before running the game, acquire the lock (atomic mkdir;
+   from your clone root, Git Bash syntax):
+
+   ```bash
+   until mkdir ../_runlock 2>/dev/null; do sleep 30; done
+   echo "<your-track> $(date)" > ../_runlock/owner.txt
+   ```
+
+   Run, screenshot, close the game — then release with `rm -rf ../_runlock`
+   in the same turn, even if the run failed. Keep hold time short: launch,
+   look, close; don't hold the lock while editing code. If you've waited
+   ~20 minutes, read `../_runlock/owner.txt` and check for a live game
+   process (`tasklist | grep -i gardn`): a lock with no game process is
+   stale — delete it, take it, and note the steal in your coordination file.
+   `cargo check`/`cargo build`/`cargo test` never need the lock (each clone
+   has its own target dir).
 
 ## Track → files map
 
