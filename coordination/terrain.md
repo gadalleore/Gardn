@@ -12,7 +12,7 @@ track's files: the whole-chunk ocean decision in `generate_chunk_blocks`
 (details below). Visual check post-fix: coastline renders as a clean
 diagonal in all four compass directions, no chunk-square artifacts, no
 holes. Ground-truth ASCII dumps confirm real chunks and far ground both
-follow the coastline polygon. PR opening now.
+follow the coastline polygon. PR #7 open, awaiting review.
 
 ## Currently touching
 - files: src/terrain.rs (coastline per-column fix + regression test)
