@@ -8,7 +8,7 @@ use bevy::pbr::NotShadowCaster;
 use bevy::prelude::*;
 use std::collections::HashSet;
 
-use crate::australia::{biome_profile, AussieBiome};
+use crate::australia::{biome_at_world, biome_profile, AussieBiome};
 use crate::terrain::build_culled_voxel_mesh;
 use crate::world::{
     chunk_seed, chunk_world_origin, GardenRng, CHUNK_SIZE, CHUNK_VOXELS, VOXEL_SIZE, WORLD_SEED,
@@ -276,7 +276,8 @@ pub(crate) fn scatter_chunk_grass(
     tops: &[i32],
     grass: &GrassAssets,
 ) {
-    let center = chunk_world_origin(coord) + Vec3::new(CHUNK_SIZE * 0.5, 0.0, CHUNK_SIZE * 0.5);
+    let origin = chunk_world_origin(coord);
+    let center = origin + Vec3::new(CHUNK_SIZE * 0.5, 0.0, CHUNK_SIZE * 0.5);
     let profile = biome_profile(center.x, center.z);
     let Some((species_idx, (lo, hi))) = grass.by_biome[profile.biome as usize] else {
         return;
@@ -320,6 +321,12 @@ pub(crate) fn scatter_chunk_grass(
                 if !(0.2..=CHUNK_SIZE - 0.2).contains(&lx)
                     || !(0.2..=CHUNK_SIZE - 0.2).contains(&lz)
                 {
+                    continue;
+                }
+                // Coastal chunks mix land and water columns since the
+                // per-column sea fix — skip ocean spots so grass doesn't
+                // stand in the shallows as accidental reeds.
+                if biome_at_world(origin.x + lx, origin.z + lz) == AussieBiome::Ocean {
                     continue;
                 }
                 let cx = ((lx / VOXEL_SIZE) as i32).clamp(0, CHUNK_VOXELS - 1);

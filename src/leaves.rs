@@ -7,7 +7,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 
-use crate::australia::{biome_profile, AussieBiome};
+use crate::australia::{biome_at_world, biome_profile, AussieBiome};
 use crate::grass::GRASS_HEIGHT;
 use crate::topography::surface_top_world_y;
 use crate::world::{chunk_seed, chunk_world_origin, GardenRng, CHUNK_SIZE, WORLD_SEED};
@@ -188,6 +188,12 @@ pub(crate) fn scatter_chunk_leaves(
                 ),
             };
             prev = Some(Vec2::new(lx, lz));
+            // The whole-chunk Ocean skip above misses mixed coastal chunks
+            // (land/sea is per-column since the coastal fix) — don't hover
+            // leaves over the shallows.
+            if biome_at_world(origin.x + lx, origin.z + lz) == AussieBiome::Ocean {
+                continue;
+            }
             let ground = surface_top_world_y(origin.x + lx, origin.z + lz);
 
             let base_rot = Quat::from_euler(
