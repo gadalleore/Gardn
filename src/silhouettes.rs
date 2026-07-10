@@ -13,7 +13,7 @@ use crate::topography::surface_height_voxels;
 use crate::trees::{generate_tree, species_colors};
 use crate::world::{
     chunk_radial_distance, chunk_world_origin, world_to_chunk, GardenRng, CHUNK_SIZE,
-    CHUNK_UNLOAD_DISTANCE, MAX_CONCURRENT_SILHOUETTE_BUILDS, SILHOUETTES_PER_FRAME,
+    CHUNK_VIEW_DISTANCE, MAX_CONCURRENT_SILHOUETTE_BUILDS, SILHOUETTES_PER_FRAME,
     SILHOUETTE_CHUNK_DISTANCE, TREE_VOXEL_SIZE, VOXEL_SIZE,
 };
 
@@ -535,7 +535,14 @@ pub fn plan_tree_silhouettes(
             // Leave the streamed neighbourhood to the real terrain and trees,
             // and clip the square sweep's corners so the silhouette region is a
             // disc — the radial metric lets a corner chunk sit past the ring.
-            if dist <= CHUNK_UNLOAD_DISTANCE
+            // The inner skip must be VIEW distance, not UNLOAD: real terrain
+            // only ever streams in at dist <= CHUNK_VIEW_DISTANCE, so skipping
+            // out to CHUNK_UNLOAD_DISTANCE left the ring between them with
+            // neither real nor far ground (a one-chunk moat of missing world).
+            // Loaded chunks lingering in that ring (unload hysteresis) are
+            // already excluded by the `loaded` check below, and far ground
+            // despawns the moment a real chunk lands on its coord.
+            if dist <= CHUNK_VIEW_DISTANCE
                 || dist > SILHOUETTE_CHUNK_DISTANCE
                 || chunk_world.loaded.contains_key(&coord)
                 || sil.spawned.contains_key(&coord)
