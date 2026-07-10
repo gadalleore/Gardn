@@ -50,7 +50,18 @@ struct GrassClump {
     phase: f32,
     freq: f32,
     base_scale: f32,
+    /// Sprout clock, in seconds: starts negative (a per-clump stagger), counts
+    /// up every frame; the clump is full-size once it passes SPROUT_SECS. Kept
+    /// on the clump (not a separate component) so finishing doesn't need a
+    /// Commands archetype move for hundreds of entities per chunk.
+    grow: f32,
 }
+
+/// Freshly streamed grass sprouts out of the soil instead of popping in: each
+/// clump waits its random stagger (up to SPROUT_STAGGER) then grows to full
+/// size over SPROUT_SECS, so a new chunk fills in as a ~2s wave, not a flash.
+const SPROUT_SECS: f32 = 0.9;
+const SPROUT_STAGGER: f32 = 1.2;
 
 /// Grass thins toward the render edge rather than hard-cropping: full size
 /// within `GRASS_FULL_FT`, shrinking to nothing by `GRASS_GONE_FT` (just inside
@@ -210,9 +221,10 @@ fn sway_grass(
     time: Res<Time>,
     wind: Res<Wind>,
     cam_q: Query<&Transform, (With<Camera>, Without<GrassClump>)>,
-    mut clumps: Query<(&GrassClump, &GlobalTransform, &mut Transform)>,
+    mut clumps: Query<(&mut GrassClump, &GlobalTransform, &mut Transform)>,
 ) {
     let t = time.elapsed_secs();
+    let dt = time.delta_secs();
     let gust = 0.5 + 0.5 * ((t * 0.11).sin() * 0.6 + (t * 0.043).sin() * 0.4);
     let wind_axis = Vec3::new(-wind.dir.y, 0.0, wind.dir.x);
     let force = wind.strength / 5.0;
@@ -222,7 +234,13 @@ fn sway_grass(
     const PUSH_RADIUS: f32 = 0.9;
     const PUSH_MAX_RAD: f32 = 1.25;
 
-    for (clump, global, mut tf) in &mut clumps {
+    for (mut clump, global, mut tf) in &mut clumps {
+        // Advance the sprout clock unconditionally — an add + min is cheaper
+        // than branching per clump, and full-grown clumps just saturate.
+        clump.grow = (clump.grow + dt).min(SPROUT_SECS);
+        let g = (clump.grow / SPROUT_SECS).clamp(0.0, 1.0);
+        let sprout = g * g * (3.0 - 2.0 * g); // smoothstep: eases in AND out
+
         let wind_angle = force
             * ((0.06 + 0.11 * gust) * (t * clump.freq + clump.phase).sin() + 0.35 * gust);
         let mut rotation = Quat::from_axis_angle(wind_axis, wind_angle);
@@ -245,7 +263,7 @@ fn sway_grass(
         }
 
         tf.rotation = rotation * Quat::from_rotation_y(clump.yaw);
-        tf.scale = Vec3::splat(clump.base_scale * fade);
+        tf.scale = Vec3::splat(clump.base_scale * fade * sprout);
     }
 }
 
@@ -270,46 +288,86 @@ pub(crate) fn scatter_chunk_grass(
     let count = rng.range_i(lo, hi) * 3;
 
     commands.entity(chunk_entity).with_children(|chunk| {
-        for _ in 0..count {
-            let lx = rng.range(0.2, CHUNK_SIZE - 0.2);
-            let lz = rng.range(0.2, CHUNK_SIZE - 0.2);
-            let cx = ((lx / VOXEL_SIZE) as i32).clamp(0, CHUNK_VOXELS - 1);
-            let cz = ((lz / VOXEL_SIZE) as i32).clamp(0, CHUNK_VOXELS - 1);
-            let y = (tops[(cz * CHUNK_VOXELS + cx) as usize] + 1) as f32 * VOXEL_SIZE;
-
-            // Wild size spread: anything from a 5% sprout barely clearing the
-            // soil to a 300% monster clump towering three times standard height —
-            // the tallest become the worm's overhead jungle canopy. Kept on the
-            // clump so the distance fade scales relative to it.
-            let base_scale = rng.range(0.05, 3.0);
-            let clump = GrassClump {
-                yaw: rng.range(0.0, std::f32::consts::TAU),
-                phase: rng.range(0.0, std::f32::consts::TAU),
-                freq: rng.range(2.2, 3.6),
-                base_scale,
+        // Grass grows in families, not white noise: most clumps belong to a
+        // cluster — a shared centre, footprint and size bias, so a patch reads
+        // as siblings of one bush — and the rest scatter as loners so the gaps
+        // between patches aren't sterile.
+        let mut remaining = count;
+        while remaining > 0 {
+            let clustered = rng.chance(0.75);
+            let group = if clustered {
+                rng.range_i(4, 12).min(remaining)
+            } else {
+                1
             };
-            let transform = Transform {
-                translation: Vec3::new(lx, y, lz),
-                rotation: Quat::from_rotation_y(clump.yaw),
-                scale: Vec3::splat(base_scale),
-            };
+            remaining -= group;
+            let gx = rng.range(0.2, CHUNK_SIZE - 0.2);
+            let gz = rng.range(0.2, CHUNK_SIZE - 0.2);
+            let radius = if clustered { rng.range(1.5, 4.5) } else { 0.0 };
+            // Siblings share a rough family height; the per-clump roll below
+            // still lets a sprout hide under a monster within one patch.
+            let size_bias = if clustered { rng.range(0.5, 1.6) } else { 1.0 };
 
-            if let Some((top_mesh, top_mat)) = &species.top {
+            for _ in 0..group {
+                // Linear radial falloff: dense core, thinning fringe.
+                let ang = rng.range(0.0, std::f32::consts::TAU);
+                let r = radius * rng.range(0.0, 1.0);
+                let lx = gx + ang.cos() * r;
+                let lz = gz + ang.sin() * r;
+                // Drop fringe members that fall off the chunk instead of
+                // clamping them — clamping piles clumps into a visible line
+                // along the border every 32 ft.
+                if !(0.2..=CHUNK_SIZE - 0.2).contains(&lx)
+                    || !(0.2..=CHUNK_SIZE - 0.2).contains(&lz)
+                {
+                    continue;
+                }
+                let cx = ((lx / VOXEL_SIZE) as i32).clamp(0, CHUNK_VOXELS - 1);
+                let cz = ((lz / VOXEL_SIZE) as i32).clamp(0, CHUNK_VOXELS - 1);
+                let y = (tops[(cz * CHUNK_VOXELS + cx) as usize] + 1) as f32 * VOXEL_SIZE;
+
+                // Wild size spread: anything from a 5% sprout barely clearing
+                // the soil to a 300% monster clump towering three times standard
+                // height — the tallest become the worm's overhead jungle canopy.
+                // Kept on the clump so the distance fade scales relative to it.
+                let base_scale = if clustered {
+                    (size_bias * rng.range(0.3, 2.0)).clamp(0.05, 3.0)
+                } else {
+                    rng.range(0.05, 3.0)
+                };
+                let clump = GrassClump {
+                    yaw: rng.range(0.0, std::f32::consts::TAU),
+                    phase: rng.range(0.0, std::f32::consts::TAU),
+                    freq: rng.range(2.2, 3.6),
+                    base_scale,
+                    grow: -rng.range(0.0, SPROUT_STAGGER),
+                };
+                // Spawn near-zero scale: commands flush after this stage, so a
+                // frame could render before sway_grass takes over the scale —
+                // starting tiny guarantees no single full-size pop frame.
+                let transform = Transform {
+                    translation: Vec3::new(lx, y, lz),
+                    rotation: Quat::from_rotation_y(clump.yaw),
+                    scale: Vec3::splat(0.001),
+                };
+
+                if let Some((top_mesh, top_mat)) = &species.top {
+                    chunk.spawn((
+                        GrassClump { ..clump },
+                        Mesh3d(top_mesh.clone()),
+                        MeshMaterial3d(top_mat.clone()),
+                        NotShadowCaster,
+                        transform,
+                    ));
+                }
                 chunk.spawn((
-                    GrassClump { ..clump },
-                    Mesh3d(top_mesh.clone()),
-                    MeshMaterial3d(top_mat.clone()),
+                    clump,
+                    Mesh3d(species.mesh.clone()),
+                    MeshMaterial3d(species.material.clone()),
                     NotShadowCaster,
                     transform,
                 ));
             }
-            chunk.spawn((
-                clump,
-                Mesh3d(species.mesh.clone()),
-                MeshMaterial3d(species.material.clone()),
-                NotShadowCaster,
-                transform,
-            ));
         }
     });
 }

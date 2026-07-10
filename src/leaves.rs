@@ -30,11 +30,23 @@ struct FloatingLeaf {
     base_x: f32,
     base_y: f32,
     base_z: f32,
+    /// Full world scale the leaf wears once grown in — the animation system
+    /// owns Transform::scale now, so it has to know the target.
+    base_scale: f32,
     phase: f32,
     bob_speed: f32,
     spin_speed: f32,
     base_rotation: Quat, // artistic starting orientation
+    /// Grow-in clock, seconds: starts negative (per-leaf stagger), counts up;
+    /// full-size past LEAF_GROW_SECS. Streamed leaves swell in, not pop in.
+    grow: f32,
 }
+
+/// Freshly streamed leaves swell from nothing to full size over this long,
+/// each after its own random stagger — a chunk's litter settles in as a
+/// scatter of arrivals instead of one simultaneous pop.
+const LEAF_GROW_SECS: f32 = 0.7;
+const LEAF_GROW_STAGGER: f32 = 0.8;
 
 /// Shared handles for the extruded-PNG leaf so every chunk can scatter copies.
 #[derive(Resource)]
@@ -116,20 +128,26 @@ fn spawn_textured_leaves(commands: &mut Commands, leaf_assets: &LeafAssets) {
         commands.spawn((
             Mesh3d(leaf_assets.mesh.clone()),
             MeshMaterial3d(leaf_assets.material.clone()),
+            // Near-zero spawn scale: the animation system owns scale from the
+            // first Update, but a frame can render before it runs — start tiny
+            // so there's never a full-size pop frame.
             Transform {
                 translation: pos,
                 rotation: *base_rot,
-                scale: Vec3::splat(full_scale),
+                scale: Vec3::splat(0.001),
             },
             Leaf,
             FloatingLeaf {
                 base_x: pos.x,
                 base_y: pos.y,
                 base_z: pos.z,
+                base_scale: full_scale,
                 phase,
                 bob_speed,
                 spin_speed,
                 base_rotation: *base_rot,
+                // Welcome set staggers by index — a little cascade at spawn.
+                grow: -(i as f32) * 0.15,
             },
         ));
     }
@@ -154,9 +172,22 @@ pub(crate) fn scatter_chunk_leaves(
     let count = (rng.range(3.0, 7.0) * (0.4 + profile.tree_density * 0.5)).round() as i32;
 
     commands.entity(chunk_entity).with_children(|chunk| {
+        // Leaves gather in drifts the way real litter does: each leaf has an
+        // even chance of settling near the previous one instead of on a fresh
+        // uniform spot, so runs of 2–3 companions form naturally.
+        let mut prev: Option<Vec2> = None;
         for _ in 0..count {
-            let lx = rng.range(1.5, CHUNK_SIZE - 1.5);
-            let lz = rng.range(1.5, CHUNK_SIZE - 1.5);
+            let (lx, lz) = match prev {
+                Some(p) if rng.chance(0.5) => (
+                    (p.x + rng.range(-3.5, 3.5)).clamp(1.5, CHUNK_SIZE - 1.5),
+                    (p.y + rng.range(-3.5, 3.5)).clamp(1.5, CHUNK_SIZE - 1.5),
+                ),
+                _ => (
+                    rng.range(1.5, CHUNK_SIZE - 1.5),
+                    rng.range(1.5, CHUNK_SIZE - 1.5),
+                ),
+            };
+            prev = Some(Vec2::new(lx, lz));
             let ground = surface_top_world_y(origin.x + lx, origin.z + lz);
 
             let base_rot = Quat::from_euler(
@@ -175,20 +206,24 @@ pub(crate) fn scatter_chunk_leaves(
             chunk.spawn((
                 Mesh3d(leaf_assets.mesh.clone()),
                 MeshMaterial3d(leaf_assets.material.clone()),
+                // Near-zero spawn scale so no full-size frame renders before
+                // the animation system takes over (commands flush post-stage).
                 Transform {
                     translation: Vec3::new(lx, y, lz),
                     rotation: base_rot,
-                    scale: Vec3::splat(leaf_scale),
+                    scale: Vec3::splat(0.001),
                 },
                 Leaf,
                 FloatingLeaf {
                     base_x: lx,
                     base_y: y,
                     base_z: lz,
+                    base_scale: leaf_scale,
                     phase: rng.range(0.0, std::f32::consts::TAU),
                     bob_speed: rng.range(1.2, 2.4),
                     spin_speed: rng.range(0.45, 1.3),
                     base_rotation: base_rot,
+                    grow: -rng.range(0.0, LEAF_GROW_STAGGER),
                 },
             ));
         }
@@ -201,13 +236,21 @@ pub(crate) fn scatter_chunk_leaves(
 fn animate_floating_leaves(
     time: Res<Time>,
     wind: Res<Wind>,
-    mut query: Query<(&mut Transform, &FloatingLeaf)>,
+    mut query: Query<(&mut Transform, &mut FloatingLeaf)>,
 ) {
     let t = time.elapsed_secs();
+    let dt = time.delta_secs();
     let force = wind.strength / 5.0;
     let lean_axis = Vec3::new(-wind.dir.y, 0.0, wind.dir.x);
 
-    for (mut transform, floating) in &mut query {
+    for (mut transform, mut floating) in &mut query {
+        // Grow-in: negative while waiting out the stagger, saturates at full
+        // size. Unconditional add + min beats a per-leaf branch.
+        floating.grow = (floating.grow + dt).min(LEAF_GROW_SECS);
+        let g = (floating.grow / LEAF_GROW_SECS).clamp(0.0, 1.0);
+        let swell = g * g * (3.0 - 2.0 * g); // smoothstep
+        transform.scale = Vec3::splat(floating.base_scale * swell);
+
         // Gentle vertical bob, a little choppier when the wind is up.
         let bob = (t * floating.bob_speed * (1.0 + force * 0.8) + floating.phase).sin() * 0.20;
         transform.translation.y = floating.base_y + bob;
