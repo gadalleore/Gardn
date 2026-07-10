@@ -22,6 +22,16 @@ file is loaded every session so you land on the same page as the others.
    work only as of your last pull / once it's merged — this is not live chat.
    Small PRs + frequent `main` pulls + the human as merge hub is the real
    coordination channel.
+6. **Director sync:** the fleet root has a `..\_director\` folder (a sibling
+   of your clone, outside every repo). At each checkpoint — before starting a
+   new step, after finishing one, and always before opening a PR — read
+   `..\_director\broadcast.md` and `..\_director\<your-track>.md`. Treat them
+   as standing instructions from the director (e.g. "main updated — pull +
+   rebase"). Acknowledge the latest broadcast number in your coordination
+   file. Never edit or commit anything under `_director\`. (This works
+   because all clones share one machine; the director also reads your
+   `coordination/<track>.md` live, so requests you write there don't need a
+   push to be seen.)
 
 ## Track → files map
 

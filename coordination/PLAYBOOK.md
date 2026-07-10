@@ -42,11 +42,28 @@ coding.
 1. A PR lands → the director reviews it (stayed in owned files? README rule
    followed? `cargo check` clean?).
 2. Merge **one PR at a time**: `gh pr merge <n> --squash --delete-branch`.
-3. Broadcast to every *other* live session: "main updated —
-   `git pull origin main`, then `git rebase main`."
+3. Announce it as a numbered entry in `..\_director\broadcast.md`
+   ("main updated to <sha> — pull + rebase"). Tracks pick it up at their next
+   checkpoint; paste a nudge into a session only when it's urgent.
 4. Cross-track requests appear in `coordination/<track>.md` under
-   Needs / requests → the director rules on them and writes instructions for
-   the owning track.
+   Needs / requests → the director rules on them and answers in
+   `..\_director\<track>.md`.
+
+## The director sync channel
+
+`Gardn Master\_director\` sits at the fleet root, outside every clone, so it
+carries zero git noise. Traffic flows two ways without the human relaying:
+
+- **Director → agents:** `broadcast.md` (fleet-wide, numbered entries,
+  newest-first) and `<track>.md` (per-track instructions). Only the director
+  writes here; agents read at every checkpoint (CLAUDE.md rule 6) and
+  acknowledge the latest broadcast number in their coordination file.
+- **Agents → director:** each agent keeps `coordination/<track>.md` current
+  in its own clone; the director reads those files straight off disk — no
+  push needed.
+
+The human stays in the loop for what genuinely needs eyes and judgment:
+visual verification, merge approval, and anything the director flags.
 
 ## Kickoff prompts
 
@@ -75,6 +92,11 @@ coding.
 > small and focused, one coherent change. Update the README only if the change
 > is player-visible; otherwise say "No player-visible change; README untouched"
 > in the PR body.
+>
+> Director sync: at each checkpoint — and always before opening a PR — read
+> `../_director/broadcast.md` and `../_director/terrain.md` and follow any
+> instructions there; acknowledge the latest broadcast number in
+> coordination/terrain.md. Never edit or commit anything under `_director/`.
 
 ### weather
 
@@ -90,6 +112,10 @@ coding.
 > Workflow: `cargo check` after every change; `cargo run` to verify (try
 > `GARDN_HOUR=0` and `GARDN_HOUR=6`). Keep coordination/weather.md current.
 > Small PRs via `gh pr create`; follow the README-per-PR rule in CLAUDE.md.
+> Director sync: at each checkpoint — and always before opening a PR — read
+> `../_director/broadcast.md` and `../_director/weather.md`, follow any
+> instructions, and acknowledge the latest broadcast number in
+> coordination/weather.md. Never edit or commit anything under `_director/`.
 
 ### trees
 
@@ -106,6 +132,10 @@ coding.
 > Workflow: `cargo check` after every change; `cargo run` to verify (use
 > `GARDN_HIGH=300` to inspect crowns). Keep coordination/trees.md current.
 > Small PRs via `gh pr create`; follow the README-per-PR rule in CLAUDE.md.
+> Director sync: at each checkpoint — and always before opening a PR — read
+> `../_director/broadcast.md` and `../_director/trees.md`, follow any
+> instructions, and acknowledge the latest broadcast number in
+> coordination/trees.md. Never edit or commit anything under `_director/`.
 
 ### foliage-life
 
@@ -122,6 +152,10 @@ coding.
 > Workflow: `cargo check` after every change; `cargo run` to verify. Keep
 > coordination/foliage-life.md current. Small PRs via `gh pr create`; follow
 > the README-per-PR rule in CLAUDE.md.
+> Director sync: at each checkpoint — and always before opening a PR — read
+> `../_director/broadcast.md` and `../_director/foliage-life.md`, follow any
+> instructions, and acknowledge the latest broadcast number in
+> coordination/foliage-life.md. Never edit or commit anything under `_director/`.
 
 ### sprites
 
@@ -138,3 +172,7 @@ coding.
 > Workflow: `cargo check` after every change; `cargo run` to see art in-game.
 > Keep coordination/sprites.md current. Small PRs via `gh pr create`; follow
 > the README-per-PR rule in CLAUDE.md.
+> Director sync: at each checkpoint — and always before opening a PR — read
+> `../_director/broadcast.md` and `../_director/sprites.md`, follow any
+> instructions, and acknowledge the latest broadcast number in
+> coordination/sprites.md. Never edit or commit anything under `_director/`.
