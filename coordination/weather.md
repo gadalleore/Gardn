@@ -7,7 +7,7 @@
 Seen broadcast #7 (rotation one complete 🏆 — congrats all). Rotation 2 begun:
 rebased onto main @ cb259ba clean.
 
-**PR 1 of 2 (seasons + cloud state machine) ready:** pure logic per the
+**PR #17 open (seasons + cloud state machine, PR 1 of 2):** pure logic per the
 director's assignment + the owner's design doc, all in weather.rs. `Season`
 clock (Summer→Autumn→Winter→Spring, 3 game days each, pub(crate) as directed),
 and a Bevy-free `CloudSim` publishing a `CloudState` resource
