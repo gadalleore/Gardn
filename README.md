@@ -36,6 +36,11 @@ happens in — the hard part: a believable, streamable, gargantuan planet.
   green stretch of coast.
 - **Voxel terrain** with regional ranges, worm-scale micro-relief, and a
   Minecraft-style cave web underground.
+- **Real geology underfoot.** Dirt runs about a tree length deep on average —
+  but it's a distribution: ~1% of ground has bedrock right below the surface,
+  ~1% has dirt two tree lengths down, varying smoothly so digging feels
+  geological. Beneath the dirt: a rock layer worms can't eat, floored by
+  unbreakable bedrock.
 - **Titan trees.** Procedurally grown, species-accurate giants — a mountain ash
   tops **1,000 ft** (~4,000 worm-lengths) — planted sparsely so each stands as a
   lone landmark you crawl between. Distant ones render as coarse voxel LODs that
