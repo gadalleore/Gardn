@@ -1,12 +1,16 @@
 //! Day/night sky: a 24-hour clock that walks the sun (and the full moon
 //! opposite it) across the sky, retinting the sky colour, fog, and ambient
 //! light, and swinging the two directional lights + their visible discs.
+//! Sundown grades blue → gold → orange → violet → moonlit night, the sun ball
+//! itself blushes at the horizon, and a starfield wheels overhead after dark.
 //! `SkyPlugin` owns the clock, the celestial entities, and the update. Fully
 //! self-contained — nothing outside reads its state.
 
 use bevy::pbr::{CascadeShadowConfigBuilder, DistanceFog, NotShadowCaster};
 use bevy::prelude::*;
 use bevy::render::view::RenderLayers;
+
+use crate::world::GardenRng;
 
 pub struct SkyPlugin;
 
@@ -21,9 +25,15 @@ impl Plugin for SkyPlugin {
 
 /// One full sun cycle every 24 real hours. The clock starts at
 /// [`GAME_START_HOUR`] when the app launches; GARDN_HOUR=<0-24> overrides the
-/// starting hour (e.g. `GARDN_HOUR=0` to see the moonlit night right away).
+/// starting hour (e.g. `GARDN_HOUR=0` to see the moonlit night right away),
+/// and GARDN_DAY_SECS=<secs> compresses the whole cycle (dev knob — e.g.
+/// `GARDN_DAY_SECS=120` sweeps dawn-to-dawn in two minutes to eyeball the
+/// colour grading).
 const DAY_LENGTH_SECS: f32 = 24.0 * 3600.0;
 const GAME_START_HOUR: f32 = 8.0;
+/// How many stars the night dome carries. All share one mesh + one material,
+/// so the count is cheap; it just needs to feel like a sky, not a scatter.
+const STAR_COUNT: usize = 220;
 /// How far from the camera the sun/moon discs float — past the fog's end
 /// (780 ft) but inside the far clip (900 ft); unlit materials skip fog, so they
 /// burn through and read as sky, not scenery.
@@ -32,6 +42,9 @@ const CELESTIAL_DISTANCE_FT: f32 = 850.0;
 #[derive(Resource)]
 struct DayCycle {
     start_frac: f32,
+    /// Real seconds per full cycle — [`DAY_LENGTH_SECS`] unless GARDN_DAY_SECS
+    /// shrinks it for testing.
+    day_secs: f32,
 }
 
 impl DayCycle {
@@ -40,9 +53,15 @@ impl DayCycle {
             .ok()
             .and_then(|v| v.trim().parse::<f32>().ok())
             .unwrap_or(GAME_START_HOUR);
-        println!("🕗 Day cycle: starting the 24-hour clock at {hour:.1}h.");
+        let day_secs = std::env::var("GARDN_DAY_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|s| *s > 1.0)
+            .unwrap_or(DAY_LENGTH_SECS);
+        println!("🕗 Day cycle: starting the 24-hour clock at {hour:.1}h ({day_secs:.0}s per day).");
         Self {
             start_frac: (hour / 24.0).rem_euclid(1.0),
+            day_secs,
         }
     }
 }
@@ -63,6 +82,20 @@ struct SunDirection(Vec3);
 #[derive(Component)]
 struct CelestialDisc {
     is_sun: bool,
+}
+
+/// Parent of all the star sprites. Re-anchored to the camera and rotated with
+/// the sun's orbital angle each frame, so the whole field rises and sets as one
+/// rigid dome — stars wheel across the night instead of hanging frozen.
+#[derive(Component)]
+struct StarDome;
+
+/// Handles to the sky materials retinted per frame: the sun disc blushes at the
+/// horizon and the shared star material fades with twilight.
+#[derive(Resource)]
+struct SkyMaterials {
+    sun_disc: Handle<StandardMaterial>,
+    stars: Handle<StandardMaterial>,
 }
 
 /// Spawn the sun/moon directional lights and their glowing discs, plus the base
@@ -126,19 +159,21 @@ fn setup_sky(
 
     // The bodies themselves: unlit spheres that ignore fog, hung well past the
     // fog wall so they read as sky, not scenery.
+    let sun_disc_mat = materials.add(StandardMaterial {
+        // Pure HDR emitter (unlit would discard emissive): with bloom on
+        // the camera the disc blazes a brilliant white halo instead of
+        // reading as a flat dot. fog_enabled: false so the fog wall at
+        // 680 ft can't swallow it. Retinted per frame — white-hot overhead,
+        // a deep ember at the horizon.
+        base_color: Color::BLACK,
+        emissive: LinearRgba::rgb(40.0, 39.0, 36.0),
+        fog_enabled: false,
+        ..default()
+    });
     commands.spawn((
         CelestialDisc { is_sun: true },
         Mesh3d(meshes.add(Sphere::new(34.0))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            // Pure HDR emitter (unlit would discard emissive): with bloom on
-            // the camera the disc blazes a brilliant white halo instead of
-            // reading as a flat dot. fog_enabled: false so the fog wall at
-            // 680 ft can't swallow it.
-            base_color: Color::BLACK,
-            emissive: LinearRgba::rgb(40.0, 39.0, 36.0),
-            fog_enabled: false,
-            ..default()
-        })),
+        MeshMaterial3d(sun_disc_mat.clone()),
         NotShadowCaster,
         Transform::default(),
     ));
@@ -156,6 +191,55 @@ fn setup_sky(
         Transform::default(),
     ));
 
+    // The star dome: one shared unit sphere + one shared emissive material,
+    // scattered over the whole celestial sphere (not just the visible half —
+    // the dome rotates with the sun angle, so stars below the horizon now are
+    // the ones rising later tonight). Sizes vary, and a few outliers get
+    // doubled so bloom picks out "bright stars" from the dust. Fixed seed:
+    // the constellations are the same every session, like a real sky.
+    let star_mesh = meshes.add(Sphere::new(1.0));
+    let star_mat = materials.add(StandardMaterial {
+        // Emissive-only like the sun/moon discs; the emissive is scaled by the
+        // twilight fade each frame (and the dome hidden by day, so the fully
+        // faded black spheres never draw).
+        base_color: Color::BLACK,
+        emissive: LinearRgba::BLACK,
+        fog_enabled: false,
+        ..default()
+    });
+    let mut rng = GardenRng::new(0x57A2_F1E1D);
+    commands
+        .spawn((StarDome, Transform::default(), Visibility::Hidden))
+        .with_children(|dome| {
+            for _ in 0..STAR_COUNT {
+                // Uniform point on the sphere: y uniform in [-1, 1], then a
+                // random longitude at that latitude's radius.
+                let y = rng.range(-1.0, 1.0);
+                let theta = rng.range(0.0, std::f32::consts::TAU);
+                let r = (1.0 - y * y).max(0.0).sqrt();
+                let dir = Vec3::new(r * theta.cos(), y, r * theta.sin());
+                let mut size = rng.range(0.5, 1.4);
+                if rng.chance(0.08) {
+                    size *= 2.0;
+                }
+                dome.spawn((
+                    Mesh3d(star_mesh.clone()),
+                    MeshMaterial3d(star_mat.clone()),
+                    NotShadowCaster,
+                    Transform {
+                        translation: dir * CELESTIAL_DISTANCE_FT,
+                        scale: Vec3::splat(size),
+                        ..default()
+                    },
+                ));
+            }
+        });
+
+    commands.insert_resource(SkyMaterials {
+        sun_disc: sun_disc_mat,
+        stars: star_mat,
+    });
+
     commands.insert_resource(AmbientLight {
         color: Color::srgb(0.82, 0.88, 0.95),
         brightness: 70.0,
@@ -168,6 +252,8 @@ fn setup_sky(
 fn update_day_cycle(
     time: Res<Time>,
     day: Res<DayCycle>,
+    sky_mats: Res<SkyMaterials>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut clear: ResMut<ClearColor>,
     mut ambient: ResMut<AmbientLight>,
     mut sun_direction: ResMut<SunDirection>,
@@ -177,8 +263,17 @@ fn update_day_cycle(
         (&CelestialDisc, &mut Transform, &mut Visibility),
         (Without<Camera>, Without<CelestialLight>),
     >,
+    mut dome_q: Query<
+        (&mut Transform, &mut Visibility),
+        (
+            With<StarDome>,
+            Without<Camera>,
+            Without<CelestialLight>,
+            Without<CelestialDisc>,
+        ),
+    >,
 ) {
-    let frac = (day.start_frac + time.elapsed_secs() / DAY_LENGTH_SECS).rem_euclid(1.0);
+    let frac = (day.start_frac + time.elapsed_secs() / day.day_secs).rem_euclid(1.0);
     // 0.25 of the cycle = 6:00 — sunrise on the eastern horizon.
     let angle = (frac - 0.25) * std::f32::consts::TAU;
     // Slight southward tilt keeps noon shadows from collapsing to nothing.
@@ -192,12 +287,16 @@ fn update_day_cycle(
     let dusk_t = ((elev + 0.15) / 0.15).clamp(0.0, 1.0);
     let moon_t = (-elev * 3.0).clamp(0.0, 1.0);
 
-    // Five-stop sky: proper BLUE all day, and sundown walks blue → yellow →
-    // orange → dark. Night is never black — the full moon on the other side
-    // of the sky lifts it with a cool white sheen.
+    // Six-stop sky: proper BLUE all day, and sundown walks blue → yellow →
+    // orange → violet → dark. The violet band is the civil-twilight afterglow
+    // — the sun is below the horizon but still colouring the air, and skipping
+    // straight from orange to near-black read as a light switch. Night is
+    // never black — the full moon on the other side of the sky lifts it with
+    // a cool white sheen.
     const DAY_SKY: Vec3 = Vec3::new(0.34, 0.58, 0.96);
     const GOLD_SKY: Vec3 = Vec3::new(0.92, 0.80, 0.48);
     const ORANGE_SKY: Vec3 = Vec3::new(0.96, 0.52, 0.26);
+    const VIOLET_SKY: Vec3 = Vec3::new(0.34, 0.20, 0.40);
     const NIGHT_SKY: Vec3 = Vec3::new(0.07, 0.09, 0.17);
     const MOON_SHEEN: Vec3 = Vec3::new(0.18, 0.21, 0.30);
 
@@ -207,8 +306,14 @@ fn update_day_cycle(
         GOLD_SKY.lerp(DAY_SKY, (elev - 0.15) / 0.20)
     } else if elev >= 0.0 {
         ORANGE_SKY.lerp(GOLD_SKY, elev / 0.15)
+    } else if dusk_t >= 0.5 {
+        // Upper half of twilight: the horizon orange cools into violet.
+        VIOLET_SKY.lerp(ORANGE_SKY, (dusk_t - 0.5) * 2.0)
     } else {
-        NIGHT_SKY.lerp(MOON_SHEEN, moon_t).lerp(ORANGE_SKY, dusk_t)
+        // Lower half: violet sinks into the moonlit night.
+        NIGHT_SKY
+            .lerp(MOON_SHEEN, moon_t)
+            .lerp(VIOLET_SKY, dusk_t * 2.0)
     };
     let sky_color = Color::srgb(sky.x, sky.y, sky.z);
     clear.0 = sky_color;
@@ -219,6 +324,21 @@ fn update_day_cycle(
         .lerp(Vec3::new(0.78, 0.86, 1.0), day_t)
         .lerp(Vec3::new(0.95, 0.85, 0.62), (1.0 - day_t) * (dusk_t * dusk_t));
     ambient.color = Color::srgb(amb.x, amb.y, amb.z);
+
+    // The sun ball itself blushes with altitude: white-hot overhead, a deep
+    // ember on the horizon. Bloom smears that tint into the halo, so sunrise
+    // and sunset get their glow for free. Stars ride the same fade in reverse,
+    // easing in once the sun dips below ~1° so they surface through the violet
+    // rather than popping on. (Two material writes per frame — negligible.)
+    let star_t = ((-elev - 0.02) / 0.10).clamp(0.0, 1.0);
+    if let Some(mat) = materials.get_mut(&sky_mats.sun_disc) {
+        let glow = Vec3::new(32.0, 9.0, 2.5).lerp(Vec3::new(40.0, 39.0, 36.0), day_t);
+        mat.emissive = LinearRgba::rgb(glow.x, glow.y, glow.z);
+    }
+    if let Some(mat) = materials.get_mut(&sky_mats.stars) {
+        let e = Vec3::new(3.2, 3.5, 4.2) * star_t;
+        mat.emissive = LinearRgba::rgb(e.x, e.y, e.z);
+    }
 
     for (light, mut dl, mut tf) in &mut lights {
         if light.is_sun {
@@ -249,6 +369,23 @@ fn update_day_cycle(
         let dir = if disc.is_sun { sun_dir } else { moon_dir };
         tf.translation = cam_pos + dir * CELESTIAL_DISTANCE_FT;
         let want = if dir.y > -0.05 {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != want {
+            *vis = want;
+        }
+    }
+
+    // The star dome rides the camera like the discs, but also rotates with the
+    // sun's orbital angle (same Z axis the sun circles on), so the whole field
+    // wheels westward through the night. Hidden by day: no point drawing 220
+    // black spheres behind a blue sky.
+    for (mut tf, mut vis) in &mut dome_q {
+        tf.translation = cam_pos;
+        tf.rotation = Quat::from_rotation_z(angle);
+        let want = if star_t > 0.001 {
             Visibility::Visible
         } else {
             Visibility::Hidden

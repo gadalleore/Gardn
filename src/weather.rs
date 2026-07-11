@@ -1,8 +1,11 @@
 //! Weather: the global wind — a slowly wandering direction with a gusty 0–5
 //! strength that re-rolls toward calm — and the ribbon streamers that make it
-//! visible and audible as they race past the worm. `WeatherPlugin` owns the
-//! `Wind` resource, the streamer assets, and the wind systems; grass, leaves and
-//! trees all read `crate::weather::Wind` to sway with it.
+//! visible and audible as they race past the worm. The rolled level is only
+//! the *base*: a private gust engine layers surges, lulls, and flutter on top
+//! so `strength` breathes like real air instead of holding a flat line.
+//! `WeatherPlugin` owns the `Wind` resource, the streamer assets, and the wind
+//! systems; grass, leaves and trees all read `crate::weather::Wind` to sway
+//! with it.
 
 use bevy::audio::{SpatialScale, Volume};
 use bevy::pbr::NotShadowCaster;
@@ -18,6 +21,7 @@ pub struct WeatherPlugin;
 impl Plugin for WeatherPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Wind>()
+            .init_resource::<GustTexture>()
             .add_systems(Startup, setup_streamers)
             .add_systems(Update, (update_wind, update_wind_streamers));
     }
@@ -79,6 +83,35 @@ impl Default for Wind {
 
 /// The gale threshold: above this the worm starts getting pushed.
 pub(crate) const WIND_PUSH_FROM: f32 = 4.0;
+
+/// Private state of the gust engine. Kept out of `Wind` on purpose: `Wind`'s
+/// shape is a cross-module contract (grass/leaves/foliage/worm read it), so
+/// the texture layers live here and only their *sum* is published each frame
+/// as `Wind::strength`. Real wind isn't a level that eases and holds — it
+/// surges, sags, and trembles around its mean, so:
+///   strength = base (the eased 0–5 roll)
+///            + gust  (an event with a fast smooth rise and a slower fall;
+///                     ~30% are negative — lulls where the air sags)
+///            + flutter (two incommensurate sines — the air never flatlines)
+#[derive(Resource, Default)]
+struct GustTexture {
+    /// The slow ease toward `Wind::target` — what `strength` used to be.
+    base: f32,
+    /// Signed peak of the active gust; negative means a lull.
+    amp: f32,
+    /// Envelope timeline, absolute seconds: rise `start→peak`, fall `peak→end`.
+    start: f32,
+    peak: f32,
+    end: f32,
+    /// When to roll the next gust/lull event.
+    next_at: f32,
+}
+
+/// Hermite ease for the gust envelope — a linear ramp reads as mechanical.
+fn smoothstep(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
 
 /// A ribbon of air racing downwind past the worm — the wind made visible.
 /// Spawned upwind, despawned when it outlives itself or blows out of range.
@@ -152,7 +185,10 @@ fn update_wind_streamers(
     let mut voices = 0usize;
     for (entity, mut streamer, mut tf, has_voice) in &mut streamers {
         streamer.age += dt;
-        tf.translation += dir3 * streamer.speed * dt;
+        // Speed = the ribbon's own random pace + a live wind term, so when a
+        // gust hits, every streamer already in flight surges with it (and sags
+        // in a lull) instead of only newly spawned ones knowing the news.
+        tf.translation += dir3 * (streamer.speed + wind.strength * 3.0) * dt;
         tf.translation.y += (t * 2.3 + streamer.bob_phase).sin() * 0.3 * dt;
         tf.rotation = yaw;
 
@@ -181,7 +217,9 @@ fn update_wind_streamers(
             cam_pos - dir3 * wind.rng.range(3.0, 18.0) + side * wind.rng.range(-10.0, 10.0);
         pos.y = ground_world_y(&chunk_world, pos.x, pos.z) + wind.rng.range(0.15, 2.2);
 
-        let speed = 4.0 + wind.strength * 3.0 + wind.rng.range(0.0, 2.0);
+        // Only the random part is baked in; the wind's share of the speed is
+        // added live each frame above, so gusts reach ribbons mid-flight.
+        let speed = 4.0 + wind.rng.range(0.0, 2.0);
         // The streamer IS the wind gauge: a level-1 breeze draws short wisps,
         // a level-5 gale drags long fat banners. (Direction is the streak's
         // long axis + its motion — both point downwind.)
@@ -225,7 +263,7 @@ fn update_wind_streamers(
     }
 }
 
-fn update_wind(time: Res<Time>, mut wind: ResMut<Wind>) {
+fn update_wind(time: Res<Time>, mut wind: ResMut<Wind>, mut gusts: ResMut<GustTexture>) {
     let t = time.elapsed_secs();
 
     // Weather re-roll: six discrete levels on a quadratic likelihood curve,
@@ -251,11 +289,58 @@ fn update_wind(time: Res<Time>, mut wind: ResMut<Wind>) {
         // left or right — over hours the wind slowly wanders the compass.
         let step = 1.0f32.to_radians();
         wind.heading += if wind.rng.chance(0.5) { step } else { -step };
-        wind.dir = Vec2::new(wind.heading.cos(), wind.heading.sin());
 
         println!("🌬️ Wind shifting toward {level}/5");
     }
-    // Ease toward the target like real weather, not a light switch.
+    // Ease the BASE toward the target like real weather, not a light switch.
     let blend = (time.delta_secs() * 0.06).min(1.0);
-    wind.strength += (wind.target - wind.strength) * blend;
+    gusts.base += (wind.target - gusts.base) * blend;
+
+    // Roll gust/lull events. Windier weather gusts harder and more often;
+    // near-calm air is left alone (a gust out of a 0/5 day would be weather
+    // the level system didn't order).
+    if t >= gusts.next_at {
+        if gusts.base > 0.3 {
+            gusts.amp = if wind.rng.chance(0.3) {
+                // A lull: the air sags but doesn't die — cap what it can take
+                // so light breezes don't invert.
+                -wind.rng.range(0.25, 0.6) * gusts.base.min(2.0)
+            } else {
+                // A surge, scaled to the weather: a breeze puffs (+~0.5), a
+                // near-gale slams (+~1.5, briefly over WIND_PUSH_FROM — the
+                // shove the worm feels in gusty weather IS these events).
+                wind.rng.range(0.5, 1.0) * (0.3 + gusts.base * 0.28)
+            };
+            // Real gusts hit fast and drain slow: ~1 s rise, several to fall.
+            let attack = wind.rng.range(0.6, 1.6);
+            gusts.start = t;
+            gusts.peak = t + attack;
+            gusts.end = gusts.peak + wind.rng.range(2.5, 6.0);
+        }
+        gusts.next_at = t + wind.rng.range(4.0, 14.0) / (0.6 + gusts.base * 0.35);
+    }
+
+    // The active event's envelope: smooth rise to `amp`, slower smooth fall.
+    let env = if t < gusts.peak {
+        smoothstep((t - gusts.start) / (gusts.peak - gusts.start))
+    } else if t < gusts.end {
+        1.0 - smoothstep((t - gusts.peak) / (gusts.end - gusts.peak))
+    } else {
+        0.0
+    };
+    // Flutter: two sines at incommensurate rates so the sum never visibly
+    // repeats — the fine trembling between events, scaled to the weather.
+    let flutter = ((t * 0.9).sin() * 0.6 + (t * 2.37 + 1.7).sin() * 0.4) * 0.12 * gusts.base;
+
+    wind.strength = (gusts.base + gusts.amp * env + flutter).clamp(0.0, 5.0);
+
+    // The published direction breathes a few degrees around the slow-wander
+    // heading — harder wind wobbles more. `heading` stays the canonical
+    // compass value; only the derived `dir` carries the texture, so the
+    // ±1°-per-shift wander contract above is untouched.
+    let wobble = ((t * 0.23).sin() * 0.6 + (t * 0.71 + 3.1).sin() * 0.4)
+        * 4.0f32.to_radians()
+        * (wind.strength / 5.0);
+    let h = wind.heading + wobble;
+    wind.dir = Vec2::new(h.cos(), h.sin());
 }
