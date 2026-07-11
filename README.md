@@ -55,7 +55,11 @@ happens in — the hard part: a believable, streamable, gargantuan planet.
   veil heralds every front, one main cloud event takes the stage (a cirrus sky
   can resolve into a storm, rain, or a fluffy false alarm), then the system
   drains away. Winter, arid outback, coasts, and live wind all tilt the odds;
-  fall/winter mornings tend to fog. (Logic in place — cloud rendering next.)
+  fall/winter mornings tend to fog. All of it rendered procedurally: blob-puff
+  clouds at titan altitude with per-type silhouettes (wind-combed cirrus
+  streaks, anvil-topped cumulonimbus towers, broad gray rain decks), a milky
+  cirrostratus halo, overcast that genuinely dims the day, rain streaks,
+  lightning flashes, and a dawn fog that swallows the world.
 - **A custom background-only distance blur** (`src/distance_blur.rs`): a
   from-scratch render pass that keeps the foreground razor sharp while the distant
   titans go dreamy — something a physical depth-of-field physically cannot do for
