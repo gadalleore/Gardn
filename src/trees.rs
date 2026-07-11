@@ -566,13 +566,17 @@ fn build_branches(
         let dir = sample_branch_direction(rng, outward, form);
         let length_voxels =
             (rng.range_i(form.branch_len_in.0, form.branch_len_in.1) / TREE_VOXEL_INCHES).max(2);
-        let path = rasterize_branch(start, dir, length_voxels);
+        // Arc the branch and let its tip sag a touch — long mid-canopy limbs
+        // were dead-straight rods before, the single biggest tell that the
+        // trees were procedural. (Step count kept = length_voxels, matching
+        // the old rasteriser's reach, so species tables stay tuned.)
+        let (path, _) = trace_arc(rng, start, dir, length_voxels, 0.55, 0.4);
 
         let mut tip = None;
         for (i, block) in path.iter().enumerate() {
             if !trunk.contains(block) {
-                // 2×2×2 voxel cross-section: a 4-inch limb, sturdy enough to
-                // read as a branch next to 2-inch ground blocks.
+                // 2×2×2 voxel cross-section: a foot-thick limb, sturdy enough
+                // to read as a branch next to 3-inch ground blocks.
                 for d in [
                     IVec3::ZERO,
                     IVec3::X,
@@ -664,31 +668,71 @@ fn trunk_centroids(trunk: &HashSet<IVec3>) -> HashMap<i32, IVec2> {
         .collect()
 }
 
-fn rasterize_branch(start: IVec3, dir: Vec3, length_voxels: i32) -> Vec<IVec3> {
-    let mut blocks = Vec::with_capacity(length_voxels as usize);
+/// Trace a limb path as one smooth ARC: a fixed per-limb curl axis and bend
+/// sign (never a per-step random walk, which zig-zags), plus an optional
+/// `droop` that pulls the heading earthward with growing strength toward the
+/// far end — the weeping habit of gum limbs. `droop` is roughly the total
+/// downward heading change accumulated by the tip (0.0 = none). Each step
+/// advances ~0.55 voxel so diagonal runs stay hole-free. Returns the deduped
+/// cells and the final heading, so children of a curved limb continue the
+/// curve rather than the original straight line.
+fn trace_arc(
+    rng: &mut GardenRng,
+    start: IVec3,
+    dir: Vec3,
+    steps: i32,
+    max_bend: f32,
+    droop: f32,
+) -> (Vec<IVec3>, Vec3) {
+    let mut d = dir.normalize_or_zero();
+    if d.length_squared() < 0.5 {
+        d = Vec3::Y;
+    }
+    // Curl axis perpendicular to the heading, fixed for the whole limb. The
+    // bend magnitude keeps a floor so limbs read visibly sinuous, not
+    // sometimes-straight.
+    let r = Vec3::new(
+        rng.range(-1.0, 1.0),
+        rng.range(-1.0, 1.0),
+        rng.range(-1.0, 1.0),
+    );
+    let mut axis = (r - d * r.dot(d)).normalize_or_zero();
+    if axis.length_squared() < 0.5 {
+        axis = d.any_orthonormal_vector();
+    }
+    let bend = rng.range(max_bend * 0.35, max_bend)
+        * if rng.chance(0.5) { 1.0 } else { -1.0 };
+    let n = steps.max(1) as f32;
+    let step_rot = Quat::from_axis_angle(axis, bend / n);
+
     let mut pos = Vec3::new(
         start.x as f32 + 0.5,
         start.y as f32 + 0.5,
         start.z as f32 + 0.5,
     );
-    let step = dir.normalize() * 0.55;
+    let mut cells = Vec::with_capacity(steps as usize);
+    cells.push(start);
     let mut prev = start;
-    blocks.push(start);
-
-    for _ in 0..length_voxels {
-        pos += step;
+    for i in 0..steps {
+        d = step_rot * d;
+        if droop > 0.0 {
+            // Ramp the pull with progress: the base of the limb holds its
+            // line, the tip weeps. (Integrates to ~`droop` total.)
+            let t = (i + 1) as f32 / n;
+            d = (d + Vec3::NEG_Y * (droop / n) * (2.0 * t)).normalize();
+        }
+        pos += d * 0.55;
         let grid = IVec3::new(
             pos.x.floor() as i32,
             pos.y.floor() as i32,
             pos.z.floor() as i32,
         );
         if grid != prev {
-            blocks.push(grid);
+            cells.push(grid);
             prev = grid;
         }
     }
-
-    blocks
+    (cells, d)
 }
 
 /// Pom-pom leaf cloud at a branch tip — rounded, slightly irregular, sized in
@@ -762,7 +806,7 @@ fn apex_crown(
         start: IVec3,
         dir: Vec3,
         length: i32,
-        radius: i32,
+        radius: f32,
         depth: i32,
     }
 
@@ -778,7 +822,7 @@ fn apex_crown(
         ((trunk_r as f32 * 1.3 + 2.5 * ft as f32) * rng.range(0.9, 1.15)).round().max(6.0) as i32;
     // Leaders are only ~a third of the trunk's girth and taper hard each split,
     // so limbs read as branches thinning to twigs — not fat wooden beams.
-    let start_r = (trunk_r as f32 * 0.32).round().clamp(2.0, 7.0) as i32;
+    let start_r = (trunk_r as f32 * 0.32).clamp(2.0, 7.0);
     let max_depth = 3;
 
     // A crown grows per stem, so each one is kept lean (2–3 leaders); together
@@ -796,28 +840,49 @@ fn apex_crown(
     }
 
     while let Some(limb) = stack.pop() {
-        let tip = grow_limb(&mut wood, limb.start, limb.dir, limb.length, limb.radius);
+        let terminal = limb.depth >= max_depth || limb.radius <= 1.4;
+        // Every limb TAPERS continuously along its own length, and children
+        // pick up exactly at the parent's end radius — the whole crown is one
+        // monotone thinning from trunk to twig, never a sausage of constant-
+        // radius segments and never wood that thickens outward (shape rule).
+        let end_r = (limb.radius * 0.55).max(1.0);
+        // Terminal twigs weep like real gum tips; inner limbs only arc.
+        let droop = if terminal { rng.range(0.5, 0.9) } else { 0.0 };
+        let (tip, tip_dir) = grow_limb(
+            &mut wood, rng, limb.start, limb.dir, limb.length, limb.radius, end_r, droop,
+        );
 
-        if limb.depth >= max_depth || limb.radius <= 1 {
+        if terminal {
             // Fine twig: a moderate tuft of leaves. Spread wide by the long
             // leaders and massed across ~two dozen tips, they overlap into a
             // crown broader than the trunk without each blob having to be huge.
             let tuft_scale = form.blob_scale * rng.range(0.38, 0.55);
             leaves.extend(pom_foliage(rng, tip, tuft_scale));
+            // Weeping-gum streamer: a smaller cluster hanging below and just
+            // past the tip, so foliage drapes off the drooped twig instead of
+            // ending in a ball. Hangs DOWN, so crown width stays modest.
+            let hang = tip
+                + IVec3::new(
+                    (tip_dir.x * 3.0).round() as i32,
+                    -rng.range_i(3, 6),
+                    (tip_dir.z * 3.0).round() as i32,
+                );
+            leaves.extend(pom_foliage(rng, hang, tuft_scale * 0.7));
         } else {
             for _ in 0..2 {
                 // Keep the splay upward-biased so limbs climb and fan rather
-                // than throwing sideways beams.
+                // than throwing sideways beams. Children diverge from the
+                // direction the curved parent actually ENDED on, so forks
+                // continue the arc instead of snapping back to the old line.
                 let spread = rng.range(0.4, 0.8);
-                let child_dir = diverge_upward(rng, limb.dir, spread);
+                let child_dir = diverge_upward(rng, tip_dir, spread);
                 let child_len =
                     ((limb.length as f32) * rng.range(0.6, 0.75)).round().max(3.0) as i32;
-                let child_r = ((limb.radius as f32) * 0.55).round().max(1.0) as i32;
                 stack.push(Limb {
                     start: tip,
                     dir: child_dir,
                     length: child_len,
-                    radius: child_r,
+                    radius: end_r,
                     depth: limb.depth + 1,
                 });
             }
@@ -832,32 +897,46 @@ fn apex_crown(
     (wood, leaves)
 }
 
-/// Rasterise one limb as a solid tube of `radius` voxels along `dir`, returning
-/// its tip. The culled mesher only ever shows the tube's surface, so a fat limb
-/// costs mesh only at its skin.
+/// Rasterise one limb as a gently arcing solid tube that TAPERS from `r0` at
+/// its base to `r1` at its tip, returning the tip and the heading there. The
+/// culled mesher only ever shows the tube's surface, so a fat limb costs mesh
+/// only at its skin.
+#[allow(clippy::too_many_arguments)]
 fn grow_limb(
     wood: &mut HashSet<IVec3>,
+    rng: &mut GardenRng,
     start: IVec3,
     dir: Vec3,
     length: i32,
-    radius: i32,
-) -> IVec3 {
-    // rasterize_branch advances ~0.55 voxel/step; oversample to span `length`.
+    r0: f32,
+    r1: f32,
+    droop: f32,
+) -> (IVec3, Vec3) {
+    // trace_arc advances ~0.55 voxel/step; oversample to span `length`.
     let steps = ((length as f32) / 0.55).ceil().max(1.0) as i32;
-    let path = rasterize_branch(start, dir.normalize_or_zero(), steps);
-    let r_sq = radius * radius;
-    for block in &path {
-        for dx in -radius..=radius {
-            for dy in -radius..=radius {
-                for dz in -radius..=radius {
-                    if dx * dx + dy * dy + dz * dz <= r_sq {
-                        wood.insert(*block + IVec3::new(dx, dy, dz));
-                    }
+    let (path, end_dir) = trace_arc(rng, start, dir, steps, 0.5, droop);
+    let n = (path.len() - 1).max(1) as f32;
+    for (i, block) in path.iter().enumerate() {
+        let r = r0 + (r1 - r0) * (i as f32 / n);
+        stamp_ball(wood, *block, r);
+    }
+    (*path.last().unwrap_or(&start), end_dir)
+}
+
+/// Solid voxel ball — limbs are stamped as overlapping balls along their path
+/// so a tapering, curving tube stays watertight (no pinholes between discs).
+fn stamp_ball(wood: &mut HashSet<IVec3>, c: IVec3, r: f32) {
+    let ri = r.round().max(1.0) as i32;
+    let r_sq = ri * ri;
+    for dx in -ri..=ri {
+        for dy in -ri..=ri {
+            for dz in -ri..=ri {
+                if dx * dx + dy * dy + dz * dz <= r_sq {
+                    wood.insert(c + IVec3::new(dx, dy, dz));
                 }
             }
         }
     }
-    *path.last().unwrap_or(&start)
 }
 
 /// A child-branch direction: mostly along the parent but splayed sideways by
