@@ -283,7 +283,7 @@ fn animate_floating_leaves(
 }
 
 /// Creates a slightly extruded 3D leaf mesh whose silhouette *exactly* follows
-/// the opaque contours of the higher-res 8-bit leaf (assets/leaf.png).
+/// the opaque contours of the higher-res 8-bit leaf (assets/Enhanced Leaf.png).
 /// We trace per-row min/max opaque pixels, then rectify the polyline to pure
 /// horizontal+vertical segments so the outline (and extruded side walls) are
 /// chunky 8-bit jagged, exactly following the pixel steps of the art. Then
