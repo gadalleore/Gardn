@@ -8,8 +8,9 @@ happened just before I read #4's run-lock rule; future runs will take
 `../_runlock` first.
 
 ## Status
-Asset audit done; grass cutouts + foliage skin redrawn (32×32, silhouette-first),
-dead leaf intermediates removed. Verifying in-game, then PR.
+First assignment done — PR #12 open (grass cutouts + foliage skin redrawn,
+dead leaf intermediates removed, audio audited-no-changes). Awaiting merge;
+per thermal rotation this session winds down after that.
 
 Audit findings driving the work:
 - `grass/mitchell.png` (32×32): noisy — disconnected specks extrude to floating
