@@ -3,8 +3,10 @@
 //! light, and swinging the two directional lights + their visible discs.
 //! Sundown grades blue → gold → orange → violet → moonlit night, the sun ball
 //! itself blushes at the horizon, and a starfield wheels overhead after dark.
-//! `SkyPlugin` owns the clock, the celestial entities, and the update. Fully
-//! self-contained — nothing outside reads its state.
+//! `SkyPlugin` owns the clock, the celestial entities, and the update. Its one
+//! published item is [`SkyClock`] — the day fraction + day count, read by
+//! weather's seasons and morning-fog windows so both modules share the same
+//! clock (including the GARDN_HOUR / GARDN_DAY_SECS dev knobs).
 
 use bevy::pbr::{CascadeShadowConfigBuilder, DistanceFog, NotShadowCaster};
 use bevy::prelude::*;
@@ -17,6 +19,7 @@ pub struct SkyPlugin;
 impl Plugin for SkyPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(DayCycle::from_env())
+            .init_resource::<SkyClock>()
             .insert_resource(SunDirection(Vec3::new(0.6, 0.6, 0.35).normalize()))
             .add_systems(Startup, setup_sky)
             .add_systems(Update, update_day_cycle);
@@ -64,6 +67,16 @@ impl DayCycle {
             day_secs,
         }
     }
+}
+
+/// The game-time clock, published for the weather systems: `frac` is the
+/// fraction of the 24-h day (0 = midnight, 0.25 = 6:00, 0.5 = noon) and `day`
+/// counts completed days since launch — seasons divide it, fog windows read
+/// it. Kept here so GARDN_HOUR / GARDN_DAY_SECS steer every consumer at once.
+#[derive(Resource, Default)]
+pub(crate) struct SkyClock {
+    pub(crate) frac: f32,
+    pub(crate) day: u32,
 }
 
 /// A directional light driven around the sky by the day cycle.
@@ -257,6 +270,7 @@ fn update_day_cycle(
     mut clear: ResMut<ClearColor>,
     mut ambient: ResMut<AmbientLight>,
     mut sun_direction: ResMut<SunDirection>,
+    mut sky_clock: ResMut<SkyClock>,
     mut cam_q: Query<(&Transform, Option<&mut DistanceFog>), With<Camera>>,
     mut lights: Query<(&CelestialLight, &mut DirectionalLight, &mut Transform), Without<Camera>>,
     mut discs: Query<
@@ -273,7 +287,10 @@ fn update_day_cycle(
         ),
     >,
 ) {
-    let frac = (day.start_frac + time.elapsed_secs() / day.day_secs).rem_euclid(1.0);
+    let total = day.start_frac + time.elapsed_secs() / day.day_secs;
+    let frac = total.rem_euclid(1.0);
+    sky_clock.frac = frac;
+    sky_clock.day = total as u32;
     // 0.25 of the cycle = 6:00 — sunrise on the eastern horizon.
     let angle = (frac - 0.25) * std::f32::consts::TAU;
     // Slight southward tilt keeps noon shadows from collapsing to nothing.

@@ -1,43 +1,58 @@
 # Track: weather
 
 **Owns:** src/weather.rs, src/sky.rs
-**Scope:** wind + streamers, day/night sky
+**Scope:** wind + streamers, day/night sky, seasons + clouds (rotation 2)
 
 ## Status
-Seen broadcast #6 (congrats sprites on #12, foliage-life on #10). Director's
-rebase ask done: PR #11 rebased onto main @ b27f61f, README conflict resolved
-keeping BOTH sides (foliage-life's extended pixel-art bullet + my wind/sky
-bullets and `GARDN_DAY_SECS` row), `cargo check` clean, 13/13 tests pass,
-force-with-lease pushed. **PR #11 ready for the owner's eyeball run** —
-suggest `GARDN_HOUR=16 GARDN_DAY_SECS=600` to sweep dusk→violet→starfield in
-one sitting. Per thermal rotation I'm ready to wind down once it merges.
-Run-lock note: one `cargo run` verification pass started minutes before I
-read rule 8 — acquired `../_runlock` mid-run the moment I saw it, released
-after; the later dawn run took the lock first, properly.
+Seen broadcast #7 (rotation one complete 🏆 — congrats all). Rotation 2 begun:
+rebased onto main @ cb259ba clean.
 
-Assignment recap (durable memory for next rotation): sky.rs now grades
-blue→gold→orange→violet→moonlit night, sun disc blushes at the horizon,
-220-star dome wheels after dark, `GARDN_DAY_SECS` env knob compresses the
-cycle for testing. weather.rs layers gust/lull events + flutter (private
-`GustTexture` resource) on the rolled base level and wobbles `dir` a few
-degrees in strong wind; streamers surge live with gusts. `Wind`'s shape
-untouched. Possible next steps: rain/clouds, wind audio pitch tracking
-strength, aurora on rare nights.
+**PR 1 of 2 (seasons + cloud state machine) ready:** pure logic per the
+director's assignment + the owner's design doc, all in weather.rs. `Season`
+clock (Summer→Autumn→Winter→Spring, 3 game days each, pub(crate) as directed),
+and a Bevy-free `CloudSim` publishing a `CloudState` resource
+(cirrostratus/main/fog covers) that PR 2's renderer will read. 8 new unit
+tests (21 total pass): exact modifier math, fixed-seed distributions for the
+25×4 main events + cirrus escalation + fog seasonality + outro coin-flip, and
+a full-cycle invariant test (herald never absent under a main layer, phase
+order is the spec's procession). Env knobs: GARDN_SEASON, GARDN_CLOUDS,
+GARDN_FOG. No `cargo run` needed this PR (no visuals yet — nothing to
+eyeball, run-lock untouched).
+
+**Spec interpretations to flag for the owner (dissent-in-writing rule):**
+- Cirrus escalation odds 10/45/50 sum to 105, so they're treated as weights
+  (≈9.5% / 42.9% / 47.6% — keeps the owner's ratios exactly).
+- Spring morning fog is unspecified (70% fall/winter, 20% summer) → set 40%.
+- "Wind is blowing" → strength ≥ 2.0 of 5; the 70% *replaces* the base
+  formation chance, and winter/arid/coastal multipliers still apply on top.
+- Regional modifiers key off `australia::biome_at_world` (already pub — no
+  core change needed): arid = AridOutback+Pilbara, coastal = CoastalBush+
+  Mediterranean+Tasmania. Savanna/TemperateForest neutral.
 
 ## Currently touching
-- files: none (PR #11 in review)
+- files: src/weather.rs (seasons + cloud machine), src/sky.rs (SkyClock),
+  README.md (my bullets only)
 
 ## Notes for other tracks
-- `Wind`'s shape is unchanged — same fields, same meaning. `strength` now
-  breathes (gusts/lulls around the rolled level) and `dir` wobbles a few
-  degrees at high wind; both were already read per-frame by grass/leaves/
-  foliage/worm, so sway just inherits the texture for free.
-- foliage-life: grass.rs fakes its own gust with sines (line ~216) because
-  strength used to be flat — once this merges you could drop that and read the
-  real thing. Your call, no action needed.
+- `Wind` unchanged again — same fields, same meaning.
+- New pub(crate) surfaces (inside my own two files): `weather::SeasonClock`
+  (`.season`), `weather::CloudState` (herald/main/fog covers 0..1),
+  `sky::SkyClock` (`frac` 0..1 of the day, `day` count). Grass browning /
+  gameplay can read `SeasonClock` later if wanted.
 
 ## Needs / requests (flag the human)
--
+- docs/module-contracts.md (routed, not edited by me): sky.rs is no longer
+  "fully self-contained" — suggested line: "`sky.rs`: `SkyPlugin`, plus
+  `SkyClock` (resource: day fraction + day count) read by weather.rs."
+  And weather.rs's line gains: "`SeasonClock`, `CloudState` (published for
+  future consumers; only weather reads them today)."
 
 ## Done / merged
--
+- Rotation 1: PR #11 (violet twilight, wheeling stars, breathing wind) — merged.
+
+## Next (PR 2 of 2)
+Procedural cloud rendering reading `CloudState`: soft voxel/blob clumps at
+altitude, recognizable silhouettes per type (wispy cirrus vs anvil
+cumulonimbus vs fluffy cumulus), cirrostratus as a high thin veil above,
+minimal rain/lightning visuals for nimbostratus/cumulonimbus, morning fog via
+the distance-fog hooks in sky.rs. Will need the run-lock for eyeballing.
