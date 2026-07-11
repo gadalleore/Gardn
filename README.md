@@ -42,7 +42,9 @@ happens in — the hard part: a believable, streamable, gargantuan planet.
   cross-fade seamlessly into the real thing as you approach.
 - **Extruded pixel-art life.** Grass clumps and collectible leaves are painted as
   small sprites and pixel-extruded into solid 3D — a file-drop art pipeline where
-  editing a PNG changes the model.
+  editing a PNG changes the model. Grass grows in natural cluster families and
+  leaves settle in drifts; both sprout/swell in as chunks stream instead of
+  popping, and neither spawns in coastal shallows.
 - **Wind & gravity.** Trees and grass sway on a shared gust system; grass bends
   away from the passing worm.
 - **A custom background-only distance blur** (`src/distance_blur.rs`): a
