@@ -170,34 +170,99 @@ fn coast_openness(world_x: f32, world_z: f32) -> f32 {
 pub const CAVE_CELL_VOXELS: i32 = 4;
 
 pub fn is_cave_cell(world_vx: i32, world_vy: i32, world_vz: i32, surface_vy: i32) -> bool {
-    let q = |v: i32| (v.div_euclid(CAVE_CELL_VOXELS) * CAVE_CELL_VOXELS + CAVE_CELL_VOXELS / 2);
-    let (cx, cy, cz) = (q(world_vx), q(world_vy), q(world_vz));
+    let noise = cave_cell_noise(world_vx, world_vy, world_vz);
+    let cy = world_vy.div_euclid(CAVE_CELL_VOXELS) * CAVE_CELL_VOXELS + CAVE_CELL_VOXELS / 2;
+    cave_from_noise(&noise, surface_vy - cy)
+}
 
-    let depth = surface_vy - cy;
-    if depth < 0 {
-        return false;
-    }
+// ---- Geology: how deep the dirt goes ----------------------------------------
+//
+// Owner spec: "Dirt should descend a tree length down, but should vary in
+// depth. A distribution. Most likely ... an average tree length's of dirt
+// downward, but there is a 1% chance that it is bedrock right below you and
+// 1% chance that the dirt descends two treelengths."
+//
+// The yardstick is the SMALLEST tree class in trees.rs (mallee / desert oak,
+// 30–55 ft): 30 ft. Measuring by a river red gum (550–820 ft) would demand a
+// 300-ft-deep diggable world; 30 ft already deepens chunks ~4× (measured:
+// chunk mesh ~100 ms → ~400 ms, all off the main thread).
+
+/// One tree length, in ground voxels — the unit the dirt-depth field speaks.
+pub(crate) const TREE_LENGTH_VOXELS: i32 = 30 * VOXELS_PER_FOOT;
+
+/// How far below its own surface a land column stays diggable: two tree
+/// lengths of possible dirt, a 12-ft rock band (so the deepest dirt still has
+/// worm-highway rock underneath), then two voxels of bedrock floor.
+/// worm.rs collision treats everything deeper as solid bedrock — the two
+/// MUST stay in lockstep (worm.rs references this constant).
+pub(crate) const DIGGABLE_DEPTH_VOXELS: i32 =
+    2 * TREE_LENGTH_VOXELS + 12 * VOXELS_PER_FOOT + 2;
+
+/// Smooth "how deep is the dirt here" field, in voxels. Continental-space so
+/// it's seamless across chunks and pinned to the real map like the heights.
+///
+/// 260-ft base wavelength (finest octave ~65 ft): neighbouring dig sites feel
+/// geologically related, not per-column dice rolls. Measured percentiles of
+/// the underlying noise (1M samples): P1 = 0.196, P50 = 0.500, P99 = 0.803.
+/// The linear map sends P1→0 (bedrock right below you), P50→one tree length,
+/// P99→two tree lengths; the clamp pins both 1% tails exactly as spec'd.
+pub(crate) fn dirt_depth_voxels(world_x: f32, world_z: f32) -> i32 {
+    let c = world_to_continental(world_x, world_z);
+    let n = fbm01(c.x / 260.0, c.y / 260.0, seed(50), 3);
+    let frac = ((n - 0.196) / (0.803 - 0.196) * 2.0).clamp(0.0, 2.0);
+    (frac * TREE_LENGTH_VOXELS as f32).round() as i32
+}
+
+/// The noise trio for one cave lattice cell, computed once and reused by every
+/// column the cell covers. Generation carves from this + each column's own
+/// surface, so the chunk builder and the worm's collision probe answer the
+/// SAME question from the SAME inputs — any drift between them puts phantom
+/// air inside visibly solid ground (the worm clips in) or invisible floors
+/// over visible caves. A zero-mismatch test in terrain.rs pins the agreement.
+pub(crate) struct CaveCellNoise {
+    tunnel: f32,
+    cavern: f32,
+}
+
+pub(crate) fn cave_cell_noise(world_vx: i32, world_vy: i32, world_vz: i32) -> CaveCellNoise {
+    let q = |v: i32| v.div_euclid(CAVE_CELL_VOXELS) * CAVE_CELL_VOXELS + CAVE_CELL_VOXELS / 2;
+    let (cx, cy, cz) = (q(world_vx), q(world_vy), q(world_vz));
 
     let c = world_to_continental(cx as f32 * VOXEL_SIZE, cz as f32 * VOXEL_SIZE);
     let y_ft = cy as f32 * VOXEL_SIZE;
 
-    // Tunnels: 1–2 ft wide near the skin, opening up with depth.
+    // Tunnels: two noises pinching near zero; 1–2 ft wide near the skin.
     let n1 = fbm3(c.x / 7.0, y_ft / 4.5, c.y / 7.0, seed(40), 2);
     let n2 = fbm3(c.x / 9.0, y_ft / 5.5, c.y / 9.0, seed(41), 2);
-    let tunnel = n1.abs().max(n2.abs());
-    // Depth thresholds are in (1-inch) voxels: skin ~8 in, caverns below ~40 in.
-    let mut width = 0.085 + 0.05 * (depth as f32 / 120.0).min(1.0);
-    if depth < 8 {
-        // Surface skin: only the strongest tunnel cores break through as
-        // natural cave mouths.
+    CaveCellNoise {
+        tunnel: n1.abs().max(n2.abs()),
+        cavern: fbm3(c.x / 16.0, y_ft / 8.0, c.y / 16.0, seed(42), 2),
+    }
+}
+
+/// Depth-dependent half of the cave decision (see [`cave_cell_noise`]).
+/// `depth_vox` is the column's surface voxel minus the CELL-CENTRE y.
+pub(crate) fn cave_from_noise(noise: &CaveCellNoise, depth_vox: i32) -> bool {
+    if depth_vox < 0 {
+        return false;
+    }
+    // Tunnels open up with depth; a thin surface skin keeps the ground solid
+    // except where a strong tunnel core punches a natural entrance.
+    let mut width = 0.085 + 0.05 * (depth_vox as f32 / 120.0).min(1.0);
+    if depth_vox < 8 {
         width *= 0.35;
     }
-    if tunnel < width {
+    if noise.tunnel < width {
         return true;
     }
-
     // Caverns in the deep dark.
-    depth > 40 && fbm3(c.x / 16.0, y_ft / 8.0, c.y / 16.0, seed(42), 2) > 0.62
+    depth_vox > 40 && noise.cavern > 0.62
+}
+
+/// True when a cave cell's noise can't open a cave at ANY depth — lets the
+/// chunk builder skip a whole 4×4-column block without per-column tests.
+pub(crate) fn cave_never_opens(noise: &CaveCellNoise) -> bool {
+    noise.tunnel >= 0.135 && noise.cavern <= 0.62
 }
 
 fn seed(n: u32) -> u32 {
@@ -384,6 +449,76 @@ mod tests {
             "Tasmania ({tasmania_ranges}) should be rougher than the savanna plains ({savanna_plain})"
         );
         assert!(tasmania_ranges >= 24, "Tasmanian highlands too flat: {tasmania_ranges}");
+    }
+
+    /// The owner's dirt-depth spec, pinned: "Most likely below you there will
+    /// be an average tree length's of dirt downward, but there is a 1% chance
+    /// that it is bedrock right below you and 1% chance that the dirt descends
+    /// two treelengths." Percentiles measured over a wide sample, plus a
+    /// smoothness check so digging feels geological, not per-column random.
+    #[test]
+    fn dirt_depth_distribution_matches_owner_spec() {
+        let n = 350;
+        let mut total = 0f64;
+        let mut at_zero = 0u32;
+        let mut at_max = 0u32;
+        let count = (n * n) as f64;
+        for i in 0..n {
+            for j in 0..n {
+                // ~37 ft spacing over ~13 km — thousands of independent
+                // geology cells at the 260-ft base wavelength.
+                let x = i as f32 * 37.3 - 6500.0;
+                let z = j as f32 * 41.7 - 7300.0;
+                let d = dirt_depth_voxels(x, z);
+                total += d as f64;
+                if d == 0 {
+                    at_zero += 1;
+                }
+                if d == 2 * TREE_LENGTH_VOXELS {
+                    at_max += 1;
+                }
+            }
+        }
+
+        let mean = total / count;
+        let target = TREE_LENGTH_VOXELS as f64;
+        assert!(
+            (mean - target).abs() < target * 0.15,
+            "mean dirt depth {mean:.1} voxels should be ≈ one tree length ({target})"
+        );
+        let frac_zero = at_zero as f64 / count;
+        let frac_max = at_max as f64 / count;
+        assert!(
+            (0.004..0.03).contains(&frac_zero),
+            "bedrock-right-below fraction {frac_zero:.4} should be ≈ 1%"
+        );
+        assert!(
+            (0.004..0.03).contains(&frac_max),
+            "two-tree-lengths fraction {frac_max:.4} should be ≈ 1%"
+        );
+
+        // Adjacent columns (one 3-inch voxel apart) must be near-identical —
+        // the depth field varies geologically, not as per-column noise.
+        let mut max_step = 0i32;
+        let mut step_sum = 0f64;
+        let pairs = 4000;
+        for k in 0..pairs {
+            let x = (k as f32 * 53.71).sin() * 6000.0;
+            let z = (k as f32 * 31.17).cos() * 6000.0;
+            let step =
+                (dirt_depth_voxels(x + VOXEL_SIZE, z) - dirt_depth_voxels(x, z)).abs();
+            max_step = max_step.max(step);
+            step_sum += step as f64;
+        }
+        assert!(
+            max_step <= 4,
+            "dirt depth jumped {max_step} voxels between adjacent columns"
+        );
+        assert!(
+            step_sum / pairs as f64 <= 1.0,
+            "dirt depth too jittery between adjacent columns: mean step {:.2}",
+            step_sum / pairs as f64
+        );
     }
 
     /// Caves exist underground at a sane density: enough to stumble into,

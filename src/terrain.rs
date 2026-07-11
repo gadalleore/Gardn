@@ -4,7 +4,10 @@ use bevy::render::mesh::{Indices, PrimitiveTopology};
 use std::collections::{HashMap, HashSet};
 
 use crate::australia::{biome_at_world, biome_profile, AussieBiome};
-use crate::topography::{is_cave_cell, surface_height_voxels, CAVE_CELL_VOXELS};
+use crate::topography::{
+    cave_cell_noise, cave_from_noise, cave_never_opens, dirt_depth_voxels,
+    surface_height_voxels, CAVE_CELL_VOXELS, DIGGABLE_DEPTH_VOXELS,
+};
 use crate::world::{
     GardenRng, CHUNK_DEPTH_VOXELS, CHUNK_SIZE, CHUNK_VOXELS, SEA_LEVEL_VOXEL_Y, VOXEL_SIZE,
 };
@@ -19,6 +22,9 @@ pub enum BlockType {
     Laterite,
     Limestone,
     Stone,
+    /// The unbreakable floor of the world — the bottom of every column, plus
+    /// the whole band below the diggable depth. Never carved, never eaten.
+    Bedrock,
     IronOre,
     BauxiteOre,
     CoalOre,
@@ -28,6 +34,25 @@ pub enum BlockType {
     LeadZincOre,
     OpalOre,
     Water,
+}
+
+impl BlockType {
+    /// What a worm can actually eat: soils. Rock, ore, bedrock and water all
+    /// refuse the bite — "worms cannot eat rocks and don't want to" (owner).
+    /// Generation guarantees the rock exists; the refusal itself lives in
+    /// worm.rs's bite probe (core), which calls this. (Kept `allow(dead_code)`
+    /// until that routed one-liner lands — see coordination/terrain.md.)
+    #[allow(dead_code)]
+    pub(crate) fn worm_edible(self) -> bool {
+        matches!(
+            self,
+            BlockType::Grass
+                | BlockType::Dirt
+                | BlockType::RedSand
+                | BlockType::Sand
+                | BlockType::Laterite
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -293,14 +318,36 @@ pub fn generate_chunk_blocks(
         }
     }
 
-    let mut voxels = ChunkVoxels::new(
-        CHUNK_VOXELS,
-        CHUNK_VOXELS,
-        min_h - CHUNK_DEPTH_VOXELS,
-        max_h,
-    );
+    // Per-column geology, sampled at each column's CENTRE in world feet — the
+    // same points the worm's collision probe (worm.rs ColumnProbe) asks the
+    // formula about. The bilerp `heights` above shape the visible ground; the
+    // exact formula surface drives everything depth-relative (caves, bedrock)
+    // so generation and collision answer solidity questions identically.
+    let mut col_surface = vec![0i32; cols * cols];
+    let mut col_dirt = vec![0i32; cols * cols];
+    let mut min_sf = i32::MAX;
+    for lz in 0..CHUNK_VOXELS {
+        for lx in 0..CHUNK_VOXELS {
+            let i = lz as usize * cols + lx as usize;
+            if sea_mask[i] {
+                continue;
+            }
+            let wx = chunk_origin.x + (lx as f32 + 0.5) * VOXEL_SIZE;
+            let wz = chunk_origin.z + (lz as f32 + 0.5) * VOXEL_SIZE;
+            col_surface[i] = surface_height_voxels(wx, wz);
+            col_dirt[i] = dirt_depth_voxels(wx, wz);
+            min_sf = min_sf.min(col_surface[i]);
+        }
+    }
 
-    let veins = plan_ore_veins(coord, terrain_seed, &profile, &mut rng, min_h);
+    // The box floor sits a full diggable depth below the LOWEST surface either
+    // measure reports — so every land column's bedrock band (surface-relative,
+    // matching collision) lies fully inside the box and above the carve floor.
+    let chunk_floor = min_h.min(if min_sf == i32::MAX { min_h } else { min_sf })
+        - DIGGABLE_DEPTH_VOXELS;
+    let mut voxels = ChunkVoxels::new(CHUNK_VOXELS, CHUNK_VOXELS, chunk_floor, max_h);
+
+    let veins = plan_ore_veins(coord, terrain_seed, &profile, &mut rng, min_h, chunk_floor);
 
     // Per-column surface layers, sampled every 8 voxels into a flat array
     // (was a 36k-entry HashMap). Smooth enough, 64× cheaper than per-voxel.
@@ -322,32 +369,40 @@ pub fn generate_chunk_blocks(
         }
     }
 
-    // Each column's soil stack rides its own surface height. Filled solid down
-    // to the chunk-wide stone floor so even the steepest worm-mountain walls
-    // never expose a hollow core (interior faces are culled away, so the mesh
-    // stays the same size). Sea columns get the standard seabed profile
-    // instead, so a mixed coastal chunk meets a full-ocean neighbour with the
-    // exact same water/sand stack at the shared edge.
-    let chunk_floor = min_h - CHUNK_DEPTH_VOXELS;
+    // Each column's geology stack rides its own surface height, filled solid
+    // down to the box floor so even the steepest worm-mountain walls never
+    // expose a hollow core (interior faces are culled away, so the mesh stays
+    // the same size). Top to bottom: surface skin, dirt to the geology field's
+    // local depth (mean one tree length, 1% tails at zero and two — the owner's
+    // distribution), a thin sedimentary cap, then rock, then bedrock below the
+    // per-column diggable depth — the SAME rule collision uses for its bedrock
+    // band. Sea columns get the standard seabed profile instead, so a mixed
+    // coastal chunk meets a full-ocean neighbour with the exact same
+    // water/sand stack at the shared edge.
     for lz in 0..CHUNK_VOXELS {
         for lx in 0..CHUNK_VOXELS {
-            if sea_mask[lz as usize * cols + lx as usize] {
+            let i = lz as usize * cols + lx as usize;
+            if sea_mask[i] {
                 fill_seabed_column(&mut voxels, lx, lz, chunk_floor);
                 continue;
             }
-            let h = heights[lz as usize * cols + lx as usize];
-            let layers = columns[lz as usize * cols + lx as usize];
-            let soft_bottom = h - layers.dirt_depth - layers.soft_depth;
+            let h = heights[i];
+            let layers = columns[i];
+            let dirt_bottom = h - col_dirt[i];
+            let soft_bottom = dirt_bottom - SOFT_ROCK_CAP_VOXELS;
+            let bedrock_top = col_surface[i] - DIGGABLE_DEPTH_VOXELS + 2;
 
             for y in chunk_floor..=h {
                 let block = if y == h {
                     layers.surface
-                } else if y > h - layers.dirt_depth {
+                } else if y > dirt_bottom {
                     layers.subsurface
                 } else if y > soft_bottom {
                     layers.soft_rock
-                } else {
+                } else if y > bedrock_top {
                     BlockType::Stone
+                } else {
+                    BlockType::Bedrock
                 };
                 voxels.set(lx, y, lz, block);
             }
@@ -359,34 +414,55 @@ pub fn generate_chunk_blocks(
     stamp_ore_veins(&mut voxels, &veins);
 
     // Carve the cave web — after ore stamping, so veins gleam in cave walls.
-    // Decided per 8-inch lattice cell in world space (seamless across chunk
-    // borders); the bottom two layers stay bedrock so caves never open into
-    // the void.
+    // The noise is decided once per 8-inch lattice cell in world space
+    // (seamless across chunk borders); the depth half of the decision runs
+    // PER COLUMN against that column's formula surface — the exact question
+    // `is_cave_cell` answers for the worm's collision probe. (Deciding whole
+    // cells at the cell-centre column's bilerp height, as this used to, put
+    // ~150 phantom air voxels per chunk in collision's map of visibly solid
+    // ground — the worm clipped into terrain, worst right after digging.)
+    // Bedrock is never carved, so caves can't open into the void.
     let base_wx = coord.x * CHUNK_VOXELS;
     let base_wz = coord.y * CHUNK_VOXELS;
     let carve_floor = chunk_floor + 2;
     let y_start = carve_floor.div_euclid(CAVE_CELL_VOXELS) * CAVE_CELL_VOXELS;
     for lz in (0..CHUNK_VOXELS).step_by(CAVE_CELL_VOXELS as usize) {
         for lx in (0..CHUNK_VOXELS).step_by(CAVE_CELL_VOXELS as usize) {
-            let cx = (lx + CAVE_CELL_VOXELS / 2).min(CHUNK_VOXELS - 1);
-            let cz = (lz + CAVE_CELL_VOXELS / 2).min(CHUNK_VOXELS - 1);
-            let h = heights[cz as usize * cols + cx as usize];
+            // The tallest fill in this 4×4 column block bounds the y sweep.
+            let mut block_max_h = i32::MIN;
+            for dz in 0..CAVE_CELL_VOXELS {
+                for dx in 0..CAVE_CELL_VOXELS {
+                    let i = (lz + dz) as usize * cols + (lx + dx) as usize;
+                    if !sea_mask[i] {
+                        block_max_h = block_max_h.max(heights[i]);
+                    }
+                }
+            }
 
             let mut y = y_start;
-            while y <= h {
-                if is_cave_cell(base_wx + lx, y, base_wz + lz, h) {
-                    for dy in 0..CAVE_CELL_VOXELS {
-                        let cy = y + dy;
-                        if cy < carve_floor || cy > h {
-                            continue;
-                        }
-                        for dz in 0..CAVE_CELL_VOXELS {
-                            for dx in 0..CAVE_CELL_VOXELS {
-                                // Never carve a sea column — a cave cell that
-                                // straddles the waterline must not punch holes
-                                // in the water sheet or the seabed.
-                                let (cx, cz) = (lx + dx, lz + dz);
-                                if sea_mask[cz as usize * cols + cx as usize] {
+            while y <= block_max_h {
+                let noise = cave_cell_noise(base_wx + lx, y, base_wz + lz);
+                if !cave_never_opens(&noise) {
+                    // `y` is lattice-aligned, so the cell centre collision
+                    // will quantise to is exactly y + half a cell.
+                    let cell_cy = y + CAVE_CELL_VOXELS / 2;
+                    for dz in 0..CAVE_CELL_VOXELS {
+                        for dx in 0..CAVE_CELL_VOXELS {
+                            // Never carve a sea column — a cave cell that
+                            // straddles the waterline must not punch holes
+                            // in the water sheet or the seabed.
+                            let (cx, cz) = (lx + dx, lz + dz);
+                            let i = cz as usize * cols + cx as usize;
+                            if sea_mask[i] {
+                                continue;
+                            }
+                            if !cave_from_noise(&noise, col_surface[i] - cell_cy) {
+                                continue;
+                            }
+                            let bedrock_top = col_surface[i] - DIGGABLE_DEPTH_VOXELS + 2;
+                            for dy in 0..CAVE_CELL_VOXELS {
+                                let cy = y + dy;
+                                if cy < carve_floor || cy <= bedrock_top {
                                     continue;
                                 }
                                 voxels.clear_cell(cx, cy, cz);
@@ -402,13 +478,17 @@ pub fn generate_chunk_blocks(
     voxels
 }
 
+/// Thin sedimentary cap (biome soft rock) between the dirt and the deep stone
+/// — 3 ft of visual transition at the dirt–rock interface.
+const SOFT_ROCK_CAP_VOXELS: i32 = 12;
+
+/// Per-column MATERIALS only — how deep each band runs is the geology field's
+/// business (`dirt_depth_voxels`), not a per-column dice roll.
 #[derive(Clone, Copy)]
 struct ColumnLayers {
     surface: BlockType,
     subsurface: BlockType,
     soft_rock: BlockType,
-    dirt_depth: i32,
-    soft_depth: i32,
 }
 
 fn column_layers(rng: &mut GardenRng, profile: &crate::australia::BiomeProfile) -> ColumnLayers {
@@ -440,8 +520,6 @@ fn column_layers(rng: &mut GardenRng, profile: &crate::australia::BiomeProfile) 
         surface,
         subsurface,
         soft_rock,
-        dirt_depth: rng.range_i(2, 4),
-        soft_depth: rng.range_i(3, 6),
     }
 }
 
@@ -480,18 +558,21 @@ fn plan_ore_veins(
     profile: &crate::australia::BiomeProfile,
     rng: &mut GardenRng,
     min_surface_h: i32,
+    chunk_floor: i32,
 ) -> Vec<OreVein> {
     let mut veins = Vec::new();
     let total_weight: f32 = profile.ore_weights.iter().map(|(_, w)| w).sum();
 
-    // Keep veins in the rock band below the lowest surface in the chunk so they
-    // stay underground even where the terrain dips.
-    let vein_floor = min_surface_h - CHUNK_DEPTH_VOXELS + 4;
+    // Keep veins in the underground band below the lowest surface in the chunk
+    // so they stay buried even where the terrain dips. The band is ~6× taller
+    // than it was pre-geology (the world got deep), so the count scales up to
+    // keep veins worth stumbling into down a dig shaft or cave wall.
+    let vein_floor = chunk_floor + 4;
     let vein_ceiling = (min_surface_h - 2).max(vein_floor);
 
     for (ore, weight) in profile.ore_weights {
         let share = weight / total_weight;
-        let vein_count = (share * rng.range(4.0, 10.0)).round() as i32;
+        let vein_count = (share * rng.range(12.0, 26.0)).round() as i32;
         for v in 0..vein_count {
             let vein_seed = terrain_seed
                 ^ ((ore as u64) << 32)
@@ -590,6 +671,7 @@ fn block_color(block: BlockType) -> [f32; 4] {
         BlockType::Laterite => [0.58, 0.28, 0.20],
         BlockType::Limestone => [0.78, 0.76, 0.68],
         BlockType::Stone => [0.48, 0.48, 0.50],
+        BlockType::Bedrock => [0.16, 0.16, 0.19],
         BlockType::IronOre => [0.55, 0.36, 0.28],
         BlockType::BauxiteOre => [0.62, 0.42, 0.38],
         BlockType::CoalOre => [0.18, 0.18, 0.20],
@@ -925,6 +1007,113 @@ mod tests {
         assert!(
             verts > 0 && verts < 2_500_000,
             "chunk mesh has {verts} vertices — too heavy for streaming"
+        );
+    }
+
+    /// Generation and the worm's collision probe must agree on EVERY land
+    /// voxel's solidity. This replicates worm.rs `ColumnProbe::solid` (with
+    /// the geology-depth bedrock band it adopts via the routed constant) over
+    /// freshly generated chunks and demands zero disagreement in either
+    /// direction: a "phantom" (generated solid, collision says air) lets the
+    /// worm sink into visibly solid ground — the clip-through bug — and a
+    /// "ghost" (generated air, collision says solid) is an invisible floor
+    /// hanging in a cave. Before the per-column cave rewrite this found
+    /// 130–190 phantoms and ~20k ghosts per chunk.
+    #[test]
+    fn generation_and_collision_agree_on_every_land_voxel() {
+        use crate::topography::{is_cave_cell, surface_height_voxels, DIGGABLE_DEPTH_VOXELS};
+        let coords = [IVec2::new(3, -1), IVec2::new(10, 7), IVec2::new(-5, 12)];
+        for coord in coords {
+            let origin = chunk_world_origin(coord);
+            let voxels = generate_chunk_blocks(coord, origin, chunk_seed(WORLD_SEED, coord));
+            let tops = voxels.column_tops();
+            let mut phantom = 0u32;
+            let mut ghost = 0u32;
+            for lz in 0..CHUNK_VOXELS {
+                for lx in 0..CHUNK_VOXELS {
+                    let wx = origin.x + (lx as f32 + 0.5) * VOXEL_SIZE;
+                    let wz = origin.z + (lz as f32 + 0.5) * VOXEL_SIZE;
+                    if biome_at_world(wx, wz) == AussieBiome::Ocean {
+                        // Sea columns aren't diggable ground; the worm treats
+                        // the water sheet as a floor. Out of scope here.
+                        continue;
+                    }
+                    let surface = surface_height_voxels(wx, wz);
+                    let top = tops[(lz * CHUNK_VOXELS + lx) as usize];
+                    let bedrock = surface - DIGGABLE_DEPTH_VOXELS + 2;
+                    let vx = coord.x * CHUNK_VOXELS + lx;
+                    let vz = coord.y * CHUNK_VOXELS + lz;
+                    for vy in voxels.y_min..=top {
+                        let gen_solid = voxels.get(lx, vy, lz).is_some();
+                        // ColumnProbe::solid replica (no edits in a fresh chunk).
+                        let col_solid = if vy <= bedrock {
+                            true
+                        } else {
+                            !is_cave_cell(vx, vy, vz, surface)
+                        };
+                        match (gen_solid, col_solid) {
+                            (true, false) => phantom += 1,
+                            (false, true) => ghost += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                (phantom, ghost),
+                (0, 0),
+                "chunk {coord:?}: {phantom} phantom voxels (worm clips into solid \
+                 ground) and {ghost} ghosts (invisible cave floors)"
+            );
+        }
+    }
+
+    /// The geology stack is ordered and honest: bedrock at the very bottom,
+    /// stone above it, and the dirt band actually edible — so once worm.rs
+    /// refuses `!worm_edible()` blocks, digging straight down eats soil for
+    /// the local dirt depth and then hits rock it cannot chew through.
+    #[test]
+    fn rock_floors_the_dirt() {
+        use crate::topography::dirt_depth_voxels;
+        let coord = IVec2::new(10, 7);
+        let origin = chunk_world_origin(coord);
+        let voxels = generate_chunk_blocks(coord, origin, chunk_seed(WORLD_SEED, coord));
+        let tops = voxels.column_tops();
+
+        let mut rocky_below_dirt = 0u32;
+        let mut sampled = 0u32;
+        for lz in (2..CHUNK_VOXELS).step_by(9) {
+            for lx in (2..CHUNK_VOXELS).step_by(9) {
+                let wx = origin.x + (lx as f32 + 0.5) * VOXEL_SIZE;
+                let wz = origin.z + (lz as f32 + 0.5) * VOXEL_SIZE;
+                if biome_at_world(wx, wz) == AussieBiome::Ocean {
+                    continue;
+                }
+                sampled += 1;
+
+                // The world floor is bedrock, everywhere.
+                assert_eq!(
+                    voxels.get(lx, voxels.y_min, lz),
+                    Some(BlockType::Bedrock),
+                    "column ({lx},{lz}) floor isn't bedrock"
+                );
+
+                // Below the dirt (plus the sedimentary cap) the ground is
+                // rock/ore — inedible. Caves may hollow the probe point, so
+                // count instead of asserting per column.
+                let top = tops[(lz * CHUNK_VOXELS + lx) as usize];
+                let probe_y = top - dirt_depth_voxels(wx, wz) - SOFT_ROCK_CAP_VOXELS - 4;
+                match voxels.get(lx, probe_y.max(voxels.y_min), lz) {
+                    Some(b) if !b.worm_edible() => rocky_below_dirt += 1,
+                    Some(_) => {}
+                    None => rocky_below_dirt += 1, // cave — fine, still not edible
+                }
+            }
+        }
+        assert!(sampled > 0, "no land columns sampled");
+        assert!(
+            rocky_below_dirt * 100 >= sampled * 95,
+            "below the dirt band should be rock: {rocky_below_dirt}/{sampled}"
         );
     }
 
