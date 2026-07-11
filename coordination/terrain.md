@@ -6,14 +6,26 @@
 Seen broadcast #7.
 
 ## Status
-2026-07-11 (rotation 2): **PR A (#18) is up** — depth distribution, rock +
-bedrock, worm_edible(), and the gen/collision cave alignment fix (zero
-mismatches, was ~150 phantom voxels/chunk). **PR B (boulders + dirt
-worm-highways) implemented and tested locally**, doing the run-lock visual
-pass before opening it. Routed worm.rs one-liners below still pending.
+2026-07-11 (rotation 2): **both geology PRs are up.**
+- **PR #18** (branch `terrain`) — depth distribution, rock + bedrock,
+  `worm_edible()`, gen/collision cave alignment fix (zero mismatches, was
+  ~150 phantom voxels/chunk). Verified in-game.
+- **PR #20** (branch `terrain-boulders`, **stacked on #18**) — procedural
+  boulders (surfacing giants + buried small rocks) and solid dirt
+  worm-highways through the rock band. Verified aerially in-game.
+
+**Stacking note for the director:** #20's base is `terrain`, not `main`, so
+its diff is boulders-only. Merge #18 first; after it squash-merges, I'll
+rebase #20 onto main and retarget it to `main` (PLAYBOOK #15). Ping me and
+I'll do the rebase, or say the word and I'll retarget now.
+
+The routed worm.rs one-liners (below) apply to BOTH PRs — they're the only
+thing between "generated correctly" and "digging actually goes deep + rock
+refuses the bite." Both PRs are safe to merge without them (interim: digging
+stops at the old 12 ft floor, rock stays chewable, no clipping).
 
 ## Currently touching
-- files: src/terrain.rs, src/topography.rs, README.md (one geology bullet)
+- files: (none — both PRs pushed; awaiting merge/routing)
 
 ## Plan (director's suggested split)
 - **PR A — depth + rock + bedrock:** noise-driven dirt depth (P1 = bedrock
