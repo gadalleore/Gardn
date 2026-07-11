@@ -52,6 +52,11 @@ durable memory).
 1. A PR lands → the director reviews it (stayed in owned files? README rule
    followed? `cargo check` clean?).
 2. Merge **one PR at a time**: `gh pr merge <n> --squash --delete-branch`.
+   Squash merges rewrite history, so **stacked PRs don't survive them**: a PR
+   branched off another PR's branch will conflict once its base squash-merges.
+   If a track stacks (fine for keeping diffs small), merge the base PR first,
+   then have the track `git rebase origin/main` + `--force-with-lease` the
+   stacked branch before its review.
 3. Announce it as a numbered entry in `..\_director\broadcast.md`
    ("main updated to <sha> — pull + rebase"). Tracks pick it up at their next
    checkpoint; paste a nudge into a session only when it's urgent.
