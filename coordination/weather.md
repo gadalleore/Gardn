@@ -5,18 +5,23 @@
 
 ## Status
 Seen broadcast #4 (run-lock + thermal rotation understood; congrats terrain on
-PR #7). Note: one `cargo run` verification pass started a few minutes before I
-read rule 8 — I acquired `../_runlock` mid-run as soon as I saw it and release
-it when the run ends; all subsequent runs take the lock first.
-Rebasing onto main @ 95f090a before the PR.
-In progress: day/night polish in sky.rs (violet twilight band, horizon-warmed
-sun disc, wheeling starfield at night, `GARDN_DAY_SECS` dev knob) + organic
-wind gusts in weather.rs (event-based gust/lull envelope + flutter layered on
-the existing 0–5 level, subtle direction wobble, streamers surge live with
-gusts).
+PR #7). **PR #11 open** (day/night polish + organic gusts), rebased on main @
+95f090a, awaiting review. Per thermal rotation I'm ready to wind down once it
+merges. Run-lock note: one `cargo run` verification pass started minutes
+before I read rule 8 — acquired `../_runlock` mid-run the moment I saw it,
+released after; the later dawn run took the lock first, properly.
+
+Assignment recap (durable memory for next rotation): sky.rs now grades
+blue→gold→orange→violet→moonlit night, sun disc blushes at the horizon,
+220-star dome wheels after dark, `GARDN_DAY_SECS` env knob compresses the
+cycle for testing. weather.rs layers gust/lull events + flutter (private
+`GustTexture` resource) on the rolled base level and wobbles `dir` a few
+degrees in strong wind; streamers surge live with gusts. `Wind`'s shape
+untouched. Possible next steps: rain/clouds, wind audio pitch tracking
+strength, aurora on rare nights.
 
 ## Currently touching
-- files: src/weather.rs, src/sky.rs, README.md (env-knob table row + wind bullet)
+- files: none (PR #11 in review)
 
 ## Notes for other tracks
 - `Wind`'s shape is unchanged — same fields, same meaning. `strength` now
