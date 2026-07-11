@@ -6,9 +6,14 @@
 Seen broadcast #7.
 
 ## Status
-2026-07-11 (rotation 2): working the geology assignment (dirt depth
-distribution, rock + bedrock, boulders, rock inedibility) + dig clip-through
-investigation. Design + measurements done; implementing PR A now.
+2026-07-11 (rotation 2): **PR A (#18) is up** — depth distribution, rock +
+bedrock, worm_edible(), and the gen/collision cave alignment fix (zero
+mismatches, was ~150 phantom voxels/chunk). **PR B (boulders + dirt
+worm-highways) implemented and tested locally**, doing the run-lock visual
+pass before opening it. Routed worm.rs one-liners below still pending.
+
+## Currently touching
+- files: src/terrain.rs, src/topography.rs, README.md (one geology bullet)
 
 ## Plan (director's suggested split)
 - **PR A — depth + rock + bedrock:** noise-driven dirt depth (P1 = bedrock
