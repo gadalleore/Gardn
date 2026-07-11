@@ -33,10 +33,24 @@ impl Plugin for WeatherPlugin {
             .insert_resource(SeasonClock::from_env())
             .insert_resource(CloudSimRes(CloudSim::from_env()))
             .init_resource::<CloudState>()
-            .add_systems(Startup, setup_streamers)
+            .init_resource::<ActiveFormation>()
+            .init_resource::<StormLight>()
+            .add_systems(Startup, (setup_streamers, setup_clouds))
+            // Chained so the visual systems read THIS frame's CloudState and
+            // the sky (which runs unordered) is at most one frame behind.
             .add_systems(
                 Update,
-                (update_wind, update_wind_streamers, update_seasons, update_clouds),
+                (
+                    update_wind,
+                    update_wind_streamers,
+                    update_seasons,
+                    update_clouds,
+                    sync_cloud_formations,
+                    animate_clouds,
+                    update_rain,
+                    update_lightning,
+                )
+                    .chain(),
             );
     }
 }
@@ -826,6 +840,633 @@ fn region_class(world_x: f32, world_z: f32) -> (bool, bool) {
         AridOutback | Pilbara => (true, false),
         CoastalBush | Mediterranean | Tasmania => (false, true),
         _ => (false, false),
+    }
+}
+
+// ===================== Procedural cloud rendering =====================
+//
+// Owner ruled: procedural, no sprites. Each cloud is a clump of low-poly
+// blob puffs (one shared icosphere mesh, a handful of shared gray materials)
+// hung at type-specific altitude — worm-scale, they're distant titans'
+// ceilings. The whole field is camera-anchored like the star dome (sky decor,
+// not streamed world) and drifts with the live wind; per-type layouts give
+// each form its silhouette: streaks for cirrus, a mackerel scatter for
+// cirrocumulus, fluffy flat-bottomed heaps for cumulus, an anvil tower for
+// cumulonimbus, broad gray decks for the stratus family. Cover from the state
+// machine swells clouds in and out; the cirrostratus veil is a single huge
+// translucent disc above everything. Rain is streamer-style falling streaks;
+// lightning is a light flash published as [`StormLight`] for the sky to apply
+// (single-writer: sky.rs owns every light/fog write).
+
+/// How far the cloud field spreads around the worm, and how high the herald
+/// veil hangs (just under the celestial discs at 850 ft).
+const CLOUD_FIELD_RADIUS: f32 = 750.0;
+const VEIL_ALTITUDE: f32 = 700.0;
+/// Veil disc radius, sized so its farthest fragment (√(500² + 700²) ≈ 860 ft)
+/// stays inside the camera's 1000 ft far plane — a bigger disc gets the far
+/// clip carving a hard arc across the sky (seen in the first eyeball run).
+/// The edge that remains sits past the fog start, so the haze soft-fades it.
+const VEIL_RADIUS: f32 = 500.0;
+const VEIL_MAX_ALPHA: f32 = 0.32;
+/// Cloud drift in ft/s per wind-strength unit — a gale visibly marches the
+/// ceiling along, a breeze barely.
+const CLOUD_DRIFT_FTPS: f32 = 4.0;
+
+/// How much a cloud type grays and dims the daylight at full cover — the sky
+/// reads this (with [`CloudState`]) to sell overcast without touching clouds.
+pub(crate) fn sky_grayness(kind: CloudType) -> f32 {
+    match kind {
+        CloudType::Cumulonimbus => 0.85,
+        CloudType::Nimbostratus => 0.75,
+        CloudType::Stratus => 0.55,
+        CloudType::Altostratus => 0.45,
+        CloudType::Stratocumulus => 0.35,
+        CloudType::Cumulus => 0.12,
+        CloudType::Cirrus | CloudType::Altocumulus | CloudType::Cirrocumulus => 0.08,
+    }
+}
+
+/// Lightning flash level, 0..1 decaying — written here when a cumulonimbus
+/// bolt fires, applied by sky.rs (the one writer of ambient/sky colour).
+#[derive(Resource)]
+pub(crate) struct StormLight {
+    pub(crate) flash: f32,
+    next_bolt_at: f32,
+    rng: GardenRng,
+}
+
+impl Default for StormLight {
+    fn default() -> Self {
+        Self { flash: 0.0, next_bolt_at: 0.0, rng: GardenRng::new(0x0B_017) }
+    }
+}
+
+/// Root of the current main-event formation; its children are cloud masses.
+#[derive(Component)]
+struct CloudFormation;
+
+/// One cloud: a puff clump. `offset` is its slot in the camera-anchored field
+/// (y = altitude), `base_scale` its full-cover size, `bob` a phase for the
+/// slow breathing pulse.
+#[derive(Component)]
+struct CloudMass {
+    offset: Vec3,
+    base_scale: Vec3,
+    bob: f32,
+}
+
+/// The single cirrostratus disc above everything.
+#[derive(Component)]
+struct HeraldVeil;
+
+/// One falling rain streak (world-space, near the worm).
+#[derive(Component)]
+struct RainStreak {
+    fall_speed: f32,
+}
+
+/// Which main type the spawned formation was built for — rebuilt when the
+/// state machine moves on.
+#[derive(Resource, Default)]
+struct ActiveFormation(Option<CloudType>);
+
+/// Shared cloud geometry + the fixed shade ladder. One icosphere, six
+/// materials — a formation of 150 puffs costs one mesh and a texture-less
+/// material each.
+#[derive(Resource)]
+struct CloudAssets {
+    puff: Handle<Mesh>,
+    veil_mat: Handle<StandardMaterial>,
+    shades: [Handle<StandardMaterial>; 6],
+    rain_mesh: Handle<Mesh>,
+    rain_mat: Handle<StandardMaterial>,
+}
+
+/// The shade ladder's gray levels, brightest first (index into `shades`).
+const CLOUD_GRAYS: [f32; 6] = [1.0, 0.94, 0.80, 0.62, 0.45, 0.34];
+
+impl CloudAssets {
+    /// Nearest shade material for a wanted gray level.
+    fn shade(&self, gray: f32) -> Handle<StandardMaterial> {
+        let mut best = 0;
+        for (i, g) in CLOUD_GRAYS.iter().enumerate() {
+            if (g - gray).abs() < (CLOUD_GRAYS[best] - gray).abs() {
+                best = i;
+            }
+        }
+        self.shades[best].clone()
+    }
+}
+
+fn setup_clouds(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let shades = CLOUD_GRAYS.map(|g| {
+        materials.add(StandardMaterial {
+            // Faintly blue-shadowed white, fully rough so the sun models the
+            // clumps; fog stays ON so distant clouds melt into the haze.
+            base_color: Color::srgb(g, g, (g * 1.03).min(1.0)),
+            perceptual_roughness: 1.0,
+            reflectance: 0.06,
+            ..default()
+        })
+    });
+    let veil_mat = materials.add(StandardMaterial {
+        // The herald: a milky sheet whose alpha IS the machine's cover value.
+        // Unlit and retinted per frame by `animate_clouds` — a LIT sheet seen
+        // from below shows its shadowed underside and reads as a dark UFO
+        // (first eyeball run). Fog stays on so the disc edge melts into haze.
+        base_color: Color::srgba(1.0, 1.0, 1.0, 0.0),
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        double_sided: true,
+        cull_mode: None,
+        ..default()
+    });
+    commands.spawn((
+        HeraldVeil,
+        Mesh3d(meshes.add(Cylinder::new(VEIL_RADIUS, 2.0))),
+        MeshMaterial3d(veil_mat.clone()),
+        NotShadowCaster,
+        Transform::from_xyz(0.0, VEIL_ALTITUDE, 0.0),
+        Visibility::Hidden,
+    ));
+
+    commands.insert_resource(CloudAssets {
+        puff: meshes.add(Sphere::new(1.0).mesh().ico(2).unwrap_or_else(|_| Sphere::new(1.0).into())),
+        veil_mat,
+        shades,
+        rain_mesh: meshes.add(Cuboid::new(0.04, 1.8, 0.04)),
+        rain_mat: materials.add(StandardMaterial {
+            base_color: Color::srgba(0.66, 0.73, 0.86, 0.6),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            ..default()
+        }),
+    });
+}
+
+/// Per-type formation recipe: where it lives and how its clumps are built.
+struct CloudLook {
+    altitude: f32,
+    /// How many cloud masses across the field.
+    count: (i32, i32),
+    /// Puffs per mass.
+    puffs: (i32, i32),
+    /// Puff radius range, feet.
+    puff_ft: (f32, f32),
+    /// Local scatter of puffs inside a mass (half-extents, feet).
+    spread: Vec3,
+    /// Whole-mass anisotropic stretch — streaks vs decks vs heaps.
+    stretch: Vec3,
+    gray: f32,
+    /// Cumulus family: puffs pile upward off a flat base.
+    flat_base: bool,
+    /// Streak types align their long axis downwind.
+    wind_aligned: bool,
+}
+
+fn cloud_look(kind: CloudType) -> CloudLook {
+    use CloudType::*;
+    match kind {
+        // High wisps combed into long thin downwind streaks.
+        Cirrus => CloudLook {
+            altitude: 580.0,
+            count: (5, 9),
+            puffs: (5, 9),
+            puff_ft: (7.0, 12.0),
+            spread: Vec3::new(60.0, 4.0, 10.0),
+            stretch: Vec3::new(2.6, 0.3, 0.7),
+            gray: 1.0,
+            flat_base: false,
+            wind_aligned: true,
+        },
+        // A mackerel sky: many small high rippled patches.
+        Cirrocumulus => CloudLook {
+            altitude: 560.0,
+            count: (14, 22),
+            puffs: (3, 6),
+            puff_ft: (4.5, 7.5),
+            spread: Vec3::new(26.0, 3.0, 20.0),
+            stretch: Vec3::ONE,
+            gray: 1.0,
+            flat_base: false,
+            wind_aligned: false,
+        },
+        // Mid-level puff patches in loose rows.
+        Altocumulus => CloudLook {
+            altitude: 400.0,
+            count: (10, 16),
+            puffs: (4, 7),
+            puff_ft: (9.0, 14.0),
+            spread: Vec3::new(30.0, 8.0, 24.0),
+            stretch: Vec3::new(1.0, 0.6, 1.0),
+            gray: 0.94,
+            flat_base: false,
+            wind_aligned: false,
+        },
+        // Low lumpy patchwork — bigger, grayer, closer.
+        Stratocumulus => CloudLook {
+            altitude: 260.0,
+            count: (7, 11),
+            puffs: (7, 11),
+            puff_ft: (16.0, 24.0),
+            spread: Vec3::new(55.0, 10.0, 45.0),
+            stretch: Vec3::new(1.0, 0.5, 1.0),
+            gray: 0.80,
+            flat_base: false,
+            wind_aligned: false,
+        },
+        // The classic fluffy heap: flat bottom, cauliflower top.
+        Cumulus => CloudLook {
+            altitude: 230.0,
+            count: (4, 7),
+            puffs: (6, 10),
+            puff_ft: (14.0, 22.0),
+            spread: Vec3::new(34.0, 22.0, 30.0),
+            stretch: Vec3::new(1.0, 0.9, 1.0),
+            gray: 1.0,
+            flat_base: true,
+            wind_aligned: false,
+        },
+        // Handled by `spawn_cumulonimbus` (tower + anvil), but keep sane
+        // numbers here for the shared fields it does use.
+        Cumulonimbus => CloudLook {
+            altitude: 200.0,
+            count: (1, 2),
+            puffs: (0, 0),
+            puff_ft: (0.0, 0.0),
+            spread: Vec3::ZERO,
+            stretch: Vec3::ONE,
+            gray: 0.34,
+            flat_base: true,
+            wind_aligned: false,
+        },
+        // The rain deck: broad, dark, low, featureless.
+        Nimbostratus => CloudLook {
+            altitude: 190.0,
+            count: (9, 13),
+            puffs: (8, 12),
+            puff_ft: (22.0, 32.0),
+            spread: Vec3::new(70.0, 8.0, 60.0),
+            stretch: Vec3::new(1.2, 0.4, 1.2),
+            gray: 0.45,
+            flat_base: false,
+            wind_aligned: false,
+        },
+        // The two outro sheets: gray mid-level, paler low.
+        Altostratus => CloudLook {
+            altitude: 380.0,
+            count: (8, 12),
+            puffs: (7, 10),
+            puff_ft: (20.0, 28.0),
+            spread: Vec3::new(65.0, 6.0, 55.0),
+            stretch: Vec3::new(1.3, 0.35, 1.3),
+            gray: 0.62,
+            flat_base: false,
+            wind_aligned: false,
+        },
+        Stratus => CloudLook {
+            altitude: 140.0,
+            count: (7, 10),
+            puffs: (8, 12),
+            puff_ft: (24.0, 34.0),
+            spread: Vec3::new(80.0, 6.0, 66.0),
+            stretch: Vec3::new(1.4, 0.3, 1.4),
+            gray: 0.72,
+            flat_base: false,
+            wind_aligned: false,
+        },
+    }
+}
+
+/// Rebuild the formation whenever the state machine changes the main event.
+/// The swap happens at zero cover (the machine ramps every phase edge), so
+/// nothing pops on screen.
+fn sync_cloud_formations(
+    mut commands: Commands,
+    state: Res<CloudState>,
+    assets: Res<CloudAssets>,
+    wind: Res<Wind>,
+    mut active: ResMut<ActiveFormation>,
+    formations: Query<Entity, With<CloudFormation>>,
+) {
+    if active.0 == state.main_type {
+        return;
+    }
+    active.0 = state.main_type;
+    for e in &formations {
+        commands.entity(e).despawn_recursive();
+    }
+    let Some(kind) = state.main_type else {
+        return;
+    };
+
+    // Fresh seed per formation — cloudscapes never repeat.
+    let mut rng = GardenRng::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0xC10D_5EED),
+    );
+    let look = cloud_look(kind);
+    let count = rng.range_i(look.count.0, look.count.1);
+
+    let root = commands
+        .spawn((CloudFormation, Transform::default(), Visibility::default()))
+        .id();
+    for _ in 0..count {
+        // Uniform slot in the field disc (sqrt for area-uniform).
+        let ang = rng.range(0.0, std::f32::consts::TAU);
+        let r = CLOUD_FIELD_RADIUS * rng.next_f32().sqrt();
+        let offset = Vec3::new(
+            ang.cos() * r,
+            look.altitude * rng.range(0.92, 1.12),
+            ang.sin() * r,
+        );
+        let yaw = if look.wind_aligned {
+            // Streaks comb along the wind (long axis = local X).
+            Quat::from_rotation_y((-wind.dir.y).atan2(wind.dir.x))
+        } else {
+            Quat::from_rotation_y(rng.range(0.0, std::f32::consts::TAU))
+        };
+        let base_scale = look.stretch * rng.range(0.8, 1.25);
+        let mass = commands
+            .spawn((
+                CloudMass {
+                    offset,
+                    base_scale,
+                    bob: rng.range(0.0, std::f32::consts::TAU),
+                },
+                Transform {
+                    translation: offset,
+                    rotation: yaw,
+                    // Swelled to real size by `animate_clouds`.
+                    scale: Vec3::splat(0.001),
+                },
+                Visibility::Hidden,
+            ))
+            .id();
+        commands.entity(root).add_child(mass);
+        if kind == CloudType::Cumulonimbus {
+            spawn_cumulonimbus(&mut commands, mass, &assets, &mut rng);
+        } else {
+            spawn_puff_clump(&mut commands, mass, &assets, &look, &mut rng);
+        }
+    }
+    println!("☁️ Cloudscape rebuilt: {count} {kind:?} masses.");
+}
+
+/// Fill a mass with its puff clump per the recipe.
+fn spawn_puff_clump(
+    commands: &mut Commands,
+    mass: Entity,
+    assets: &CloudAssets,
+    look: &CloudLook,
+    rng: &mut GardenRng,
+) {
+    let n = rng.range_i(look.puffs.0, look.puffs.1);
+    for _ in 0..n {
+        let mut pos = Vec3::new(
+            rng.range(-look.spread.x, look.spread.x),
+            rng.range(-look.spread.y, look.spread.y),
+            rng.range(-look.spread.z, look.spread.z),
+        );
+        if look.flat_base {
+            // Cumulus family: pile upward off a common flat bottom.
+            pos.y = pos.y.abs();
+        }
+        let r = rng.range(look.puff_ft.0, look.puff_ft.1);
+        // Real cloud bases sit in shadow: puffs low in the clump run a shade
+        // darker than the sunlit crown.
+        let frac_up = (pos.y + look.spread.y) / (2.0 * look.spread.y).max(1.0);
+        let gray = look.gray * (0.82 + 0.18 * frac_up.clamp(0.0, 1.0));
+        let puff = commands
+            .spawn((
+                Mesh3d(assets.puff.clone()),
+                MeshMaterial3d(assets.shade(gray)),
+                NotShadowCaster,
+                Transform {
+                    translation: pos,
+                    rotation: Quat::from_rotation_y(rng.range(0.0, std::f32::consts::TAU)),
+                    // Slightly squashed blobs read as vapor, not marbles.
+                    scale: Vec3::new(r, r * rng.range(0.55, 0.8), r * rng.range(0.8, 1.1)),
+                },
+            ))
+            .id();
+        commands.entity(mass).add_child(puff);
+    }
+}
+
+/// The one bespoke build: a cumulonimbus tower — dark shelf base, boiling
+/// column, and the white anvil smeared flat at the top.
+fn spawn_cumulonimbus(
+    commands: &mut Commands,
+    mass: Entity,
+    assets: &CloudAssets,
+    rng: &mut GardenRng,
+) {
+    let mut spawn = |pos: Vec3, scale: Vec3, gray: f32, rng: &mut GardenRng| {
+        let p = commands
+            .spawn((
+                Mesh3d(assets.puff.clone()),
+                MeshMaterial3d(assets.shade(gray)),
+                NotShadowCaster,
+                Transform {
+                    translation: pos,
+                    rotation: Quat::from_rotation_y(rng.range(0.0, std::f32::consts::TAU)),
+                    scale,
+                },
+            ))
+            .id();
+        commands.entity(mass).add_child(p);
+    };
+    // The dark shelf the rain falls from.
+    for _ in 0..rng.range_i(5, 7) {
+        let r = rng.range(26.0, 36.0);
+        let pos = Vec3::new(rng.range(-45.0, 45.0), rng.range(-6.0, 6.0), rng.range(-45.0, 45.0));
+        spawn(pos, Vec3::new(r, r * 0.45, r * rng.range(0.8, 1.1)), 0.34, rng);
+    }
+    // The boiling column, brightening as it climbs into sunlight.
+    for _ in 0..rng.range_i(9, 12) {
+        let h = rng.range(25.0, 300.0);
+        let taper = 1.0 - h / 420.0;
+        let r = rng.range(18.0, 28.0) * (0.6 + 0.6 * taper);
+        let pos = Vec3::new(
+            rng.range(-30.0, 30.0) * taper,
+            h,
+            rng.range(-30.0, 30.0) * taper,
+        );
+        let gray = 0.45 + 0.5 * (h / 300.0);
+        spawn(pos, Vec3::new(r, r * rng.range(0.7, 0.95), r), gray.min(0.95), rng);
+    }
+    // The anvil: bright, wide, smeared flat where the tower hits the ceiling.
+    for _ in 0..rng.range_i(5, 8) {
+        let r = rng.range(20.0, 26.0);
+        let pos = Vec3::new(rng.range(-70.0, 70.0), rng.range(295.0, 330.0), rng.range(-70.0, 70.0));
+        spawn(pos, Vec3::new(r * 3.2, r * 0.35, r * 3.2), 1.0, rng);
+    }
+}
+
+/// Per-frame cloud life: the field rides the camera (sky decor, like the star
+/// dome), masses drift downwind and wrap, swell with the machine's cover, and
+/// breathe a slow pulse; the herald veil's alpha follows its own cover.
+fn animate_clouds(
+    time: Res<Time>,
+    wind: Res<Wind>,
+    state: Res<CloudState>,
+    clock: Res<crate::sky::SkyClock>,
+    assets: Res<CloudAssets>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    cam_q: Query<&Transform, (With<Camera>, Without<CloudFormation>, Without<CloudMass>, Without<HeraldVeil>)>,
+    mut formation_q: Query<&mut Transform, (With<CloudFormation>, Without<CloudMass>, Without<HeraldVeil>)>,
+    mut masses: Query<(&mut CloudMass, &mut Transform, &mut Visibility), Without<CloudFormation>>,
+    mut veil_q: Query<
+        (&mut Transform, &mut Visibility),
+        (With<HeraldVeil>, Without<CloudFormation>, Without<CloudMass>, Without<Camera>),
+    >,
+) {
+    let Ok(cam) = cam_q.get_single() else {
+        return;
+    };
+    let dt = time.delta_secs();
+    let t = time.elapsed_secs();
+    let drift = Vec3::new(wind.dir.x, 0.0, wind.dir.y) * wind.strength * CLOUD_DRIFT_FTPS * dt;
+
+    for mut tf in &mut formation_q {
+        tf.translation = Vec3::new(cam.translation.x, 0.0, cam.translation.z);
+    }
+
+    let cover = state.main_cover;
+    for (mut mass, mut tf, mut vis) in &mut masses {
+        mass.offset += drift;
+        let flat = Vec2::new(mass.offset.x, mass.offset.z);
+        if flat.length() > CLOUD_FIELD_RADIUS {
+            // Blew off the field's edge — re-enter from the upwind side.
+            mass.offset.x = -mass.offset.x * 0.96;
+            mass.offset.z = -mass.offset.z * 0.96;
+        }
+        tf.translation = mass.offset;
+        // Grow in from 35% size rather than zero — a swelling cloud, not an
+        // inflating balloon — with a slow breathing pulse on top.
+        let pulse = 1.0 + ((t * 0.05) + mass.bob).sin() * 0.03;
+        let swell = (0.35 + 0.65 * cover) * pulse;
+        tf.scale = (mass.base_scale * swell).max(Vec3::splat(0.001));
+        let want = if cover > 0.02 {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != want {
+            *vis = want;
+        }
+    }
+
+    for (mut tf, mut vis) in &mut veil_q {
+        tf.translation = Vec3::new(cam.translation.x, VEIL_ALTITUDE, cam.translation.z);
+        let want = if state.cirrostratus > 0.01 {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+        if *vis != want {
+            *vis = want;
+        }
+    }
+    if let Some(mat) = materials.get_mut(&assets.veil_mat) {
+        // Unlit, so day/night is painted in by hand: same sun-elevation curve
+        // the sky uses (0.25 of the day = sunrise), dimming the milk to a
+        // faint moonlit gray at night.
+        let elev = ((clock.frac - 0.25) * std::f32::consts::TAU).sin();
+        let day_l = (elev * 3.0).clamp(0.0, 1.0);
+        let v = 0.22 + 0.78 * day_l;
+        mat.base_color =
+            Color::srgba(v, v, (v * 1.02).min(1.0), VEIL_MAX_ALPHA * state.cirrostratus);
+    }
+}
+
+/// Rain under the rain-bearers: streamer-style streaks falling around the
+/// worm, heavier under cumulonimbus than nimbostratus, leaning with the wind.
+/// Minimal by design — real water is a future epic; this is the weather being
+/// legible from the ground.
+fn update_rain(
+    time: Res<Time>,
+    state: Res<CloudState>,
+    mut wind: ResMut<Wind>,
+    assets: Res<CloudAssets>,
+    chunk_world: Res<ChunkWorld>,
+    mut commands: Commands,
+    cam_q: Query<&Transform, (With<Camera>, Without<RainStreak>)>,
+    mut streaks: Query<(Entity, &RainStreak, &mut Transform), Without<Camera>>,
+) {
+    let Ok(cam) = cam_q.get_single() else {
+        return;
+    };
+    let cam_pos = cam.translation;
+    let dt = time.delta_secs();
+
+    let intensity = match state.main_type {
+        Some(CloudType::Nimbostratus) => state.main_cover,
+        // The deadly rain: harder, denser.
+        Some(CloudType::Cumulonimbus) => state.main_cover * 1.6,
+        _ => 0.0,
+    };
+    let lean = Vec3::new(wind.dir.x, 0.0, wind.dir.y) * wind.strength * 1.5;
+
+    let mut alive = 0usize;
+    for (entity, streak, mut tf) in &mut streaks {
+        tf.translation.y -= streak.fall_speed * dt;
+        tf.translation += lean * dt;
+        let floor = ground_world_y(&chunk_world, tf.translation.x, tf.translation.z);
+        if tf.translation.y < floor {
+            commands.entity(entity).despawn();
+        } else {
+            alive += 1;
+        }
+    }
+
+    let desired = (intensity.clamp(0.0, 1.6) * 130.0) as usize;
+    let mut to_spawn = desired.saturating_sub(alive).min(8);
+    while to_spawn > 0 {
+        to_spawn -= 1;
+        let pos = cam_pos
+            + Vec3::new(
+                wind.rng.range(-35.0, 35.0),
+                wind.rng.range(18.0, 42.0),
+                wind.rng.range(-35.0, 35.0),
+            );
+        commands.spawn((
+            RainStreak { fall_speed: wind.rng.range(26.0, 34.0) },
+            Mesh3d(assets.rain_mesh.clone()),
+            MeshMaterial3d(assets.rain_mat.clone()),
+            NotShadowCaster,
+            Transform::from_translation(pos),
+        ));
+    }
+}
+
+/// Cumulonimbus bolts: random flashes published as [`StormLight`]; sky.rs
+/// turns the flash into the actual light/colour kick (single writer). No
+/// thunder yet — there's no thunder sample in assets/ (flagged to sprites).
+fn update_lightning(time: Res<Time>, state: Res<CloudState>, mut storm: ResMut<StormLight>) {
+    let t = time.elapsed_secs();
+    // Fast exponential decay — a flash, not a floodlight.
+    storm.flash *= (-time.delta_secs() * 7.0).exp();
+    if storm.flash < 0.001 {
+        storm.flash = 0.0;
+    }
+    let stormy =
+        state.main_type == Some(CloudType::Cumulonimbus) && state.main_cover > 0.5;
+    if stormy && t >= storm.next_bolt_at {
+        storm.flash = 1.0;
+        let gap = storm.rng.range(6.0, 18.0);
+        storm.next_bolt_at = t + gap;
+        println!("⚡ Lightning!");
+    } else if !stormy {
+        // Keep the timer ahead so the first bolt of a storm isn't instant.
+        storm.next_bolt_at = t + 8.0;
     }
 }
 

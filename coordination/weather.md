@@ -29,9 +29,31 @@ eyeball, run-lock untouched).
   core change needed): arid = AridOutback+Pilbara, coastal = CoastalBush+
   Mediterranean+Tasmania. Savanna/TemperateForest neutral.
 
+**PR #19 open (procedural clouds, PR 2 of 2)** — stacked branch
+`weather-clouds`, base = `weather`, per PLAYBOOK #15; will rebase onto main
+when #17 squash-merges.
+Blob-puff formations at altitude with per-type silhouettes, camera-anchored
+field drifting with live wind, cirrostratus veil disc, overcast sky
+dimming/graying, rain streaks, lightning flashes (StormLight resource, sky.rs
+applies), morning fog pulling the DistanceFog wall in. Three eyeball runs
+under the run-lock (acquired/released properly, logs + screenshots verified):
+cumulonimbus lifecycle w/ 16 ⚡ + live Stratus outro rebuild; dawn fog run;
+noon cirrus + veil halo. First run exposed the lit-veil-reads-dark-from-below
+bug — fixed (unlit + day-tinted + radius inside far plane).
+
+- Note for worm.rs owner (core): sky.rs now writes DistanceFog *falloff*
+  every frame (base values mirror worm.rs's 650/1350) for morning fog. worm.rs
+  remains the only setup writer; if worm ever animates falloff we'll collide —
+  flag it.
+- Request for sprites track (via human): a thunder.wav would let cumulonimbus
+  rumble; lightning is visual-only until then.
+- Future polish noted: per-time-of-day cloud tinting (backlit cirrus reads
+  gray at noon — acceptable, but dawn-pink cumulus would be lovely); cloud
+  shadows on the ground.
+
 ## Currently touching
-- files: src/weather.rs (seasons + cloud machine), src/sky.rs (SkyClock),
-  README.md (my bullets only)
+- files: src/weather.rs (seasons + machine + cloud renderer), src/sky.rs
+  (SkyClock + weather application), README.md (my bullets only)
 
 ## Notes for other tracks
 - `Wind` unchanged again — same fields, same meaning.

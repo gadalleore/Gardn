@@ -6,9 +6,12 @@
 //! `SkyPlugin` owns the clock, the celestial entities, and the update. Its one
 //! published item is [`SkyClock`] — the day fraction + day count, read by
 //! weather's seasons and morning-fog windows so both modules share the same
-//! clock (including the GARDN_HOUR / GARDN_DAY_SECS dev knobs).
+//! clock (including the GARDN_HOUR / GARDN_DAY_SECS dev knobs). In return it
+//! reads weather's `CloudState`/`StormLight` and applies their overcast
+//! dimming, morning-fog falloff, and lightning flashes itself — sky.rs stays
+//! the single writer of every light, colour, and fog value.
 
-use bevy::pbr::{CascadeShadowConfigBuilder, DistanceFog, NotShadowCaster};
+use bevy::pbr::{CascadeShadowConfigBuilder, DistanceFog, FogFalloff, NotShadowCaster};
 use bevy::prelude::*;
 use bevy::render::view::RenderLayers;
 
@@ -271,6 +274,8 @@ fn update_day_cycle(
     mut ambient: ResMut<AmbientLight>,
     mut sun_direction: ResMut<SunDirection>,
     mut sky_clock: ResMut<SkyClock>,
+    clouds: Res<crate::weather::CloudState>,
+    storm: Res<crate::weather::StormLight>,
     mut cam_q: Query<(&Transform, Option<&mut DistanceFog>), With<Camera>>,
     mut lights: Query<(&CelestialLight, &mut DirectionalLight, &mut Transform), Without<Camera>>,
     mut discs: Query<
@@ -332,10 +337,26 @@ fn update_day_cycle(
             .lerp(MOON_SHEEN, moon_t)
             .lerp(VIOLET_SKY, dusk_t * 2.0)
     };
+    // ---- Weather's say (read-only; weather.rs computes, sky.rs is the one
+    // writer of lights/colours/fog so nothing fights over them) ----
+    // Overcast: the main cloud layer washes the sky toward its own gray and
+    // dims it, scaled by how gray that cloud type is; the cirrostratus veil
+    // milks the blue a touch by day; lightning kicks everything cold-white.
+    let gray_amt = clouds
+        .main_type
+        .map_or(0.0, crate::weather::sky_grayness)
+        * clouds.main_cover;
+    let sky = {
+        let luma = sky.dot(Vec3::new(0.3, 0.5, 0.2));
+        let mut s = sky.lerp(Vec3::splat(luma), 0.8 * gray_amt) * (1.0 - 0.35 * gray_amt);
+        s = s.lerp(Vec3::new(0.90, 0.92, 0.95), 0.10 * clouds.cirrostratus * day_t);
+        s.lerp(Vec3::new(0.85, 0.88, 1.0), 0.55 * storm.flash)
+    };
     let sky_color = Color::srgb(sky.x, sky.y, sky.z);
     clear.0 = sky_color;
 
-    ambient.brightness = 16.0 + 54.0 * day_t;
+    ambient.brightness =
+        (16.0 + 54.0 * day_t) * (1.0 - 0.35 * gray_amt) + 1200.0 * storm.flash;
     // Ambient follows the same walk: blue daylight, golden dusk, moon-white night.
     let amb = Vec3::new(0.55, 0.62, 0.85)
         .lerp(Vec3::new(0.78, 0.86, 1.0), day_t)
@@ -359,7 +380,8 @@ fn update_day_cycle(
 
     for (light, mut dl, mut tf) in &mut lights {
         if light.is_sun {
-            dl.illuminance = 24_000.0 * elev.max(0.0).powf(0.6);
+            // Overcast steals up to 60% of the direct sun at full gray cover.
+            dl.illuminance = 24_000.0 * elev.max(0.0).powf(0.6) * (1.0 - 0.6 * gray_amt);
             let warm = Vec3::new(1.0, 0.60, 0.35).lerp(Vec3::new(1.0, 0.98, 0.94), day_t);
             dl.color = Color::srgb(warm.x, warm.y, warm.z);
             // Hand the (expensive) shadow pass to whichever body is up.
@@ -377,9 +399,21 @@ fn update_day_cycle(
     };
     let cam_pos = cam_tf.translation;
     if let Some(mut fog) = fog {
-        fog.color = sky_color;
+        // Morning fog pulls the fog wall from the horizon right onto the
+        // worm and pales it toward mist. Base values mirror the camera setup
+        // in worm.rs (650/1350) — written every frame, so the wall glides
+        // back out as the fog burns off. (sky.rs is the only falloff writer
+        // after setup.)
+        let f = clouds.fog;
+        fog.falloff = FogFalloff::Linear {
+            start: 650.0 + (45.0 - 650.0) * f,
+            end: 1350.0 + (220.0 - 1350.0) * f,
+        };
+        let mist = Vec3::new(0.80, 0.83, 0.87) * (0.25 + 0.75 * day_t);
+        let fog_c = sky.lerp(mist, f);
+        fog.color = Color::srgb(fog_c.x, fog_c.y, fog_c.z);
         let glow = Vec3::new(1.0, 0.95, 0.85).lerp(Vec3::new(0.75, 0.82, 1.0), moon_t);
-        fog.directional_light_color = Color::srgba(glow.x, glow.y, glow.z, 0.6);
+        fog.directional_light_color = Color::srgba(glow.x, glow.y, glow.z, 0.6 * (1.0 - 0.5 * f));
     }
 
     for (disc, mut tf, mut vis) in &mut discs {
