@@ -3,32 +3,15 @@
 **Owns:** assets/ (+ tiny loader tweaks)
 **Scope:** PNG/audio assets, cutouts
 
-Seen broadcast #4 (rebased onto 95f090a). Note: my 30s verify-run of the game
-happened just before I read #4's run-lock rule; future runs will take
-`../_runlock` first.
+Seen broadcast #4. Session wound down 2026-07-10 per thermal rotation;
+branch confirmed content-identical to main (b27f61f merged).
 
 ## Status
-First assignment done — PR #12 open (grass cutouts + foliage skin redrawn,
-dead leaf intermediates removed, audio audited-no-changes). Awaiting merge;
-per thermal rotation this session winds down after that.
-
-Audit findings driving the work:
-- `grass/mitchell.png` (32×32): noisy — disconnected specks extrude to floating
-  boxes; top 5 rows empty.
-- `grass/button.png` (32×32): only ~2 blades, all in the left half of the
-  canvas → clump is half-width and off-centre of its yaw/sway pivot.
-- `grass/mitchell_top.png` is 1032×1032; the loader nearest-downsamples to
-  32×32 which shreds the thin strands into noise. Redrawing at native 32×32.
-- `foliage.png` (1032×1032) is binary white/transparent maze, but foliage-block
-  UVs tile once per voxel (nearest+repeat) and the material multiplies a
-  species tint — so a small grayscale leaf-cluster tile is the intended use of
-  that pipeline and currently wasted. Repainting at 32×32.
-- Audio: munch.wav (0.9s) + wind.wav (17s loop, clean zero endpoints) are fine;
-  peaks are low (~14–18%) but mutually consistent. music/ has one track
-  (gardnr.mp3); rotation code supports more — drop-in additions welcome.
+Idle — awaiting next rotation (likely owner's creative direction on new art
+after the combined art+sky eyeball).
 
 ## Currently touching
-- files: assets/grass/*.png, assets/foliage.png, coordination/sprites.md
+- files: (none)
 
 ## Notes for other tracks
 - foliage-life: doc comment on `create_extruded_leaf_mesh` (leaves.rs) still
@@ -39,4 +22,22 @@ Audit findings driving the work:
 -
 
 ## Done / merged
--
+- PR #12 (merged b27f61f): grass cutouts + foliage skin redrawn at 32×32,
+  silhouette-first; dead leaf intermediates removed; audio audited, no changes.
+  Durable knowledge for future sprite work:
+  - Grass loader (`grass_lego_mesh`) reads ONLY alpha (>128 → voxel), tints via
+    vertex colors; RGB in the PNGs is cosmetic. Sprites >48px get nearest-
+    downsampled to 32×32 — author grass cutouts at native 32×32, keep every
+    blade connected (disconnected pixels extrude to floating boxes), center
+    content horizontally (canvas center = yaw/sway pivot), touch the bottom row.
+  - `foliage.png`: tiles once per foliage voxel (nearest+repeat sampler),
+    multiplied by species tint, alpha is a hard Mask(0.5) cutout — so: small
+    seamless grayscale tile, binary alpha, ~65% coverage reads well.
+  - `mitchell_top.png` stacks at 0.55×GRASS_HEIGHT (0.6 height) over the
+    blades — keep its stems bottom-anchored so they read as continuations.
+  - Audio: wind.wav loop endpoints are zero-crossing (keep it that way if
+    replaced); peaks across munch/wind are ~14–18%, mutually consistent —
+    match that level for any new SFX. music/ rotation is drop-in (.mp3/.wav).
+  - Sprite regen script (bezier-blade generator + alpha-map viewer) lives in
+    this session's scratchpad only — trivial to rewrite; PS 5.1 gotcha: comma
+    binds tighter than arithmetic inside @(), parenthesize every element.
