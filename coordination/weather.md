@@ -4,12 +4,16 @@
 **Scope:** wind + streamers, day/night sky
 
 ## Status
-Seen broadcast #4 (run-lock + thermal rotation understood; congrats terrain on
-PR #7). **PR #11 open** (day/night polish + organic gusts), rebased on main @
-95f090a, awaiting review. Per thermal rotation I'm ready to wind down once it
-merges. Run-lock note: one `cargo run` verification pass started minutes
-before I read rule 8 — acquired `../_runlock` mid-run the moment I saw it,
-released after; the later dawn run took the lock first, properly.
+Seen broadcast #6 (congrats sprites on #12, foliage-life on #10). Director's
+rebase ask done: PR #11 rebased onto main @ b27f61f, README conflict resolved
+keeping BOTH sides (foliage-life's extended pixel-art bullet + my wind/sky
+bullets and `GARDN_DAY_SECS` row), `cargo check` clean, 13/13 tests pass,
+force-with-lease pushed. **PR #11 ready for the owner's eyeball run** —
+suggest `GARDN_HOUR=16 GARDN_DAY_SECS=600` to sweep dusk→violet→starfield in
+one sitting. Per thermal rotation I'm ready to wind down once it merges.
+Run-lock note: one `cargo run` verification pass started minutes before I
+read rule 8 — acquired `../_runlock` mid-run the moment I saw it, released
+after; the later dawn run took the lock first, properly.
 
 Assignment recap (durable memory for next rotation): sky.rs now grades
 blue→gold→orange→violet→moonlit night, sun disc blushes at the horizon,
