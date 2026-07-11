@@ -29,8 +29,9 @@ eyeball, run-lock untouched).
   core change needed): arid = AridOutback+Pilbara, coastal = CoastalBush+
   Mediterranean+Tasmania. Savanna/TemperateForest neutral.
 
-**PR 2 (procedural clouds) ready on stacked branch `weather-clouds`** (base =
-`weather`, per PLAYBOOK #15 — will rebase onto main when #17 squash-merges).
+**PR #19 open (procedural clouds, PR 2 of 2)** — stacked branch
+`weather-clouds`, base = `weather`, per PLAYBOOK #15; will rebase onto main
+when #17 squash-merges.
 Blob-puff formations at altitude with per-type silhouettes, camera-anchored
 field drifting with live wind, cirrostratus veil disc, overcast sky
 dimming/graying, rain streaks, lightning flashes (StormLight resource, sky.rs
