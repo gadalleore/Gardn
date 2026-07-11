@@ -5,8 +5,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::australia::{biome_at_world, biome_profile, AussieBiome};
 use crate::topography::{
-    cave_cell_noise, cave_from_noise, cave_never_opens, dirt_depth_voxels,
-    surface_height_voxels, CAVE_CELL_VOXELS, DIGGABLE_DEPTH_VOXELS,
+    boulders_near_chunk, cave_cell_noise, cave_from_noise, cave_never_opens,
+    dirt_depth_voxels, is_dirt_tunnel_cell, surface_height_voxels, CAVE_CELL_VOXELS,
+    DIGGABLE_DEPTH_VOXELS,
 };
 use crate::world::{
     GardenRng, CHUNK_DEPTH_VOXELS, CHUNK_SIZE, CHUNK_VOXELS, SEA_LEVEL_VOXEL_Y, VOXEL_SIZE,
@@ -343,9 +344,15 @@ pub fn generate_chunk_blocks(
     // The box floor sits a full diggable depth below the LOWEST surface either
     // measure reports — so every land column's bedrock band (surface-relative,
     // matching collision) lies fully inside the box and above the carve floor.
+    // The ceiling grows to fit any boulder dome poking above the terrain.
+    let boulders = boulders_near_chunk(coord);
+    let box_top = boulders
+        .iter()
+        .map(|b| b.center.y + b.radius.y)
+        .fold(max_h, i32::max);
     let chunk_floor = min_h.min(if min_sf == i32::MAX { min_h } else { min_sf })
         - DIGGABLE_DEPTH_VOXELS;
-    let mut voxels = ChunkVoxels::new(CHUNK_VOXELS, CHUNK_VOXELS, chunk_floor, max_h);
+    let mut voxels = ChunkVoxels::new(CHUNK_VOXELS, CHUNK_VOXELS, chunk_floor, box_top);
 
     let veins = plan_ore_veins(coord, terrain_seed, &profile, &mut rng, min_h, chunk_floor);
 
@@ -409,9 +416,107 @@ pub fn generate_chunk_blocks(
         }
     }
 
+    // Boulders: stamp each ellipsoid (they arrive in WORLD voxels and may
+    // straddle chunk borders — the world-lattice hash keeps both sides
+    // agreeing). Every covered column is filled from the dome down to the
+    // ground, so a surfacing giant is a rooted rock, never an overhang with
+    // phantom air beneath it — collision's column model stays exact.
+    let base_vx = coord.x * CHUNK_VOXELS;
+    let base_vz = coord.y * CHUNK_VOXELS;
+    // Post-boulder solid top per column — the cave sweep must consider dome
+    // voxels above the terrain surface too, or collision (which asks about
+    // every solid voxel) could disagree with generation up there.
+    let mut col_top = heights.clone();
+    for b in &boulders {
+        let x0 = (b.center.x - b.radius.x - base_vx).max(0);
+        let x1 = (b.center.x + b.radius.x - base_vx).min(CHUNK_VOXELS - 1);
+        let z0 = (b.center.z - b.radius.z - base_vz).max(0);
+        let z1 = (b.center.z + b.radius.z - base_vz).min(CHUNK_VOXELS - 1);
+        for lz in z0..=z1 {
+            for lx in x0..=x1 {
+                let i = lz as usize * cols + lx as usize;
+                if sea_mask[i] {
+                    continue;
+                }
+                let dx = (base_vx + lx - b.center.x) as f32 / b.radius.x as f32;
+                let dz = (base_vz + lz - b.center.z) as f32 / b.radius.z as f32;
+                let rem = 1.0 - dx * dx - dz * dz;
+                if rem <= 0.0 {
+                    continue;
+                }
+                let half = (b.radius.y as f32 * rem.sqrt()) as i32;
+                let y1 = (b.center.y + half).min(voxels.y_max);
+                let y0 = (b.center.y - half).max(chunk_floor + 2);
+                let h = heights[i];
+                // Root the dome into the ground below it.
+                for y in (h + 1).min(y0)..=y1 {
+                    voxels.set(lx, y, lz, BlockType::Stone);
+                }
+                col_top[i] = col_top[i].max(y1);
+            }
+        }
+    }
+
     // Stamp ore veins directly over their bounding boxes instead of testing
     // every voxel against every vein (was ~25M checks/chunk, all underground).
     stamp_ore_veins(&mut voxels, &veins);
+
+    // Dirt worm-highways: on the tunnel web, rock cells below the dirt band
+    // turn back into the biome's dirt. Solid, invisible, zero mesh cost —
+    // found by digging, then followed by chewing (the highway is edible, the
+    // rock around it is not). Runs after ore so a vein never blocks a highway.
+    {
+        let carve_floor = chunk_floor + 2;
+        let y_lattice = carve_floor.div_euclid(CAVE_CELL_VOXELS) * CAVE_CELL_VOXELS;
+        for lz in (0..CHUNK_VOXELS).step_by(CAVE_CELL_VOXELS as usize) {
+            for lx in (0..CHUNK_VOXELS).step_by(CAVE_CELL_VOXELS as usize) {
+                // Tunnels live strictly below the dirt: the tallest rock top
+                // in this 4×4 block bounds the sweep.
+                let mut block_rock_top = i32::MIN;
+                for dz in 0..CAVE_CELL_VOXELS {
+                    for dx in 0..CAVE_CELL_VOXELS {
+                        let i = (lz + dz) as usize * cols + (lx + dx) as usize;
+                        if !sea_mask[i] {
+                            block_rock_top = block_rock_top
+                                .max(heights[i] - col_dirt[i] - SOFT_ROCK_CAP_VOXELS);
+                        }
+                    }
+                }
+
+                let mut y = y_lattice;
+                while y <= block_rock_top {
+                    if is_dirt_tunnel_cell(base_vx + lx, y, base_vz + lz) {
+                        for dz in 0..CAVE_CELL_VOXELS {
+                            for dx in 0..CAVE_CELL_VOXELS {
+                                let (cx, cz) = (lx + dx, lz + dz);
+                                let i = cz as usize * cols + cx as usize;
+                                if sea_mask[i] {
+                                    continue;
+                                }
+                                let rock_top =
+                                    heights[i] - col_dirt[i] - SOFT_ROCK_CAP_VOXELS;
+                                let bedrock_top =
+                                    col_surface[i] - DIGGABLE_DEPTH_VOXELS + 2;
+                                let dirt = columns[i].subsurface;
+                                for dy in 0..CAVE_CELL_VOXELS {
+                                    let cy = y + dy;
+                                    if cy > rock_top || cy <= bedrock_top {
+                                        continue;
+                                    }
+                                    match voxels.get(cx, cy, cz) {
+                                        Some(BlockType::Bedrock) | Some(BlockType::Water)
+                                        | None => {}
+                                        Some(_) => voxels.set(cx, cy, cz, dirt),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    y += CAVE_CELL_VOXELS;
+                }
+            }
+        }
+    }
 
     // Carve the cave web — after ore stamping, so veins gleam in cave walls.
     // The noise is decided once per 8-inch lattice cell in world space
@@ -428,13 +533,14 @@ pub fn generate_chunk_blocks(
     let y_start = carve_floor.div_euclid(CAVE_CELL_VOXELS) * CAVE_CELL_VOXELS;
     for lz in (0..CHUNK_VOXELS).step_by(CAVE_CELL_VOXELS as usize) {
         for lx in (0..CHUNK_VOXELS).step_by(CAVE_CELL_VOXELS as usize) {
-            // The tallest fill in this 4×4 column block bounds the y sweep.
+            // The tallest solid fill (terrain or boulder dome) in this 4×4
+            // column block bounds the y sweep.
             let mut block_max_h = i32::MIN;
             for dz in 0..CAVE_CELL_VOXELS {
                 for dx in 0..CAVE_CELL_VOXELS {
                     let i = (lz + dz) as usize * cols + (lx + dx) as usize;
                     if !sea_mask[i] {
-                        block_max_h = block_max_h.max(heights[i]);
+                        block_max_h = block_max_h.max(col_top[i]);
                     }
                 }
             }
@@ -1111,10 +1217,102 @@ mod tests {
             }
         }
         assert!(sampled > 0, "no land columns sampled");
+        // Not 100%: the dirt worm-highways deliberately thread edible dirt
+        // through the rock band (~10% of its volume).
         assert!(
-            rocky_below_dirt * 100 >= sampled * 95,
-            "below the dirt band should be rock: {rocky_below_dirt}/{sampled}"
+            rocky_below_dirt * 100 >= sampled * 70,
+            "below the dirt band should be mostly rock: {rocky_below_dirt}/{sampled}"
         );
+    }
+
+    /// The rock band is threaded with SOLID dirt tunnels — the worm highways.
+    /// Present at a discoverable density, nowhere near replacing the rock.
+    #[test]
+    fn dirt_highways_thread_the_rock() {
+        use crate::topography::dirt_depth_voxels;
+        let mut edible = 0u64;
+        let mut solid = 0u64;
+        for coord in [IVec2::new(3, -1), IVec2::new(10, 7)] {
+            let origin = chunk_world_origin(coord);
+            let voxels = generate_chunk_blocks(coord, origin, chunk_seed(WORLD_SEED, coord));
+            for lz in (0..CHUNK_VOXELS).step_by(3) {
+                for lx in (0..CHUNK_VOXELS).step_by(3) {
+                    let wx = origin.x + (lx as f32 + 0.5) * VOXEL_SIZE;
+                    let wz = origin.z + (lz as f32 + 0.5) * VOXEL_SIZE;
+                    if biome_at_world(wx, wz) == AussieBiome::Ocean {
+                        continue;
+                    }
+                    let h = crate::topography::surface_height_voxels(wx, wz);
+                    let rock_top = h - dirt_depth_voxels(wx, wz) - SOFT_ROCK_CAP_VOXELS;
+                    let bedrock_top = h - crate::topography::DIGGABLE_DEPTH_VOXELS + 2;
+                    for y in (bedrock_top + 1)..=rock_top.min(h) {
+                        match voxels.get(lx, y, lz) {
+                            Some(b) => {
+                                solid += 1;
+                                if b.worm_edible() {
+                                    edible += 1;
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                }
+            }
+        }
+        assert!(solid > 10_000, "rock band too small to judge ({solid} cells)");
+        let frac = edible as f64 / solid as f64;
+        assert!(
+            (0.03..0.30).contains(&frac),
+            "dirt-highway share of the rock band is {frac:.3} — should be \
+             discoverable (>3%) without dissolving the rock (<30%)"
+        );
+    }
+
+    /// Boulders exist: somewhere in a modest scan there's a giant surfacing
+    /// as a visible rock (column tops in Stone), and small rocks sit buried
+    /// in the dirt. Both are world-lattice driven, so this is deterministic
+    /// for a fixed WORLD_SEED.
+    #[test]
+    fn boulders_dot_the_landscape() {
+        use crate::topography::dirt_depth_voxels;
+        let mut surfaced = false;
+        let mut buried = false;
+        'scan: for cz in 0..5 {
+            for cx in 0..5 {
+                let coord = IVec2::new(cx * 3, cz * 3 - 1);
+                let origin = chunk_world_origin(coord);
+                let voxels =
+                    generate_chunk_blocks(coord, origin, chunk_seed(WORLD_SEED, coord));
+                let tops = voxels.column_tops();
+                for lz in 0..CHUNK_VOXELS {
+                    for lx in 0..CHUNK_VOXELS {
+                        let top = tops[(lz * CHUNK_VOXELS + lx) as usize];
+                        if top < voxels.y_min {
+                            continue;
+                        }
+                        // Only boulders put Stone at a column's very top.
+                        if voxels.get(lx, top, lz) == Some(BlockType::Stone) {
+                            surfaced = true;
+                        } else {
+                            let wx = origin.x + (lx as f32 + 0.5) * VOXEL_SIZE;
+                            let wz = origin.z + (lz as f32 + 0.5) * VOXEL_SIZE;
+                            let dirt = dirt_depth_voxels(wx, wz);
+                            for y in (top - dirt + 1)..top {
+                                if voxels.get(lx, y, lz) == Some(BlockType::Stone) {
+                                    buried = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if surfaced && buried {
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(surfaced, "no giant rock surfaces anywhere in a 25-chunk scan");
+        assert!(buried, "no small rocks buried in the dirt in a 25-chunk scan");
     }
 
     /// A chunk straddling the coastline must carry BOTH sea and land columns,

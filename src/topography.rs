@@ -213,6 +213,107 @@ pub(crate) fn dirt_depth_voxels(world_x: f32, world_z: f32) -> i32 {
     (frac * TREE_LENGTH_VOXELS as f32).round() as i32
 }
 
+/// Dirt tunnels — the worm highways threading the rock band. Same
+/// pinched-noise machinery as the caves but on its own seeds, wider cores,
+/// and flatter (stretched y) so they read as wandering horizontal passages.
+/// Crucially these are SOLID DIRT, not air: they cost zero mesh faces, the
+/// collision map doesn't change, and the worm discovers them by chewing —
+/// hit one while digging through rock and you can follow it for dozens of
+/// feet. Decided per cave-lattice cell in world space, seamless across
+/// chunks. Width 0.16 measured ≈ 8–12% of rock-band volume.
+pub(crate) fn is_dirt_tunnel_cell(world_vx: i32, world_vy: i32, world_vz: i32) -> bool {
+    let q = |v: i32| v.div_euclid(CAVE_CELL_VOXELS) * CAVE_CELL_VOXELS + CAVE_CELL_VOXELS / 2;
+    let (cx, cy, cz) = (q(world_vx), q(world_vy), q(world_vz));
+    let c = world_to_continental(cx as f32 * VOXEL_SIZE, cz as f32 * VOXEL_SIZE);
+    let y_ft = cy as f32 * VOXEL_SIZE;
+    let n1 = fbm3(c.x / 14.0, y_ft / 6.0, c.y / 14.0, seed(45), 2);
+    let n2 = fbm3(c.x / 18.0, y_ft / 7.5, c.y / 18.0, seed(46), 2);
+    n1.abs().max(n2.abs()) < 0.16
+}
+
+/// One procedural rock clump. Coordinates are WORLD voxels; the ellipsoid is
+/// stamped into any chunk it overlaps, so clumps cross chunk borders
+/// seamlessly (everything derives from a world-space lattice hash).
+pub(crate) struct Boulder {
+    pub(crate) center: bevy::math::IVec3,
+    pub(crate) radius: bevy::math::IVec3,
+}
+
+/// Boulders whose ellipsoids could overlap the given chunk. Two tiers on
+/// jittered world lattices: sparse GIANTS (2–8 ft, ~1 per couple of chunks,
+/// a third of them surfacing as visible rocks in the landscape) and common
+/// small rocks souped invisibly through the dirt (worm-scale obstacles —
+/// they refuse the bite, so digs detour around them). Ocean cells spawn
+/// nothing.
+pub(crate) fn boulders_near_chunk(chunk_coord: bevy::math::IVec2) -> Vec<Boulder> {
+    use crate::world::{chunk_world_origin, GardenRng, CHUNK_VOXELS, WORLD_SEED};
+    use bevy::math::{IVec2, IVec3};
+
+    let origin = chunk_world_origin(chunk_coord);
+    // (lattice cell size in voxels, max radius, presence, surfacing share,
+    //  radius range ft, tier salt)
+    const TIERS: [(i32, f32, f32, (f32, f32), u64); 2] = [
+        (96, 0.22, 0.33, (2.0, 8.0), 0xB0_71DE55),
+        (32, 0.18, 0.08, (0.8, 2.2), 0x570_5E5),
+    ];
+
+    let base_vx = chunk_coord.x * CHUNK_VOXELS;
+    let base_vz = chunk_coord.y * CHUNK_VOXELS;
+    let mut out = Vec::new();
+
+    for (cell, presence, surfacing, (r_lo, r_hi), salt) in TIERS {
+        let max_r = (r_hi * VOXELS_PER_FOOT as f32).ceil() as i32;
+        let c0 = IVec2::new(
+            (base_vx - max_r).div_euclid(cell),
+            (base_vz - max_r).div_euclid(cell),
+        );
+        let c1 = IVec2::new(
+            (base_vx + CHUNK_VOXELS + max_r).div_euclid(cell),
+            (base_vz + CHUNK_VOXELS + max_r).div_euclid(cell),
+        );
+        for cz in c0.y..=c1.y {
+            for cx in c0.x..=c1.x {
+                let mut rng = GardenRng::new(
+                    WORLD_SEED
+                        ^ salt
+                        ^ (cx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        ^ (cz as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F),
+                );
+                if !rng.chance(presence) {
+                    continue;
+                }
+                let vx = cx * cell + (rng.next_f32() * cell as f32) as i32;
+                let vz = cz * cell + (rng.next_f32() * cell as f32) as i32;
+                let wx = vx as f32 * VOXEL_SIZE;
+                let wz = vz as f32 * VOXEL_SIZE;
+                if biome_at_world(wx, wz) == AussieBiome::Ocean {
+                    continue;
+                }
+
+                let rx = (rng.range(r_lo, r_hi) * VOXELS_PER_FOOT as f32) as i32;
+                let rz = (rng.range(r_lo, r_hi) * VOXELS_PER_FOOT as f32) as i32;
+                let ry = ((rx + rz) as f32 * rng.range(0.30, 0.45)) as i32;
+                let surf = surface_height_voxels(wx, wz);
+                let vy = if rng.chance(surfacing) {
+                    // Poking out of the ground: about two-thirds of the dome
+                    // shows — a visible giant rock in the landscape.
+                    surf - ry / 3
+                } else {
+                    // Buried in the dirt band (or the rock below, where the
+                    // dirt runs shallow — invisible there, harmless).
+                    let dirt = dirt_depth_voxels(wx, wz).max(8);
+                    surf - ((0.25 + 0.6 * rng.next_f32()) * dirt as f32) as i32 - ry / 4
+                };
+                out.push(Boulder {
+                    center: IVec3::new(vx, vy, vz),
+                    radius: IVec3::new(rx.max(2), ry.max(2), rz.max(2)),
+                });
+            }
+        }
+    }
+    out
+}
+
 /// The noise trio for one cave lattice cell, computed once and reused by every
 /// column the cell covers. Generation carves from this + each column's own
 /// surface, so the chunk builder and the worm's collision probe answer the
