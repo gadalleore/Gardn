@@ -9,8 +9,8 @@ weather inbox in full including all rotation-2 re-scope + refinement + altitude
 notes (2026-07-12 corrected). **Rebuilt the cloud system local + blocky per the
 owner's sharpened direction.**
 
-**PR (local blocky clouds v1) — branch `weather-local-clouds` off main.**
-Retires #17/#19's global-scalar + icosphere model (leave those open as
+**PR #25 open (local blocky clouds v1) — branch `weather-local-clouds` off
+main.** Retires #17/#19's global-scalar + icosphere model (leave those open as
 reference per director). What's here:
 - **Seasons** — kept verbatim from #17 (owner: pure win). `SeasonClock`.
 - **The procession brain** — kept verbatim (phases, exact odds, winter/arid/
