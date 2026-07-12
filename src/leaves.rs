@@ -1,7 +1,10 @@
 //! Collectible ground leaves: a 3D mesh extruded from the enhanced leaf PNG's
-//! silhouette, scattered per chunk (and a hand-placed welcome set at spawn),
-//! bobbing and spinning in the wind. Sized to match a grass clump. Eating them
-//! lives with the worm (see `eat_leaves`); this module owns their look and life.
+//! silhouette, scattered per chunk (and a hand-placed welcome set at spawn).
+//! They ride the wind — drifting downwind across the ground, faster in gusts,
+//! and wrapping back around at range so a chunk's litter keeps blowing about
+//! instead of all sailing off to the horizon. Sized to match a grass clump.
+//! Eating them lives with the worm (see `eat_leaves`); this module owns their
+//! look and life.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::prelude::*;
@@ -37,16 +40,34 @@ struct FloatingLeaf {
     bob_speed: f32,
     spin_speed: f32,
     base_rotation: Quat, // artistic starting orientation
-    /// Grow-in clock, seconds: starts negative (per-leaf stagger), counts up;
-    /// full-size past LEAF_GROW_SECS. Streamed leaves swell in, not pop in.
-    grow: f32,
+    /// Accumulated horizontal travel (feet) away from (base_x, base_z): the wind
+    /// integrates into this every frame so the leaf actually *goes* somewhere.
+    /// Each component wraps within ±LEAF_DRIFT_WRAP so the leaf recycles across
+    /// its patch rather than drifting away forever — but the wrap only fires
+    /// off-screen (see animate_floating_leaves). Seeded to a random offset so a
+    /// chunk's leaves are spread across the box, not marching in lockstep.
+    drift: Vec2,
+    /// Persistence gate. A streamed leaf starts hidden (`false`, scale 0) and
+    /// flips to shown the first frame it's out of the player's view — so it's
+    /// simply *there*, full size, by the time it rotates in, never popping in
+    /// on-screen. Once shown it stays shown. The hand-placed welcome set starts
+    /// shown (it's the world's opening state, not a mid-play arrival).
+    revealed: bool,
 }
 
-/// Freshly streamed leaves swell from nothing to full size over this long,
-/// each after its own random stagger — a chunk's litter settles in as a
-/// scatter of arrivals instead of one simultaneous pop.
-const LEAF_GROW_SECS: f32 = 0.7;
-const LEAF_GROW_STAGGER: f32 = 0.8;
+/// Downwind travel speed, feet/sec per unit of wind strength (`Wind::strength`
+/// runs 0..5 and already breathes with gusts/lulls). A stiff breeze skitters
+/// leaves along; a full gale really moves them.
+const LEAF_DRIFT_SPEED: f32 = 0.9;
+/// A leaf never strays more than this far (feet) from its spawn point along
+/// either axis: past it, its drift wraps to the upwind side so the litter
+/// streams across its own patch and recycles instead of all blowing to the
+/// horizon and stranding the chunk bare. Kept modest so terrain barely changes
+/// across the box (the fixed hover height reads as "along the ground") and so a
+/// leaf stays near its chunk — it despawns cleanly, and off-screen, when that
+/// chunk unloads. In view the leaf holds at this edge; the wrap waits for
+/// off-screen so the ±2×WRAP jump is never seen.
+const LEAF_DRIFT_WRAP: f32 = 7.0;
 
 /// Shared handles for the extruded-PNG leaf so every chunk can scatter copies.
 #[derive(Resource)]
@@ -146,8 +167,16 @@ fn spawn_textured_leaves(commands: &mut Commands, leaf_assets: &LeafAssets) {
                 bob_speed,
                 spin_speed,
                 base_rotation: *base_rot,
-                // Welcome set staggers by index — a little cascade at spawn.
-                grow: -(i as f32) * 0.15,
+                // Spread the handful of welcome leaves across the drift box so
+                // they don't slide the wind in lockstep (they all integrate the
+                // same wind vector — a shared start = a rigid sheet).
+                drift: Vec2::new(
+                    (i as f32 * 2.3).sin() * LEAF_DRIFT_WRAP,
+                    (i as f32 * 3.7).cos() * LEAF_DRIFT_WRAP,
+                ),
+                // The welcome leaves ARE the opening view — already present, not
+                // a mid-play arrival, so they show from the first frame.
+                revealed: true,
             },
         ));
     }
@@ -229,56 +258,141 @@ pub(crate) fn scatter_chunk_leaves(
                     bob_speed: rng.range(1.2, 2.4),
                     spin_speed: rng.range(0.45, 1.3),
                     base_rotation: base_rot,
-                    grow: -rng.range(0.0, LEAF_GROW_STAGGER),
+                    // Random start across the drift box so the chunk's leaves
+                    // are spread along their travel, not marching together.
+                    drift: Vec2::new(
+                        rng.range(-LEAF_DRIFT_WRAP, LEAF_DRIFT_WRAP),
+                        rng.range(-LEAF_DRIFT_WRAP, LEAF_DRIFT_WRAP),
+                    ),
+                    // Streamed in during play — stay hidden until off-screen so
+                    // the arrival is never seen (it reveals behind the camera).
+                    revealed: false,
                 },
             ));
         }
     });
 }
 
+/// Fold an accumulated drift offset back into the range [-wrap, wrap]. A leaf
+/// that travels off one side of its patch re-enters the opposite side, so the
+/// litter recycles across the ground forever with no bookkeeping and no
+/// despawn/respawn churn. `rem_euclid` gives a non-negative remainder even for
+/// negative drift (upwind gusts), so the seam is continuous in both directions.
+fn wrap_drift(v: f32, wrap: f32) -> f32 {
+    (v + wrap).rem_euclid(2.0 * wrap) - wrap
+}
+
+/// Conservative "is this leaf safely OUT of the player's view?" test, in the
+/// ground plane. Every appearance/disappearance is gated on it so none is ever
+/// seen (owner: leaves are persistent — they reveal, despawn, and wind-recycle
+/// only off-screen). A leaf counts as out of view only when it sits clearly
+/// BEHIND the camera — the direction to it points more than ~99° off the look
+/// direction — so anything on screen, even far in the side periphery, is left
+/// untouched. Deliberately errs toward "visible": near-vertical look (heading
+/// ill-defined) or a leaf right on the camera both return false.
+fn leaf_out_of_view(cam_pos: Vec2, cam_fwd: Vec2, leaf: Vec2) -> bool {
+    let fwd_len = cam_fwd.length();
+    if fwd_len < 0.05 {
+        return false; // looking near-straight up/down: no usable heading
+    }
+    let to_leaf = leaf - cam_pos;
+    let d = to_leaf.length();
+    if d < 0.001 {
+        return false;
+    }
+    (to_leaf / d).dot(cam_fwd / fwd_len) < -0.15
+}
+
 /// Animates the floating 3D leaves (now with real thickness).
-/// They bob and spin — and they answer the wind: drifting downwind, leaning
-/// with it, and spinning faster the harder it blows.
+/// The headline: they *travel*. Each frame the wind vector integrates into the
+/// leaf's accumulated drift so it skates downwind across the ground, faster in
+/// gusts, recycling within ±LEAF_DRIFT_WRAP instead of sailing off forever. On
+/// top of the travel they bob, lean into the wind, and tumble — a gentle
+/// end-over-end, not a spin-in-place top.
+///
+/// Persistence: leaves are stable from the worm's eye — a streamed leaf holds
+/// hidden until it's off-screen, then it's simply there; and the drift wrap
+/// (a ±2×WRAP jump) also waits for off-screen. Both use `leaf_out_of_view`, so
+/// nothing ever winks in, out, or teleports while you're looking at it.
 fn animate_floating_leaves(
     time: Res<Time>,
     wind: Res<Wind>,
-    mut query: Query<(&mut Transform, &mut FloatingLeaf)>,
+    cam_q: Query<&Transform, (With<Camera>, Without<FloatingLeaf>)>,
+    mut query: Query<(&mut Transform, &GlobalTransform, &mut FloatingLeaf)>,
 ) {
     let t = time.elapsed_secs();
     let dt = time.delta_secs();
     let force = wind.strength / 5.0;
     let lean_axis = Vec3::new(-wind.dir.y, 0.0, wind.dir.x);
 
-    for (mut transform, mut floating) in &mut query {
-        // Grow-in: negative while waiting out the stagger, saturates at full
-        // size. Unconditional add + min beats a per-leaf branch.
-        floating.grow = (floating.grow + dt).min(LEAF_GROW_SECS);
-        let g = (floating.grow / LEAF_GROW_SECS).clamp(0.0, 1.0);
-        let swell = g * g * (3.0 - 2.0 * g); // smoothstep
-        transform.scale = Vec3::splat(floating.base_scale * swell);
+    // Feet of downwind travel this frame — the whole field shares it (they only
+    // differ by where in the wrap box they started), so compute it once.
+    let step = wind.dir * (LEAF_DRIFT_SPEED * wind.strength * dt);
+
+    // Camera position + forward heading in the ground plane, for the view gate.
+    // No camera (shouldn't happen mid-play) ⇒ treat every leaf as visible, which
+    // freezes all reveals/wraps — the safe direction (never a seen transition).
+    let cam = cam_q.get_single().ok();
+    let cam_pos = cam.map(|c| c.translation);
+    let cam_fwd = cam.map(|c| {
+        let f = c.forward();
+        Vec2::new(f.x, f.z)
+    });
+
+    for (mut transform, global, mut floating) in &mut query {
+        let out_of_view = match (cam_pos, cam_fwd) {
+            (Some(p), Some(f)) => {
+                let w = global.translation();
+                leaf_out_of_view(Vec2::new(p.x, p.z), f, Vec2::new(w.x, w.z))
+            }
+            _ => false,
+        };
+
+        // Reveal only off-screen: a hidden leaf stays scale 0 in view and snaps
+        // to full size the first frame it's behind the camera, so it's already
+        // there by the time it rotates back in. Once shown, always shown.
+        if out_of_view {
+            floating.revealed = true;
+        }
+        transform.scale = if floating.revealed {
+            Vec3::splat(floating.base_scale)
+        } else {
+            Vec3::ZERO
+        };
+
+        // Travel: integrate the wind into the drift accumulator. Recycle the
+        // wrap only off-screen — the ±2×WRAP jump would be a teleport if seen —
+        // and in view just hold at the box edge until the leaf falls behind.
+        floating.drift += step;
+        if out_of_view {
+            floating.drift.x = wrap_drift(floating.drift.x, LEAF_DRIFT_WRAP);
+            floating.drift.y = wrap_drift(floating.drift.y, LEAF_DRIFT_WRAP);
+        } else {
+            floating.drift.x = floating.drift.x.clamp(-LEAF_DRIFT_WRAP, LEAF_DRIFT_WRAP);
+            floating.drift.y = floating.drift.y.clamp(-LEAF_DRIFT_WRAP, LEAF_DRIFT_WRAP);
+        }
 
         // Gentle vertical bob, a little choppier when the wind is up.
         let bob = (t * floating.bob_speed * (1.0 + force * 0.8) + floating.phase).sin() * 0.20;
+        transform.translation.x = floating.base_x + floating.drift.x;
+        transform.translation.z = floating.base_z + floating.drift.y;
         transform.translation.y = floating.base_y + bob;
 
-        // Downwind drift: tethered to the spawn point, straining with gusts.
-        let drift = force * (0.22 + 0.12 * (t * 1.3 + floating.phase).sin());
-        transform.translation.x = floating.base_x + wind.dir.x * drift;
-        transform.translation.z = floating.base_z + wind.dir.y * drift;
-
-        // Spin around Y — a gale whips leaves into a proper twirl.
-        let spin = Quat::from_rotation_y(
-            t * floating.spin_speed * (1.0 + force * 1.6) + floating.phase * 0.5,
+        // A slow tumble as it blows — scaled right down from the old in-place
+        // twirl (the owner wanted travel, not a spinning top) and quickened only
+        // a little by the wind so a gale reads as tumbling faster.
+        let tumble = Quat::from_rotation_y(
+            t * floating.spin_speed * 0.35 * (1.0 + force) + floating.phase * 0.5,
         );
 
         // Combine:
         // - A downwind lean that grows with the wind
         // - The artistic base rotation the leaf was given at spawn
-        // - Y spin for rotation
+        // - The slow Y tumble
         // - Strong vertical orientation so the plane stands up instead of lying flat
         let lean = Quat::from_axis_angle(lean_axis, force * 0.4);
         let vertical_stand = Quat::from_rotation_x(-1.4);
-        transform.rotation = lean * spin * vertical_stand * floating.base_rotation;
+        transform.rotation = lean * tumble * vertical_stand * floating.base_rotation;
     }
 }
 
@@ -730,4 +844,69 @@ fn create_extruded_leaf_mesh(meshes: &mut Assets<Mesh>) -> Handle<Mesh> {
     mesh.insert_indices(Indices::U32(indices));
 
     meshes.add(mesh)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{leaf_out_of_view, wrap_drift};
+    use bevy::math::Vec2;
+
+    const W: f32 = 7.0;
+
+    // Camera at origin looking down +X (forward = (1,0)).
+    const CAM: Vec2 = Vec2::ZERO;
+    const FWD: Vec2 = Vec2::new(1.0, 0.0);
+
+    #[test]
+    fn leaf_dead_ahead_is_in_view() {
+        assert!(!leaf_out_of_view(CAM, FWD, Vec2::new(20.0, 0.0)));
+    }
+
+    #[test]
+    fn leaf_to_the_side_is_still_in_view() {
+        // 90° off forward — on-screen periphery must NOT be treated as hidden.
+        assert!(!leaf_out_of_view(CAM, FWD, Vec2::new(0.0, 20.0)));
+        assert!(!leaf_out_of_view(CAM, FWD, Vec2::new(0.0, -20.0)));
+    }
+
+    #[test]
+    fn leaf_clearly_behind_is_out_of_view() {
+        assert!(leaf_out_of_view(CAM, FWD, Vec2::new(-20.0, 0.0)));
+        // Behind and off to one side (well past 99°) also counts.
+        assert!(leaf_out_of_view(CAM, FWD, Vec2::new(-20.0, 5.0)));
+    }
+
+    #[test]
+    fn degenerate_inputs_err_toward_visible() {
+        // No usable heading (looking straight up) ⇒ never hide.
+        assert!(!leaf_out_of_view(CAM, Vec2::ZERO, Vec2::new(-20.0, 0.0)));
+        // Leaf sitting on the camera ⇒ never hide.
+        assert!(!leaf_out_of_view(CAM, FWD, CAM));
+    }
+
+    #[test]
+    fn drift_within_range_is_unchanged() {
+        for &v in &[-W, -3.0, 0.0, 2.5, W - 0.001] {
+            assert!((wrap_drift(v, W) - v).abs() < 1e-4, "v={v} should pass through");
+        }
+    }
+
+    #[test]
+    fn drift_wraps_past_the_far_edge() {
+        // A leaf just past +wrap re-enters just past -wrap (seamless, not clamped).
+        let just_over = W + 0.5;
+        assert!((wrap_drift(just_over, W) - (-W + 0.5)).abs() < 1e-4);
+        // And symmetrically off the upwind edge.
+        let just_under = -W - 0.5;
+        assert!((wrap_drift(just_under, W) - (W - 0.5)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn drift_always_lands_in_range_even_after_many_laps() {
+        // However far the wind has carried it, the result stays in [-wrap, wrap).
+        for &v in &[100.0, -100.0, 3.0 * W, -5.7 * W, 999.9] {
+            let r = wrap_drift(v, W);
+            assert!(r >= -W - 1e-4 && r < W + 1e-4, "v={v} -> {r} out of range");
+        }
+    }
 }

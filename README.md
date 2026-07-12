@@ -55,7 +55,11 @@ happens in — the hard part: a believable, streamable, gargantuan planet.
   leaves settle in drifts; both sprout/swell in as chunks stream instead of
   popping, and neither spawns in coastal shallows.
 - **Wind & gravity.** Trees and grass sway on a shared wind that gusts, lulls,
-  and slowly wanders the compass; grass bends away from the passing worm.
+  and slowly wanders the compass; grass bends away from the passing worm, and
+  collectible leaves drift downwind across the ground — faster in gusts, wrapping
+  back around so a patch keeps blowing about instead of stripping bare. Leaves are
+  persistent: they only ever appear, vanish, or recycle while off-screen, so the
+  leafscape never flickers in or out under the worm's gaze.
 - **A day/night sky.** A 24-hour clock walks the sun and full moon overhead —
   blue days grade through gold, orange, and violet twilight into a moonlit
   night under a wheeling starfield.
