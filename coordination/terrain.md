@@ -3,122 +3,64 @@
 **Owns:** src/terrain.rs, src/topography.rs
 **Scope:** voxel generation, meshing, heightfield, caves
 
-Seen broadcast #8.
+Seen broadcast #9.
 
 ## Status
-2026-07-11 (rotation 2):
-- **PR #18 MERGED** (main 028b132) — depth distribution, rock + bedrock,
-  `worm_edible()`, gen/collision cave alignment fix (zero mismatches).
-- **PR #21** (branch `terrain-boulders`, base `main`) — boulders + solid
-  dirt worm-highways. **Rebased onto main 028b132** (dropped the merged PR-A
-  commit) and **reshaped per director inbox / broadcast #8**: boulders are
-  now blocky CRAGGY clumps, not smooth ellipsoids (`Boulder::top_at` — lobed
-  footprint + subtractive surface crags). Verified in-game with a temporary
-  surfacing boost: they read as blocky rocky lumps up close, coarse when the
-  far-ground downsampler takes over (the intentional near=detail/far=coarse
-  LOD the owner asked for). Boost reverted. New test
-  `boulders_are_craggy_not_round` pins the non-round shape; the zero-mismatch
-  collision audit still passes with the craggy clumps.
-  - NB: old **#20 auto-closed** when its base branch `terrain` was deleted on
-    #18's merge (can't reopen a PR whose base is gone). #21 is the same work
-    against `main`; left a breadcrumb comment on #20.
-- **Director is handling all worm.rs routing** (the 4 one-liners + the
-  near-plane wall-poke, the core half of the clip-through) as a core PR —
-  confirmed in my inbox. I don't touch worm.rs.
+2026-07-12: **winding down (thermal rotation).** Rotation-2 geology arc is
+COMPLETE and merged — depth distribution, rock + bedrock, inedible rock,
+blocky craggy LOD boulders, and dirt worm-highways. Owner flew the boulders
+and loved them. Branch synced to main (ebbb87e). No open terrain work.
 
-Open question for the owner (director invited it): is 30 ft ("one tree
-length") the right dirt depth now that geology is the headline? I sized it
-to the smallest tree class; a bigger yardstick means a deeper diggable world
-(cost scales ~linearly). Happy to bump the one constant if wanted.
+While tidying I also dropped the now-obsolete `#[allow(dead_code)]` on
+`BlockType::worm_edible` (it's called from worm.rs now via core PR #22) —
+the director flagged it as a trivial next-time cleanup; done here in this
+wind-down. Bundled into the wind-down PR.
 
 ## Currently touching
-- files: (none — reshape pushed; awaiting review/merge)
+- files: (none)
 
-## Plan (director's suggested split)
-- **PR A — depth + rock + bedrock:** noise-driven dirt depth (P1 = bedrock
-  right below, mean = one tree length, P99 = two tree lengths, smooth at dig
-  scale), rock band + `Bedrock` block below, `BlockType::worm_edible()`,
-  deepened diggable band, and the gen-vs-collision cave alignment fix (see
-  findings). Regression tests pin the distribution percentiles and pin
-  gen/collision agreement to zero mismatches.
-- **PR B — boulders + dirt tunnels:** procedural rock clumps in the dirt
-  (some surfacing as giant rocks), dirt tunnels threading the rock band
-  (worm highways — they're solid dirt, so they cost zero mesh faces and are
-  discovered by digging).
+## Open question for the owner (director invited it)
+Is 30 ft ("one tree length") the right dirt-depth yardstick now that geology
+is the headline feature? I sized `TREE_LENGTH_VOXELS = 30 * VOXELS_PER_FOOT`
+to the smallest tree class (mallee/desert oak, 30–55 ft); a bigger yardstick
+(e.g. a river red gum) means a proportionally deeper diggable world. Cost
+scales ~linearly (see numbers below). It's one constant in topography.rs if
+the owner wants it bumped.
 
-## Key design decisions (dissent welcome)
-- **"One tree length" = 30 ft** (the smallest tree class in trees.rs is
-  30–55 ft; a river red gum yardstick would demand a 300-ft-deep world).
-  So: dirt mean 120 voxels, max 240; diggable band
-  `DIGGABLE_DEPTH_VOXELS = 290` (2 tree lengths + 12 ft rock + bedrock),
-  vs today's 48. Measured cost (release): chunk gen 8 ms → est ~70 ms, mesh
-  100 ms → est ~400 ms, all off-thread; bite latency rises similarly (async,
-  no frame hitch). I think that's a fair trade for the owner's spec; if the
-  fleet feels streaming slow down, the constant is one knob.
-- `CHUNK_DEPTH_VOXELS` in world.rs stays untouched (shared); the new depth
-  constant lives in topography.rs (my file) and worm.rs consumes it via the
-  routed lines below.
-
-## Findings — dig clip-through bug (owner repro: dig a hole → clip through)
-Two independent mechanisms, with measurements:
-
-1. **Phantom cave cells (terrain-side, I'm fixing it in PR A).** Collision
-   (`ColumnProbe::solid`) asks `is_cave_cell(vx, vy, vz, formula_surface)`
-   per column; generation carves caves per 4×4-column lattice cell using the
-   *cell-centre column's bilinearly-interpolated* height. Where they disagree,
-   collision believes air inside visibly solid ground. Audit over 4 chunks:
-   **130–190 phantom voxels per chunk, most within 12 voxels of the surface**
-   — the worm sinks/clips into ground there, and digging (which drops you
-   into that band) makes it far more likely. Also ~20k "ghost" voxels per
-   chunk (gen air, collision solid → invisible cave floors) from the
-   bedrock-band mismatch (`surface - 46` per column vs `min_h - 46` chunk
-   floor). Fix: generation now decides caves per column from the exact same
-   inputs collision uses (shared per-cell noise + per-column formula surface
-   + per-column bedrock), pinned by a zero-mismatch regression test.
-2. **Near-plane wall poke (core, worm.rs — routing, not touching).**
-   `fits()` in `worm_gravity` (worm.rs:258/330) tests only the camera's own
-   column — zero horizontal body radius — so the camera can legally rest
-   0 mm from a wall face. The camera near plane (Bevy default 0.1 ft = 1.2 in)
-   then renders inside the wall. Freshly dug holes surround you with walls,
-   so digging makes it constant. Same family: the roof clamp
-   `stand.min(ceiling - 0.03)` (worm.rs:389) parks the eye 0.36 in under a
-   roof, inside near-plane range. **Suggested core fix:** give `fits` a
-   horizontal margin ≥ the near plane (test the neighbouring column when the
-   camera is within ~0.12 ft of a column edge) and widen the roof clamp to
-   `ceiling - 0.12`. Happy to spec this in more detail if useful.
-
-## Needs / requests (flag the human) — exact routed lines for worm.rs
-Same protocol as the moat. Once PR A merges, worm.rs needs four one-liners
-(my side compiles and is safe without them, but digging stops at the old
-12-ft floor and rock is still edible until they land):
-
-1. worm.rs `ground_world_y` (line ~143):
-   `let bedrock = surface - CHUNK_DEPTH_VOXELS + 2;`
-   → `let bedrock = surface - crate::topography::DIGGABLE_DEPTH_VOXELS + 2;`
-2. worm.rs `ColumnProbe::at` (line ~184): same replacement.
-3. worm.rs `probe_and_carve` hit test (line ~583):
-   `if block != BlockType::Water && local.y > voxels.floor_y() {`
-   → `if block.worm_edible() && local.y > voxels.floor_y() {`
-4. worm.rs `probe_and_carve` ball carve (line ~633):
-   `if b == BlockType::Water || clocal.y <= voxels.floor_y() {`
-   → `if !b.worm_edible() || clocal.y <= voxels.floor_y() {`
-
-Optional/nice: docs/module-contracts.md terrain section gains
-`DIGGABLE_DEPTH_VOXELS`, `dirt_depth_voxels`, `BlockType::worm_edible`
-(human-routed doc). And the near-plane fix above is core's call.
+## Design notes (for whoever picks up terrain next)
+- **Depth authority:** `DIGGABLE_DEPTH_VOXELS` (topography.rs) = 290 voxels
+  (2 tree lengths + 12 ft rock + 2 bedrock). worm.rs collision consumes it,
+  so the diggable band and the bedrock floor stay in lockstep. `dirt_depth_voxels`
+  is the smooth per-column field (P1→0, P50→1 tree length, P99→2).
+- **Gen/collision agreement is load-bearing.** Caves, bedrock, boulders and
+  highways are all built per-column from the exact inputs worm.rs's
+  `ColumnProbe` uses; `generation_and_collision_agree_on_every_land_voxel`
+  pins it at ZERO mismatches. Keep any new underground feature column-based
+  and overhang-free, or the worm clips through. (That test caught the
+  original 130–190 phantom-voxels-per-chunk clip-through.)
+- **Measured cost (release):** the 4× deeper world runs chunk gen ~50 ms,
+  mesh ~460 ms, both off-thread; ~290k verts/chunk (budget 2.5M).
+- **Residual clip:** a diagonal clip against protruding dug-hole blocks
+  remains — core worm.rs collision, the director is fixing it. Not terrain's.
 
 ## Notes for other tracks
-- (carried from rotation 1) Real↔real chunk boundaries are provably sealed;
-  coastal per-column shoreline fixed in PR #7 with a regression test.
-- **foliage-life:** unchanged from last note — grass can still stand in
-  coastal shallows (`scatter_chunk_grass` has no per-spot ocean check).
-  After my PR B, giant surfacing boulders will appear in `column_tops`, so
-  grass may sprout on top of big rocks. Cosmetic; a block-type-aware check
-  isn't possible today (grass only gets tops), happy to expose more if wanted.
-- **trees:** tree placement (chunk_store.rs) samples the height formula;
-  surfacing boulders (PR B) may intersect the odd trunk base. Cosmetic,
-  flagging for awareness.
+- (rotation 1) Real↔real chunk boundaries are provably sealed; coastal
+  per-column shoreline fixed in PR #7 with a regression test.
+- **foliage-life:** grass can still stand in coastal shallows
+  (`scatter_chunk_grass` has no per-spot ocean check). Also, surfacing
+  boulders now appear in `column_tops`, so grass may sprout on top of big
+  rocks. Both cosmetic; a block-type-aware grass check isn't possible today
+  (grass only receives tops) — happy to expose more if wanted.
+- **trees:** tree placement (chunk_store.rs) samples the height formula, so a
+  surfacing boulder may intersect the odd trunk base. Cosmetic, flagging for
+  awareness.
 
 ## Done / merged
+- 2026-07-12: blocky craggy boulders + dirt worm-highways — PR #21 (ebbb87e).
+  (Superseded auto-closed #20 after its base branch was deleted on #18's merge.)
+- 2026-07-11: dirt-depth distribution, rock + bedrock, inedible rock, and the
+  gen/collision cave-alignment fix (root-caused the dig clip-through) — PR #18
+  (028b132). Core worm.rs hookup (rock refusal, deep dig, near-plane fix) was
+  the director's PR #22.
 - 2026-07-09: per-column coastline in `generate_chunk_blocks` — PR #7 (a0e6854).
 - 2026-07-09: flagged the silhouette-ring moat (fixed in core as PR #4).
