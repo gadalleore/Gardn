@@ -40,7 +40,10 @@ leaves rendering, no panic, no regression with the new camera query.
   — fine over the modest ±7 ft box; revisit if relief makes it read wrong.
 
 ## Currently touching
-- files: (PR 1 committed) src/leaves.rs, README.md (one bullet)
+- **PR #26 OPEN** (https://github.com/gadalleore/Gardn/pull/26) — leaves ride the
+  wind + persistence. Awaiting review/merge. files: src/leaves.rs, README.md.
+- Next once merged: PR 2 arc (growth/death/decay/sprouting; "no grass on rocks"
+  via topography::boulders_near_chunk — no routing needed, see Needs below).
 
 ## Notes for other tracks
 -
