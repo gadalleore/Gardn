@@ -9,8 +9,8 @@ Seen broadcast #8.
 2026-07-11 (rotation 2):
 - **PR #18 MERGED** (main 028b132) — depth distribution, rock + bedrock,
   `worm_edible()`, gen/collision cave alignment fix (zero mismatches).
-- **PR #20** (branch `terrain-boulders`) — boulders + solid dirt
-  worm-highways. **Rebased onto main 028b132** (dropped the merged PR-A
+- **PR #21** (branch `terrain-boulders`, base `main`) — boulders + solid
+  dirt worm-highways. **Rebased onto main 028b132** (dropped the merged PR-A
   commit) and **reshaped per director inbox / broadcast #8**: boulders are
   now blocky CRAGGY clumps, not smooth ellipsoids (`Boulder::top_at` — lobed
   footprint + subtractive surface crags). Verified in-game with a temporary
@@ -19,10 +19,12 @@ Seen broadcast #8.
   LOD the owner asked for). Boost reverted. New test
   `boulders_are_craggy_not_round` pins the non-round shape; the zero-mismatch
   collision audit still passes with the craggy clumps.
+  - NB: old **#20 auto-closed** when its base branch `terrain` was deleted on
+    #18's merge (can't reopen a PR whose base is gone). #21 is the same work
+    against `main`; left a breadcrumb comment on #20.
 - **Director is handling all worm.rs routing** (the 4 one-liners + the
   near-plane wall-poke, the core half of the clip-through) as a core PR —
   confirmed in my inbox. I don't touch worm.rs.
-- **PR #20 base is now `main`** (retargeting via gh after this push).
 
 Open question for the owner (director invited it): is 30 ft ("one tree
 length") the right dirt depth now that geology is the headline? I sized it
