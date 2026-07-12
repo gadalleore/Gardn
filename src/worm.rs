@@ -245,12 +245,25 @@ impl ColumnProbe<'_> {
 /// radius, just over the near plane, used by collision and the roof clamps.
 const NEAR_PLANE_MARGIN_FT: f32 = 0.12;
 
-/// True if the eye at (x, z, y) clears solid ground at its own column and one
-/// near-plane margin out along each horizontal axis (a thin body radius that
-/// keeps the near plane from poking through a wall face).
+/// True if the eye at (x, z, y) clears solid ground at its own column and a
+/// near-plane margin out in all 8 surrounding directions — a thin square body
+/// radius. The diagonals matter: a single voxel jutting out of a dug-hole wall
+/// sits at the corner *between* the cardinal probes, so a plus-shaped test let
+/// the eye walk right up to its edge and the near plane poked through. The full
+/// ring catches that corner.
 fn eye_clears(chunk_world: &ChunkWorld, x: f32, z: f32, y: f32) -> bool {
     const M: f32 = NEAR_PLANE_MARGIN_FT;
-    for (dx, dz) in [(0.0, 0.0), (M, 0.0), (-M, 0.0), (0.0, M), (0.0, -M)] {
+    for (dx, dz) in [
+        (0.0, 0.0),
+        (M, 0.0),
+        (-M, 0.0),
+        (0.0, M),
+        (0.0, -M),
+        (M, M),
+        (M, -M),
+        (-M, M),
+        (-M, -M),
+    ] {
         let col = ColumnProbe::at(chunk_world, x + dx, z + dz);
         if col.solid_at_ft(y) || col.solid_at_ft(y - WORM_EYE_HEIGHT * 0.6) {
             return false;
