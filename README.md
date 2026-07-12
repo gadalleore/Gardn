@@ -59,6 +59,17 @@ happens in — the hard part: a believable, streamable, gargantuan planet.
 - **A day/night sky.** A 24-hour clock walks the sun and full moon overhead —
   blue days grade through gold, orange, and violet twilight into a moonlit
   night under a wheeling starfield.
+- **Seasons & local weather.** An Australian season clock (day length never
+  changes — only the weather does) feeds a cloud "front director": sunny →
+  cirrostratus herald → one main cloud type → altostratus/stratus outro →
+  clear, with winter/arid/coast/wind modifiers and a morning-fog roll. The sky
+  is *local*, not a global switch: discrete **blocky voxel clouds** drift in on
+  the wind from a distance, clump together, and blow past — each a voxel clump
+  shaped to its type (flat treetop loaves, fluffy cumulus, towering
+  cumulonimbus giants, the high thin cirrus family under the topmost
+  cirrostratus veil) with a near/far LOD like the leaves. White until the sky
+  is more than half covered, then greying toward overcast. (Cloud shadows and
+  rain-under-clouds land in follow-up PRs.)
 - **A custom background-only distance blur** (`src/distance_blur.rs`): a
   from-scratch render pass that keeps the foreground razor sharp while the distant
   titans go dreamy — something a physical depth-of-field physically cannot do for
@@ -107,6 +118,9 @@ Handy env knobs for testing:
 | `GARDN_HOUR=0` | Start at night (any 0–23 hour works) |
 | `GARDN_DAY_SECS=120` | Compress the whole 24-h cycle into N real seconds — watch a full sunrise-to-starfield sweep in minutes |
 | `GARDN_HIGH=300` | Start 300 ft airborne — great for checking LODs and streaming |
+| `GARDN_SEASON=winter` | Pin the season (`summer`/`autumn`/`winter`/`spring`) |
+| `GARDN_CLOUDS=cumulonimbus` | Force an immediate cloud front of that type |
+| `GARDN_FOG=1` | Every morning's fog roll comes up foggy |
 
 ## How the code is organized
 
@@ -120,7 +134,7 @@ own systems, so parallel work doesn't collide in the schedule:
 | `streaming.rs` / `chunk_store.rs` | Chunk load/unload pipeline and persistence (core — runs in `main.rs`'s ordered chain) |
 | `trees.rs` / `foliage.rs` | Tree generation, LODs, wind sway |
 | `grass.rs` / `leaves.rs` | Extruded pixel-art grass and collectible leaves |
-| `weather.rs` / `sky.rs` | Wind gust system, day/night cycle |
+| `weather.rs` / `sky.rs` | Wind gusts, seasons + local blocky voxel clouds, day/night cycle |
 | `worm.rs` | The player: crawling, eating, burrowing |
 | `silhouettes.rs` / `distance_blur.rs` | Far-tree stand-ins and the custom background blur pass |
 | `world.rs` / `australia.rs` | Scale constants, geography, biome map |
