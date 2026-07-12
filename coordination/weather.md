@@ -11,7 +11,20 @@ owner's sharpened direction.**
 
 **PR #25 open (local blocky clouds v1) — branch `weather-local-clouds` off
 main.** Retires #17/#19's global-scalar + icosphere model (leave those open as
-reference per director). What's here:
+reference per director).
+
+**Review fix applied (2026-07-12):** reviewer flagged the high clouds (esp.
+cumulonimbus) sitting in the treetops. Root cause: trees here are TITANS (a
+mountain ash tops ~1000 ft) and my altitudes (140–740 ft) put clouds among the
+trunks. Fix: raised the whole layering above the canopy within the 1600 ft far
+plane — treetop loaves ~320–440, mid ~600–740, cirrus family ~880–940,
+cumulonimbus anvil ~1150, cirrostratus veil ~1250. Also set the cloud material
+`fog_enabled: false` so the high layers (now inside the 650–1350 ft distance
+fog) aren't washed out to sky; the distance-blur pass still softens far ones.
+30 tests pass; eyeballed airborne — clouds now sit up in the sky above the
+treetop line, not among the trunks.
+
+What's here:
 - **Seasons** — kept verbatim from #17 (owner: pure win). `SeasonClock`.
 - **The procession brain** — kept verbatim (phases, exact odds, winter/arid/
   coastal/wind modifiers, morning fog). Repurposed: its `front_order()`

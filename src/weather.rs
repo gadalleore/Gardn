@@ -958,21 +958,26 @@ struct FormParams {
 }
 
 fn form_params(form: FormKind) -> FormParams {
-    // Owner's altitude layering (2026-07-12, corrected): the sky stacks by
-    // type. Flat wide "loaves" skim the treetops (the low deck ~140–210 ft),
-    // the puffy and mid types ride higher, the thin cirrus family sits high,
-    // the cumulonimbus giants are the BIGGEST and tower highest of the *main*
-    // clouds (~690 ft), and the cirrostratus herald veil caps ABOVE them all
-    // as the topmost layer (~740 ft) — "above all of the clouds," per the spec.
+    // Owner's altitude layering (2026-07-12, corrected) — and the review fix:
+    // the trees are TITANS (a mountain ash tops ~1000 ft), so the whole sky had
+    // to move up to clear the treetops. Flat wide "loaves" skim the canopy
+    // (~320–440 ft), the puffy/mid types ride higher, the thin cirrus family
+    // sits high, the cumulonimbus giants are the BIGGEST and tower highest of
+    // the *main* clouds (anvil ~1150 ft), and the cirrostratus herald veil caps
+    // ABOVE them all (~1250 ft). Everything stays inside the camera's 1600 ft
+    // far plane even at the field's far edge — the guardrail the reviewer set.
+    // (Cloud material is `fog_enabled: false`, so the 650–1350 ft distance fog
+    // no longer swallows the high layers; the distance-blur pass still softens
+    // the far ones.)
     use CloudType::*;
     match form {
         // The herald: a wide, very thin, broken pale veil — the TOP layer of
-        // the sky, sitting above even the cumulonimbus anvils.
+        // the sky, above even the cumulonimbus anvils.
         FormKind::Cirrostratus => FormParams {
             dims: IVec3::new(24, 2, 24),
             cell_ft: 15.0,
-            altitude: 740.0,
-            alt_jitter: 18.0,
+            altitude: 1250.0,
+            alt_jitter: 30.0,
             max_count: 9,
             scale_jitter: (0.9, 1.25),
             sky_weight: 0.7,
@@ -982,8 +987,8 @@ fn form_params(form: FormKind) -> FormParams {
             Cirrus => FormParams {
                 dims: IVec3::new(20, 2, 6),
                 cell_ft: 11.0,
-                altitude: 575.0,
-                alt_jitter: 25.0,
+                altitude: 940.0,
+                alt_jitter: 40.0,
                 max_count: 7,
                 scale_jitter: (0.8, 1.3),
                 sky_weight: 0.4,
@@ -992,8 +997,8 @@ fn form_params(form: FormKind) -> FormParams {
             Cirrocumulus => FormParams {
                 dims: IVec3::new(14, 2, 12),
                 cell_ft: 8.0,
-                altitude: 540.0,
-                alt_jitter: 20.0,
+                altitude: 880.0,
+                alt_jitter: 30.0,
                 max_count: 9,
                 scale_jitter: (0.85, 1.2),
                 sky_weight: 0.5,
@@ -1002,40 +1007,40 @@ fn form_params(form: FormKind) -> FormParams {
             Altocumulus => FormParams {
                 dims: IVec3::new(12, 3, 11),
                 cell_ft: 9.0,
-                altitude: 410.0,
-                alt_jitter: 22.0,
+                altitude: 740.0,
+                alt_jitter: 30.0,
                 max_count: 9,
                 scale_jitter: (0.85, 1.2),
                 sky_weight: 0.6,
             },
-            // A low flat loaf skimming the treetops — wide, squat, rounded.
+            // A flat loaf skimming the canopy — wide, squat, rounded.
             Stratocumulus => FormParams {
                 dims: IVec3::new(16, 6, 14),
                 cell_ft: 10.0,
-                altitude: 210.0,
-                alt_jitter: 18.0,
+                altitude: 440.0,
+                alt_jitter: 24.0,
                 max_count: 8,
                 scale_jitter: (0.85, 1.2),
                 sky_weight: 0.85,
             },
             // The classic fluffy heap: flat bottom, cauliflower dome, riding
-            // higher than the treetop loaves.
+            // above the treetop loaves.
             Cumulus => FormParams {
                 dims: IVec3::new(11, 8, 11),
                 cell_ft: 8.0,
-                altitude: 300.0,
-                alt_jitter: 24.0,
+                altitude: 600.0,
+                alt_jitter: 40.0,
                 max_count: 6,
                 scale_jitter: (0.8, 1.35),
                 sky_weight: 0.4,
             },
-            // The giant: biggest footprint, tallest column, anvil topping the
-            // whole layering. Base near the treetops, top ~700 ft.
+            // The giant: biggest footprint, tallest column (~500 ft), anvil
+            // topping the whole main layer well clear of the 1000 ft trees.
             Cumulonimbus => FormParams {
-                dims: IVec3::new(14, 40, 14),
+                dims: IVec3::new(14, 46, 14),
                 cell_ft: 11.0,
-                altitude: 470.0,
-                alt_jitter: 12.0,
+                altitude: 900.0,
+                alt_jitter: 20.0,
                 max_count: 2,
                 scale_jitter: (0.9, 1.15),
                 sky_weight: 0.55,
@@ -1044,19 +1049,19 @@ fn form_params(form: FormKind) -> FormParams {
             Nimbostratus => FormParams {
                 dims: IVec3::new(20, 6, 18),
                 cell_ft: 11.0,
-                altitude: 175.0,
-                alt_jitter: 12.0,
+                altitude: 380.0,
+                alt_jitter: 20.0,
                 max_count: 8,
                 scale_jitter: (0.9, 1.2),
                 sky_weight: 1.0,
             },
             // The outro sheets: altostratus a wide mid loaf, stratus the lowest
-            // loaf of all, right on the treetops.
+            // loaf of all, right over the canopy.
             Altostratus => FormParams {
                 dims: IVec3::new(18, 4, 16),
                 cell_ft: 11.0,
-                altitude: 380.0,
-                alt_jitter: 14.0,
+                altitude: 660.0,
+                alt_jitter: 24.0,
                 max_count: 8,
                 scale_jitter: (0.9, 1.2),
                 sky_weight: 0.9,
@@ -1064,8 +1069,8 @@ fn form_params(form: FormKind) -> FormParams {
             Stratus => FormParams {
                 dims: IVec3::new(18, 5, 16),
                 cell_ft: 10.0,
-                altitude: 140.0,
-                alt_jitter: 10.0,
+                altitude: 320.0,
+                alt_jitter: 18.0,
                 max_count: 8,
                 scale_jitter: (0.9, 1.2),
                 sky_weight: 0.95,
@@ -1454,8 +1459,12 @@ fn setup_cloud_library(
         base_color: Color::WHITE,
         perceptual_roughness: 1.0,
         reflectance: 0.08,
-        // Lit (the sun models the blocks) and fogged (far clouds melt into the
-        // haze like everything else this far out).
+        // Lit (the sun models the blocks), but fog OFF: the high layers now sit
+        // at 600–1250 ft — inside the 650–1350 ft distance fog that melts the
+        // terrain horizon — so with fog on they'd wash out to sky. Punching
+        // through it (like the sun/moon discs do) keeps them legible; the
+        // depth-aware distance-blur pass still softens the far ones.
+        fog_enabled: false,
         ..default()
     });
     let mut forms = Vec::new();
