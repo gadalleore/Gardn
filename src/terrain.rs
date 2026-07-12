@@ -41,9 +41,7 @@ impl BlockType {
     /// What a worm can actually eat: soils. Rock, ore, bedrock and water all
     /// refuse the bite — "worms cannot eat rocks and don't want to" (owner).
     /// Generation guarantees the rock exists; the refusal itself lives in
-    /// worm.rs's bite probe (core), which calls this. (Kept `allow(dead_code)`
-    /// until that routed one-liner lands — see coordination/terrain.md.)
-    #[allow(dead_code)]
+    /// worm.rs's bite probe (core), which calls this.
     pub(crate) fn worm_edible(self) -> bool {
         matches!(
             self,
