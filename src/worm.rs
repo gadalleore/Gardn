@@ -140,7 +140,7 @@ pub(crate) fn ground_world_y(chunk_world: &ChunkWorld, x: f32, z: f32) -> f32 {
     let mut top = cached.unwrap_or(surface);
 
     let record = chunk_world.active_records.get(&coord);
-    let bedrock = surface - CHUNK_DEPTH_VOXELS + 2;
+    let bedrock = surface - crate::topography::DIGGABLE_DEPTH_VOXELS + 2;
     while top > bedrock {
         let eaten = record.is_some_and(|r| r.edits.contains(&IVec3::new(local_x, top, local_z)));
         // Cached tops already account for caves; only this session's fresh
@@ -181,7 +181,7 @@ impl ColumnProbe<'_> {
         ColumnProbe {
             surface,
             top,
-            bedrock: surface - CHUNK_DEPTH_VOXELS + 2,
+            bedrock: surface - crate::topography::DIGGABLE_DEPTH_VOXELS + 2,
             vx,
             vz,
             local,
@@ -237,6 +237,28 @@ impl ColumnProbe<'_> {
 
 /// Pull the worm down to the ground unless god mode is on. Runs after the
 /// flycam has moved the camera, just before transforms propagate.
+/// The camera eye must clear solid voxels not just in its own 3-inch column
+/// but a near-plane's width to either side — otherwise it can rest flush on a
+/// wall face and Bevy's ~0.1 ft near plane renders *through* the block. Fresh
+/// dug holes wall the worm in on every side, so that flush-poke was the "clip
+/// through terrain when you dig" bug. The eye gets a thin horizontal body
+/// radius, just over the near plane, used by collision and the roof clamps.
+const NEAR_PLANE_MARGIN_FT: f32 = 0.12;
+
+/// True if the eye at (x, z, y) clears solid ground at its own column and one
+/// near-plane margin out along each horizontal axis (a thin body radius that
+/// keeps the near plane from poking through a wall face).
+fn eye_clears(chunk_world: &ChunkWorld, x: f32, z: f32, y: f32) -> bool {
+    const M: f32 = NEAR_PLANE_MARGIN_FT;
+    for (dx, dz) in [(0.0, 0.0), (M, 0.0), (-M, 0.0), (0.0, M), (0.0, -M)] {
+        let col = ColumnProbe::at(chunk_world, x + dx, z + dz);
+        if col.solid_at_ft(y) || col.solid_at_ft(y - WORM_EYE_HEIGHT * 0.6) {
+            return false;
+        }
+    }
+    true
+}
+
 fn worm_gravity(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -255,10 +277,7 @@ fn worm_gravity(
         // vertical revert stops phasing through roofs and floors, and a
         // final clamp keeps the camera out of the ground.
         if let Some(prev) = god.prev_pos {
-            let fits = |x: f32, z: f32, y: f32| -> bool {
-                let col = ColumnProbe::at(&chunk_world, x, z);
-                !col.solid_at_ft(y) && !col.solid_at_ft(y - WORM_EYE_HEIGHT * 0.6)
-            };
+            let fits = |x: f32, z: f32, y: f32| -> bool { eye_clears(&chunk_world, x, z, y) };
             let y = tf.translation.y;
             if !fits(tf.translation.x, tf.translation.z, y) {
                 if fits(tf.translation.x, prev.z, y) {
@@ -327,10 +346,7 @@ fn worm_gravity(
     // movement slides along whichever axis stays open.
     const CLIMB_LIMIT_FT: f32 = 0.26;
     if let Some(prev) = god.prev_pos {
-        let fits = |x: f32, z: f32, y: f32| -> bool {
-            let col = ColumnProbe::at(&chunk_world, x, z);
-            !col.solid_at_ft(y) && !col.solid_at_ft(y - WORM_EYE_HEIGHT * 0.6)
-        };
+        let fits = |x: f32, z: f32, y: f32| -> bool { eye_clears(&chunk_world, x, z, y) };
         let passable = |x: f32, z: f32| -> bool {
             fits(x, z, tf.translation.y) || fits(x, z, tf.translation.y + CLIMB_LIMIT_FT)
         };
@@ -386,7 +402,7 @@ fn worm_gravity(
     // Roofs are real: standing height (and stretching) stops under the first
     // solid voxel overhead instead of poking through it.
     let ceiling = here_col.ceiling_above(floor + 0.01);
-    let stand = (floor + WORM_EYE_HEIGHT + god.reach).min(ceiling - 0.03).max(floor + 0.02);
+    let stand = (floor + WORM_EYE_HEIGHT + god.reach).min(ceiling - NEAR_PLANE_MARGIN_FT).max(floor + 0.02);
     let dy = stand - tf.translation.y;
 
     // Eased vertical follow: the camera glides toward ride height on an
@@ -414,7 +430,7 @@ fn worm_gravity(
     // camera sit inside the ground. The coarse 3-inch steps outrun the glide,
     // so snap up to a clear ride height above the floor directly below (capped
     // under any ceiling so it can't shove through a low roof).
-    let min_ride = (here + WORM_EYE_HEIGHT * 0.5).min(ceiling - 0.03);
+    let min_ride = (here + WORM_EYE_HEIGHT * 0.5).min(ceiling - NEAR_PLANE_MARGIN_FT);
     if tf.translation.y < min_ride {
         tf.translation.y = min_ride;
     }
@@ -579,8 +595,9 @@ fn probe_and_carve(
 
             let local = IVec3::new(vx.rem_euclid(CHUNK_VOXELS), vy, vz.rem_euclid(CHUNK_VOXELS));
             if let Some(block) = voxels.get(local.x, local.y, local.z) {
-                // Water isn't food, and the bottom layer is bedrock.
-                if block != BlockType::Water && local.y > voxels.floor_y() {
+                // Only soils are food — rock, ore, bedrock and water refuse
+                // the bite (worm_edible); the bottom layer is bedrock too.
+                if block.worm_edible() && local.y > voxels.floor_y() {
                     hit = Some((coord, local, block));
                 }
                 break 'rays;
@@ -592,8 +609,8 @@ fn probe_and_carve(
 
     // A worm doesn't nibble single cubes — every bite scoops a worm-sized
     // BALL out of the ground (~4 inches across at 1-inch voxels), spilling
-    // into neighbouring chunks when the bite straddles a border. Bedrock and
-    // water are never carved.
+    // into neighbouring chunks when the bite straddles a border. Only soils
+    // are carved — rock, ore, bedrock and water are never eaten.
     const BITE_RADIUS_VOX: f32 = 2.2;
     let center = IVec3::new(
         coord.x * CHUNK_VOXELS + local.x,
@@ -630,7 +647,7 @@ fn probe_and_carve(
                 let Some(b) = voxels.get(clocal.x, clocal.y, clocal.z) else {
                     continue;
                 };
-                if b == BlockType::Water || clocal.y <= voxels.floor_y() {
+                if !b.worm_edible() || clocal.y <= voxels.floor_y() {
                     continue;
                 }
                 voxels.clear_cell(clocal.x, clocal.y, clocal.z);
@@ -772,6 +789,13 @@ fn lower_worm_camera(
         // few hundred feet away needs real vertical room before the clip plane.
         commands.entity(entity).insert(Projection::Perspective(PerspectiveProjection {
             far: 1600.0,
+            // Tiny near plane so the eye can sit right up against a wall — fresh
+            // dug holes box the worm in on every side — without the near plane
+            // (a rectangle whose corners sit deeper than its centre) slicing
+            // through the block and showing daylight beyond. The default 0.1 ft
+            // corner reached ~0.13 ft, past the collision margin, so glancing
+            // angles clipped. Reverse-z depth keeps precision fine to 1600 ft.
+            near: 0.02,
             ..default()
         }));
 
