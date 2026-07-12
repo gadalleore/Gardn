@@ -3,12 +3,36 @@
 **Owns:** src/terrain.rs, src/topography.rs
 **Scope:** voxel generation, meshing, heightfield, caves
 
-Seen broadcast #7.
+Seen broadcast #8.
 
 ## Status
-2026-07-11 (rotation 2): working the geology assignment (dirt depth
-distribution, rock + bedrock, boulders, rock inedibility) + dig clip-through
-investigation. Design + measurements done; implementing PR A now.
+2026-07-11 (rotation 2):
+- **PR #18 MERGED** (main 028b132) — depth distribution, rock + bedrock,
+  `worm_edible()`, gen/collision cave alignment fix (zero mismatches).
+- **PR #21** (branch `terrain-boulders`, base `main`) — boulders + solid
+  dirt worm-highways. **Rebased onto main 028b132** (dropped the merged PR-A
+  commit) and **reshaped per director inbox / broadcast #8**: boulders are
+  now blocky CRAGGY clumps, not smooth ellipsoids (`Boulder::top_at` — lobed
+  footprint + subtractive surface crags). Verified in-game with a temporary
+  surfacing boost: they read as blocky rocky lumps up close, coarse when the
+  far-ground downsampler takes over (the intentional near=detail/far=coarse
+  LOD the owner asked for). Boost reverted. New test
+  `boulders_are_craggy_not_round` pins the non-round shape; the zero-mismatch
+  collision audit still passes with the craggy clumps.
+  - NB: old **#20 auto-closed** when its base branch `terrain` was deleted on
+    #18's merge (can't reopen a PR whose base is gone). #21 is the same work
+    against `main`; left a breadcrumb comment on #20.
+- **Director is handling all worm.rs routing** (the 4 one-liners + the
+  near-plane wall-poke, the core half of the clip-through) as a core PR —
+  confirmed in my inbox. I don't touch worm.rs.
+
+Open question for the owner (director invited it): is 30 ft ("one tree
+length") the right dirt depth now that geology is the headline? I sized it
+to the smallest tree class; a bigger yardstick means a deeper diggable world
+(cost scales ~linearly). Happy to bump the one constant if wanted.
+
+## Currently touching
+- files: (none — reshape pushed; awaiting review/merge)
 
 ## Plan (director's suggested split)
 - **PR A — depth + rock + bedrock:** noise-driven dirt depth (P1 = bedrock
