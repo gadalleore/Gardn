@@ -416,40 +416,49 @@ pub fn generate_chunk_blocks(
         }
     }
 
-    // Boulders: stamp each ellipsoid (they arrive in WORLD voxels and may
-    // straddle chunk borders — the world-lattice hash keeps both sides
-    // agreeing). Every covered column is filled from the dome down to the
-    // ground, so a surfacing giant is a rooted rock, never an overhang with
-    // phantom air beneath it — collision's column model stays exact.
+    // Boulders: craggy blocky clumps (owner's rotation-2 rule — no round
+    // shapes). Each column's top comes from Boulder::top_at, a lobed + cragged
+    // ellipsoid, and is filled SOLID from the ground up to that top — so a
+    // surfacing giant is a rooted rock, never an overhang with phantom air
+    // beneath it, and collision's per-column model stays exact. The footprint
+    // scan is widened by the lobe bulge (≤1.2×). Clumps arrive in WORLD voxels
+    // and may straddle chunk borders; top_at is deterministic in world coords
+    // + seed, so both sides agree.
     let base_vx = coord.x * CHUNK_VOXELS;
     let base_vz = coord.y * CHUNK_VOXELS;
-    // Post-boulder solid top per column — the cave sweep must consider dome
+    // Post-boulder solid top per column — the cave sweep must consider clump
     // voxels above the terrain surface too, or collision (which asks about
     // every solid voxel) could disagree with generation up there.
     let mut col_top = heights.clone();
     for b in &boulders {
-        let x0 = (b.center.x - b.radius.x - base_vx).max(0);
-        let x1 = (b.center.x + b.radius.x - base_vx).min(CHUNK_VOXELS - 1);
-        let z0 = (b.center.z - b.radius.z - base_vz).max(0);
-        let z1 = (b.center.z + b.radius.z - base_vz).min(CHUNK_VOXELS - 1);
+        let margin = (b.radius.x.max(b.radius.z) as f32 * 0.25).ceil() as i32;
+        let x0 = (b.center.x - b.radius.x - margin - base_vx).max(0);
+        let x1 = (b.center.x + b.radius.x + margin - base_vx).min(CHUNK_VOXELS - 1);
+        let z0 = (b.center.z - b.radius.z - margin - base_vz).max(0);
+        let z1 = (b.center.z + b.radius.z + margin - base_vz).min(CHUNK_VOXELS - 1);
         for lz in z0..=z1 {
             for lx in x0..=x1 {
                 let i = lz as usize * cols + lx as usize;
                 if sea_mask[i] {
                     continue;
                 }
-                let dx = (base_vx + lx - b.center.x) as f32 / b.radius.x as f32;
-                let dz = (base_vz + lz - b.center.z) as f32 / b.radius.z as f32;
-                let rem = 1.0 - dx * dx - dz * dz;
-                if rem <= 0.0 {
+                let Some(top) = b.top_at(base_vx + lx, base_vz + lz) else {
                     continue;
-                }
-                let half = (b.radius.y as f32 * rem.sqrt()) as i32;
-                let y1 = (b.center.y + half).min(voxels.y_max);
-                let y0 = (b.center.y - half).max(chunk_floor + 2);
+                };
+                let y1 = top.min(voxels.y_max);
                 let h = heights[i];
-                // Root the dome into the ground below it.
-                for y in (h + 1).min(y0)..=y1 {
+                // Two cases, both leaving the column fully solid (no overhang,
+                // collision-exact): a clump poking ABOVE the ground roots from
+                // just above the terrain up to its craggy top; a clump buried
+                // wholly below the surface replaces dirt with rock over its own
+                // vertical extent (an inedible lump inside the soil). The half
+                // extent is `top - center.y`, so the base mirrors it.
+                let start = if y1 > h {
+                    h + 1
+                } else {
+                    (b.center.y - (top - b.center.y)).max(chunk_floor + 2)
+                };
+                for y in start..=y1 {
                     voxels.set(lx, y, lz, BlockType::Stone);
                 }
                 col_top[i] = col_top[i].max(y1);

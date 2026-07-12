@@ -231,12 +231,56 @@ pub(crate) fn is_dirt_tunnel_cell(world_vx: i32, world_vy: i32, world_vz: i32) -
     n1.abs().max(n2.abs()) < 0.16
 }
 
-/// One procedural rock clump. Coordinates are WORLD voxels; the ellipsoid is
-/// stamped into any chunk it overlaps, so clumps cross chunk borders
-/// seamlessly (everything derives from a world-space lattice hash).
+/// One procedural rock clump. Coordinates are WORLD voxels; the clump is
+/// stamped into any chunk it overlaps, so it crosses chunk borders seamlessly
+/// (everything derives from world coords + the boulder's own seed).
 pub(crate) struct Boulder {
     pub(crate) center: bevy::math::IVec3,
     pub(crate) radius: bevy::math::IVec3,
+    seed: u32,
+}
+
+impl Boulder {
+    /// Craggy top voxel Y at a world-voxel column, or `None` outside the clump.
+    /// NOT a smooth dome (the owner's rotation-2 rule: "no round shapes,
+    /// blocky with LOD"): a low-frequency noise makes the footprint a lumpy
+    /// clump instead of a clean oval, and a higher-frequency noise notches the
+    /// surface into crags. At the 3-inch ground voxel these read as a blocky
+    /// rocky clump up close; the far-ground downsampler collapses the same
+    /// shape into a coarse lump, so distance coarsens it intentionally rather
+    /// than scaling one smooth blob. Deterministic in world coords + seed, so
+    /// a clump straddling a chunk border agrees on both sides.
+    pub(crate) fn top_at(&self, wx_vox: i32, wz_vox: i32) -> Option<i32> {
+        let dx = (wx_vox - self.center.x) as f32 / self.radius.x as f32;
+        let dz = (wz_vox - self.center.z) as f32 / self.radius.z as f32;
+        let wx = wx_vox as f32 * VOXEL_SIZE;
+        let wz = wz_vox as f32 * VOXEL_SIZE;
+
+        // Lobes: two octaves of value noise (wavelengths ~ whole boulder and
+        // ~half) warp the footprint radius, so the outline bulges and pinches
+        // into a multi-lobed clump. Centred on 0 so it neither grows nor
+        // shrinks the clump on average.
+        let lobe = (value_noise(wx / 9.0, wz / 9.0, self.seed) * 2.0
+            + value_noise(wx / 4.5, wz / 4.5, self.seed ^ 0x1234_5678))
+            / 3.0
+            - 0.5;
+        let field = 1.0 - (dx * dx + dz * dz) + lobe * 0.7;
+        if field <= 0.0 {
+            return None;
+        }
+
+        // Ellipsoid height, then bite crags OUT of it (subtractive only, so the
+        // clump never spikes above center.y + radius.y — keeps the chunk box
+        // ceiling honest). The notch depth grows near the rim so edges look
+        // fractured, not bevelled.
+        let crag = value_noise(wx / 2.3, wz / 2.3, self.seed ^ 0x51ED_BEEF);
+        let half = self.radius.y as f32 * field.min(1.0).sqrt()
+            - crag * self.radius.y as f32 * 0.4;
+        if half < 0.5 {
+            return None;
+        }
+        Some(self.center.y + half as i32)
+    }
 }
 
 /// Boulders whose ellipsoids could overlap the given chunk. Two tiers on
@@ -262,7 +306,10 @@ pub(crate) fn boulders_near_chunk(chunk_coord: bevy::math::IVec2) -> Vec<Boulder
     let mut out = Vec::new();
 
     for (cell, presence, surfacing, (r_lo, r_hi), salt) in TIERS {
-        let max_r = (r_hi * VOXELS_PER_FOOT as f32).ceil() as i32;
+        // Lobes can bulge the footprint to ~1.2× the base radius, so the
+        // overlap margin must reach that far or a clump touching the chunk
+        // from just outside would be clipped at the border.
+        let max_r = (r_hi * VOXELS_PER_FOOT as f32 * 1.2).ceil() as i32;
         let c0 = IVec2::new(
             (base_vx - max_r).div_euclid(cell),
             (base_vz - max_r).div_euclid(cell),
@@ -307,6 +354,8 @@ pub(crate) fn boulders_near_chunk(chunk_coord: bevy::math::IVec2) -> Vec<Boulder
                 out.push(Boulder {
                     center: IVec3::new(vx, vy, vz),
                     radius: IVec3::new(rx.max(2), ry.max(2), rz.max(2)),
+                    // Per-boulder noise seed so no two clumps crag alike.
+                    seed: (rng.next_u32() ^ 0xB0_0177E5).wrapping_mul(0x9E37_79B9),
                 });
             }
         }
@@ -619,6 +668,57 @@ mod tests {
             step_sum / pairs as f64 <= 1.0,
             "dirt depth too jittery between adjacent columns: mean step {:.2}",
             step_sum / pairs as f64
+        );
+    }
+
+    /// Boulders must be craggy clumps, not smooth domes (owner's rotation-2
+    /// "no round shapes" rule). For a pure ellipsoid, every column at the same
+    /// (dx, dz) radius has the identical top; the lobe + crag noise must break
+    /// that — a ring at fixed radius shows real spread, and the footprint edge
+    /// isn't a clean circle.
+    #[test]
+    fn boulders_are_craggy_not_round() {
+        use bevy::math::IVec3;
+        let b = Boulder {
+            center: IVec3::new(0, 200, 0),
+            radius: IVec3::new(40, 22, 40),
+            seed: 0x1234_5678,
+        };
+
+        // Tops around a ring at ~half radius: a smooth dome gives one value;
+        // crags spread them across several voxels.
+        let mut lo = i32::MAX;
+        let mut hi = i32::MIN;
+        for k in 0..64 {
+            let a = k as f32 / 64.0 * std::f32::consts::TAU;
+            let x = (a.cos() * 20.0).round() as i32;
+            let z = (a.sin() * 20.0).round() as i32;
+            if let Some(t) = b.top_at(x, z) {
+                lo = lo.min(t);
+                hi = hi.max(t);
+            }
+        }
+        assert!(
+            hi - lo >= 3,
+            "boulder top is too smooth at fixed radius (spread {} voxels) — reads round",
+            hi - lo
+        );
+
+        // Footprint reach along +x vs +z: a circle would match; a lobed clump
+        // differs.
+        let reach = |dx: i32, dz: i32| -> i32 {
+            let mut r = 0;
+            for step in 1..80 {
+                if b.top_at(dx * step, dz * step).is_some() {
+                    r = step;
+                }
+            }
+            r
+        };
+        assert_ne!(
+            reach(1, 0),
+            reach(0, 1),
+            "boulder footprint is a clean circle — should be an irregular clump"
         );
     }
 

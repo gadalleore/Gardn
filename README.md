@@ -40,7 +40,8 @@ happens in — the hard part: a believable, streamable, gargantuan planet.
   but it's a distribution: ~1% of ground has bedrock right below the surface,
   ~1% has dirt two tree lengths down, varying smoothly so digging feels
   geological. Beneath the dirt: a rock layer worms can't eat, floored by
-  unbreakable bedrock. Giant procedural boulders surface as landmark rocks
+  unbreakable bedrock. Giant procedural boulders — blocky, craggy voxel
+  clumps, coarse from afar and detailed up close — surface as landmark rocks
   (smaller ones lurk buried in the dirt), and the deep rock is threaded with
   solid dirt tunnels — worm highways you discover by digging and follow by
   chewing.
