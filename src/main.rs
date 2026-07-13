@@ -32,7 +32,7 @@ use silhouettes::{plan_ground_silhouettes, process_silhouette_queue, SilhouetteW
 use terrain::TerrainPlugin;
 use distance_blur::DistanceBlurPlugin;
 use weather::Wind;
-use worm::{finish_burrow_tasks, GodMode, WormPlugin, GOD_SPEED_MULT, WORM_SPEED};
+use worm::{eat_leaves, finish_burrow_tasks, GodMode, WormPlugin, GOD_SPEED_MULT, WORM_SPEED};
 use streaming::{
     finalize_deferred_unloads, finish_chunk_tasks, plan_chunk_streaming, process_chunk_load_queue,
     ChunkWorld,
@@ -113,13 +113,18 @@ fn main() {
                 plan_chunk_streaming,
                 process_chunk_load_queue,
                 finish_chunk_tasks,
-                // PHASE 0: tree build + tree-silhouette LOD + leaf-eating stripped.
-                // The far-GROUND vista survives (terrain-only) — it stands the
-                // distant blocky land past the streamed ring and hands off gaplessly
-                // to real terrain; finalize_deferred_unloads waits on its stand-in.
+                // PHASE 0: tree build + tree-silhouette LOD stripped. The
+                // far-GROUND vista survives (terrain-only) — it stands the distant
+                // blocky land past the streamed ring and hands off gaplessly to real
+                // terrain; finalize_deferred_unloads waits on its stand-in.
                 plan_ground_silhouettes,
                 process_silhouette_queue,
                 finalize_deferred_unloads,
+                // `eat_leaves` is misnamed — it's the E-key handler: eat a nearby
+                // leaf OR, with none (Phase 0), BURROW into terrain. KEEP IT wired
+                // or digging dies (it did when the strip pulled it). Rename it in a
+                // Stage 2 cleanup; for now it just always falls through to the dig.
+                eat_leaves,
                 finish_burrow_tasks,
             )
                 .chain(),
