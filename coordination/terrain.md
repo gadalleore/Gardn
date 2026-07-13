@@ -1,66 +1,83 @@
 # Track: terrain
 
-**Owns:** src/terrain.rs, src/topography.rs
-**Scope:** voxel generation, meshing, heightfield, caves
+**Owns (Phase 0):** all terrain-foundation files, including core ones —
+`main.rs`, `streaming.rs`, `silhouettes.rs`, `worm.rs`, `world.rs`,
+`chunk_store.rs`, `australia.rs`, `terrain.rs`, `topography.rs`. (Authorized by
+the director: I'm the sole active agent for Phase 0; the fleet is paused.)
+**Branch:** `phase-0-terrain` (NOT `terrain`).
 
-Seen broadcast #9.
+Seen broadcast #10 (the PROJECT PIVOT to a phased build — terrain first, solo).
 
 ## Status
-2026-07-12: **winding down (thermal rotation).** Rotation-2 geology arc is
-COMPLETE and merged — depth distribution, rock + bedrock, inedible rock,
-blocky craggy LOD boulders, and dirt worm-highways. Owner flew the boulders
-and loved them. Branch synced to main (ebbb87e). No open terrain work.
+2026-07-12: **Phase 0, Stage 1 COMPLETE — the ecology strip now RUNS.**
+The director's WIP (2a1d58c) stripped ecology from `main.rs` but left runtime
+panics — `finish_chunk_tasks` and `finalize_deferred_unloads` still required
+resources no longer inserted (`LeafAssets`/`GrassAssets`/`TreeSpawnQueue`,
+`SilhouetteWorld`), and `worm_gravity` required `Wind`. Fixed:
 
-While tidying I also dropped the now-obsolete `#[allow(dead_code)]` on
-`BlockType::worm_edible` (it's called from worm.rs now via core PR #22) —
-the director flagged it as a trivial next-time cleanup; done here in this
-wind-down. Bundled into the wind-down PR.
+- **streaming.rs** — stripped all grass/leaf/tree integration from the chunk
+  pipeline: removed `scatter_chunk_*`, the `TreeSpawnQueue`/`FoliageSkin` types,
+  and the orphaned `start_tree_build_tasks`/`finish_tree_build_tasks`. The
+  pipeline is now terrain-only (generate → mesh → spawn → unload). Kept the
+  `TreesPending`/`ChunkTreesRevealed` marker types (DORMANT) because the paused
+  `foliage.rs` still imports them and is still compiled.
+- **silhouettes.rs** — **kept far-GROUND, dropped far-TREE LOD.** Rationale: the
+  distant terrain vista IS a terrain feature (samples real topography, has two
+  regression tests, and is the embryo of the spec §4.3 progressive-unfolding),
+  AND `finalize_deferred_unloads` depends on `stand_in_ready` for the gapless
+  chunk hand-off — disabling silhouettes entirely would strand it. Removed all
+  tree-mesh machinery; `plan_tree_silhouettes` → `plan_ground_silhouettes`,
+  retire-on-`loaded`, `stand_in_ready` = ground up.
+- **worm.rs** — left BYTE-IDENTICAL. main.rs now seeds a default **calm** `Wind`
+  (`.init_resource::<Wind>()`; strength 0, never animated without WeatherPlugin),
+  so the crawl model reads a dead-still day. (Director's suggested path.)
+- **main.rs** — re-added `SilhouetteWorld` + `plan_ground_silhouettes` /
+  `process_silhouette_queue` to the Update chain; added the calm `Wind`.
+
+**Verified:** `cargo check` clean (only expected Phase-0 dead-code warnings);
+`cargo test` 19/19 pass incl. both far-ground tests and
+`generation_and_collision_agree_on_every_land_voxel`; `cargo run` (GARDN_HIGH=250,
+run-lock held+released) ran the full ~60 s with **no panic** — green voxel
+Australia lit by the static sun, terrain reaching a clean horizon (far-ground
+vista intact, no moat/void), distance blur working.
+
+Also did **Stage 0**: extracted the owner's two `.docx` specs to versioned
+markdown — `docs/project_roadmap.md`, `docs/terrain_volume_1_spec.md` (the
+Phase 0 source of truth).
 
 ## Currently touching
-- files: (none)
+- files: (none — Stage 1 committed; PR pending)
 
-## Open question for the owner (director invited it)
-Is 30 ft ("one tree length") the right dirt-depth yardstick now that geology
-is the headline feature? I sized `TREE_LENGTH_VOXELS = 30 * VOXELS_PER_FOOT`
-to the smallest tree class (mallee/desert oak, 30–55 ft); a bigger yardstick
-(e.g. a river red gum) means a proportionally deeper diggable world. Cost
-scales ~linearly (see numbers below). It's one constant in topography.rs if
-the owner wants it bumped.
+## Open question for the director/owner
+**PR base + branch model.** phase-0-terrain is the designated Phase 0 branch and
+already carries the director's WIP commit as its tip. For "the first PR" (the
+running sandbox) I'm opening **phase-0-terrain → main** so the owner can eyeball
+it. Flag if you'd rather Phase 0 stay a separate line off `main` (main keeps the
+full ecology game) until Phase 0 matures, or want stages as sub-PRs into
+phase-0-terrain. Easy to retarget.
 
-## Design notes (for whoever picks up terrain next)
-- **Depth authority:** `DIGGABLE_DEPTH_VOXELS` (topography.rs) = 290 voxels
-  (2 tree lengths + 12 ft rock + 2 bedrock). worm.rs collision consumes it,
-  so the diggable band and the bedrock floor stay in lockstep. `dirt_depth_voxels`
-  is the smooth per-column field (P1→0, P50→1 tree length, P99→2).
-- **Gen/collision agreement is load-bearing.** Caves, bedrock, boulders and
-  highways are all built per-column from the exact inputs worm.rs's
-  `ColumnProbe` uses; `generation_and_collision_agree_on_every_land_voxel`
-  pins it at ZERO mismatches. Keep any new underground feature column-based
-  and overhang-free, or the worm clips through. (That test caught the
-  original 130–190 phantom-voxels-per-chunk clip-through.)
-- **Measured cost (release):** the 4× deeper world runs chunk gen ~50 ms,
-  mesh ~460 ms, both off-thread; ~290k verts/chunk (budget 2.5M).
-- **Residual clip:** a diagonal clip against protruding dug-hole blocks
-  remains — core worm.rs collision, the director is fixing it. Not terrain's.
+## Stage 2 (next, per director inbox) — subsequent small PRs
+1. **State-hook facade** (spec §7): `GetHeight`/`GetSoilDepth`/`GetRockDensity`
+   wrapping existing fields; `GetMoisture`/`GetPoolingDuration`/`GetFlammability`/
+   `IsCoastalZone` as stubs until water/fire arrive.
+2. **Durable mutation** (spec §3.2/§8): serialize `ChunkArchive` to disk so edits
+   persist across sessions; new-game vs saved-game per §3.3.
+3. **Hierarchical seed tree + progressive unfolding** (spec §4): formalize the
+   flat `chunk_seed` into macro→L1→L2→leaf; unify LOD as depth-limited eval
+   (can subsume the far-ground I kept).
+4. **Worm-scale calibration** (spec §2): worm is ~1 inch; code has
+   `WORM_LENGTH = 3 inches`. Flag the exact change for an owner eyeball before
+   changing (eye-height/reach/collision feel).
 
-## Notes for other tracks
-- (rotation 1) Real↔real chunk boundaries are provably sealed; coastal
-  per-column shoreline fixed in PR #7 with a regression test.
-- **foliage-life:** grass can still stand in coastal shallows
-  (`scatter_chunk_grass` has no per-spot ocean check). Also, surfacing
-  boulders now appear in `column_tops`, so grass may sprout on top of big
-  rocks. Both cosmetic; a block-type-aware grass check isn't possible today
-  (grass only receives tops) — happy to expose more if wanted.
-- **trees:** tree placement (chunk_store.rs) samples the height formula, so a
-  surfacing boulder may intersect the odd trunk base. Cosmetic, flagging for
-  awareness.
+## Design notes (carried forward)
+- **Depth authority:** `DIGGABLE_DEPTH_VOXELS` (topography.rs). Gen/collision
+  agreement is load-bearing — keep new underground features column-based and
+  overhang-free (the `generation_and_collision_agree...` test pins it at zero
+  mismatch).
+- **Distance language: feet/inches; the worm is 1 inch** (owner's yardstick).
 
 ## Done / merged
-- 2026-07-12: blocky craggy boulders + dirt worm-highways — PR #21 (ebbb87e).
-  (Superseded auto-closed #20 after its base branch was deleted on #18's merge.)
-- 2026-07-11: dirt-depth distribution, rock + bedrock, inedible rock, and the
-  gen/collision cave-alignment fix (root-caused the dig clip-through) — PR #18
-  (028b132). Core worm.rs hookup (rock refusal, deep dig, near-plane fix) was
-  the director's PR #22.
-- 2026-07-09: per-column coastline in `generate_chunk_blocks` — PR #7 (a0e6854).
-- 2026-07-09: flagged the silhouette-ring moat (fixed in core as PR #4).
+- 2026-07-12: Phase 0 Stage 0 (spec extraction, 4829a59) + Stage 1 (ecology-strip
+  → running sandbox) — PR pending.
+- Earlier rotation-1/2 terrain work (coastline, geology, boulders, tunnels,
+  cave-alignment) shipped in PRs #7/#18/#21 — see git history.

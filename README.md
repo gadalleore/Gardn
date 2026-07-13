@@ -29,6 +29,15 @@ happens in — the hard part: a believable, streamable, gargantuan planet.
 
 ## What's in the world right now
 
+> **Phase 0 — terrain foundation (current branch).** The project is being rebuilt
+> in phases on top of a deterministic, queryable, modifiable terrain base (see
+> `docs/terrain_volume_1_spec.md` and `docs/project_roadmap.md`). In this phase
+> the world is **terrain only**: voxel Australia with its geology, boulders,
+> caves, coastline, digging worm, and the far-ground horizon vista — lit by a
+> plain static sun. The ecology below (trees, grass, leaves, wind, day/night sky)
+> is **frozen intact at git tag `v0-full-ecology`** and re-layers onto the new
+> foundation in Phase 1. The feature list below describes that full v0 world.
+
 - **A whole procedural Australia.** Real (if stylised) coastline and geography,
   eight biomes — tropical savanna, the arid Red Centre, the Pilbara, the SW
   Mediterranean, temperate forest, coastal bush, Tasmania — each with its own

@@ -28,8 +28,10 @@ use audio::GameAudioPlugin;
 use australia::{biome_at_world, biome_display_name, pick_coastal_spawn};
 use chunk_store::ChunkArchive;
 use map_ui::{setup_map_ui, toggle_map_ui, update_map_ui, MapOverlay};
+use silhouettes::{plan_ground_silhouettes, process_silhouette_queue, SilhouetteWorld};
 use terrain::TerrainPlugin;
 use distance_blur::DistanceBlurPlugin;
+use weather::Wind;
 use worm::{finish_burrow_tasks, GodMode, WormPlugin, GOD_SPEED_MULT, WORM_SPEED};
 use streaming::{
     finalize_deferred_unloads, finish_chunk_tasks, plan_chunk_streaming, process_chunk_load_queue,
@@ -81,6 +83,11 @@ fn main() {
         //     GrassPlugin / LeavesPlugin / WeatherPlugin / FoliagePlugin / SkyPlugin.
         .add_plugins(GameAudioPlugin) // Sound-effect handles + music rotation
         .add_plugins(WormPlugin) // Worm gravity/collision, god mode, camera, eating
+        // The worm reads `Wind` for its crawl model; WeatherPlugin (which owns
+        // and animates it) is stripped for Phase 0, so seed a default CALM Wind
+        // (strength 0, never updated) — the crawl code stays untouched and reads
+        // as a dead-still day until weather re-layers in Phase 1.
+        .init_resource::<Wind>()
         .insert_resource(MovementSettings {
             sensitivity: 0.00012,
             speed: start_speed, // Slow crawl — we're a tiny worm (3× in god mode)
@@ -90,6 +97,7 @@ fn main() {
         .insert_resource(god_mode)
         .init_resource::<ChunkWorld>()
         .init_resource::<ChunkArchive>()
+        .init_resource::<SilhouetteWorld>() // Far-ground vista past the streamed ring
         .init_resource::<MapOverlay>()
         .add_systems(
             Startup,
@@ -106,6 +114,11 @@ fn main() {
                 process_chunk_load_queue,
                 finish_chunk_tasks,
                 // PHASE 0: tree build + tree-silhouette LOD + leaf-eating stripped.
+                // The far-GROUND vista survives (terrain-only) — it stands the
+                // distant blocky land past the streamed ring and hands off gaplessly
+                // to real terrain; finalize_deferred_unloads waits on its stand-in.
+                plan_ground_silhouettes,
+                process_silhouette_queue,
                 finalize_deferred_unloads,
                 finish_burrow_tasks,
             )

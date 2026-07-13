@@ -1,31 +1,21 @@
 //! Chunk streaming: the world-state resources (what's loaded, held, or queued),
-//! the async pipeline that generates/meshes terrain and grows trees off-thread,
-//! and the round-radius load/unload logic with its gapless silhouette hand-off.
+//! the async pipeline that generates and meshes terrain off-thread, and the
+//! round-radius load/unload logic with its gapless far-ground hand-off.
+//! (Phase 0: tree/grass/leaf integration is stripped — this pipeline is terrain
+//! only. The ecology re-layers onto it in Phase 1; see docs/project_roadmap.md.)
 //! The systems here run inside main's ordered world pipeline (they're
 //! `pub(crate)`, registered there alongside the silhouette + worm steps), so
 //! this module owns the code but not the schedule.
 
 use bevy::prelude::*;
-use bevy::render::view::NoFrustumCulling;
 use bevy::tasks::futures_lite::future;
 use bevy::tasks::{block_on, AsyncComputeTaskPool, Task};
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::chunk_store::{
-    archive_chunk, take_saved_chunk, ChunkArchive, ChunkRecord, ChunkTreeJob,
-};
-use crate::foliage::{
-    FoliageLod, FoliageLodGroup, WildTree, WindSway, FOLIAGE_LOD_FACTORS, FOLIAGE_LOD_FILL,
-};
-use crate::grass::{scatter_chunk_grass, GrassAssets};
-use crate::leaves::{scatter_chunk_leaves, LeafAssets};
+use crate::chunk_store::{archive_chunk, take_saved_chunk, ChunkArchive, ChunkRecord};
 use crate::silhouettes::SilhouetteWorld;
 use crate::terrain;
-use crate::terrain::{
-    apply_edits, build_culled_voxel_mesh, downsample_blocks, generate_chunk_blocks,
-    TerrainMaterials, TerrainSurface,
-};
-use crate::trees::{generate_tree, TreeSpecies, VoxelTreeData};
+use crate::terrain::{apply_edits, generate_chunk_blocks, TerrainMaterials, TerrainSurface};
 use crate::world::*;
 
 #[derive(Component)]
@@ -33,6 +23,11 @@ pub(crate) struct WorldChunk {
     #[allow(dead_code)]
     coord: IVec2,
 }
+
+// PHASE 0: the two tree-lifecycle marker components below are DORMANT — nothing
+// in the terrain pipeline attaches or reads them now. They're kept only so the
+// paused `foliage.rs` (still compiled, unwired) keeps building; the tree grow-in
+// + reveal choreography that drives them re-layers in Phase 1.
 
 /// Real trees still building asynchronously for a live chunk. The horizon
 /// cutouts watch this: a chunk's silhouette trees only retire once it hits
@@ -86,253 +81,9 @@ pub(crate) struct PendingChunk {
     coord: IVec2,
 }
 
-#[derive(Resource, Default)]
-pub(crate) struct TreeSpawnQueue(VecDeque<ChunkTreeJob>);
-
-/// Optional player-authored skin for tree foliage blocks (`assets/foliage.png`).
-/// Painted in grayscale — each species' foliage colour multiplies it, so one
-/// texture skins every tree. Alpha in the texture makes leaf blocks semi-
-/// transparent. `None` (file absent) falls back to flat-colour foliage.
-#[derive(Resource, Default)]
-pub(crate) struct FoliageSkin(pub(crate) Option<Handle<Image>>);
-
-/// Everything the render world needs for one finished tree, produced on a
-/// background compute thread so 650-ft giants never hitch the frame.
-struct BuiltTree {
-    bark_mesh: Mesh,
-    /// One foliage mesh per LOD level, finest first.
-    foliage_meshes: [Mesh; FOLIAGE_LOD_FACTORS.len()],
-    foliage_center: Vec3,
-    foliage_radius: f32,
-    bark_color: Color,
-    foliage_color: Color,
-}
-
-/// An in-flight background tree build; resolved by [`finish_tree_build_tasks`].
-#[derive(Component)]
-pub(crate) struct PendingTree {
-    task: Task<BuiltTree>,
-    chunk_entity: Entity,
-    local_base: Vec3,
-    species: TreeSpecies,
-    tree_seed: u64,
-}
-
-pub(crate) fn start_tree_build_tasks(
-    mut commands: Commands,
-    mut tree_queue: ResMut<TreeSpawnQueue>,
-    pending: Query<(), With<PendingTree>>,
-) {
-    let mut in_flight = pending.iter().count();
-    if in_flight >= MAX_CONCURRENT_TREE_BUILDS {
-        return;
-    }
-    let pool = AsyncComputeTaskPool::get();
-
-    while in_flight < MAX_CONCURRENT_TREE_BUILDS {
-        let Some(job) = tree_queue.0.pop_front() else {
-            break;
-        };
-
-        let species = job.species;
-        let tree_seed = job.tree_seed;
-        let bark = job.bark_color;
-        let foliage = job.foliage_color;
-
-        let task = pool.spawn(async move {
-            let mut rng = GardenRng::new(tree_seed);
-            let tree: VoxelTreeData = generate_tree(species, &mut rng);
-            // Bark and foliage are both rasterised on the world voxel grid —
-            // one block size for the whole world.
-            let bark_mesh = build_culled_voxel_mesh(&tree.bark, TREE_VOXEL_SIZE);
-            let foliage_meshes = FOLIAGE_LOD_FACTORS.map(|factor| {
-                if factor == 1 {
-                    build_culled_voxel_mesh(&tree.foliage, TREE_VOXEL_SIZE)
-                } else {
-                    let coarse = downsample_blocks(&tree.foliage, factor, FOLIAGE_LOD_FILL);
-                    build_culled_voxel_mesh(&coarse, TREE_VOXEL_SIZE * factor as f32)
-                }
-            });
-
-            // Canopy bounding sphere (tree-local feet) for distance-based LOD.
-            let mut min = Vec3::splat(f32::MAX);
-            let mut max = Vec3::splat(f32::MIN);
-            for v in &tree.foliage {
-                let p = v.as_vec3() * TREE_VOXEL_SIZE;
-                min = min.min(p);
-                max = max.max(p);
-            }
-            let foliage_center = (min + max) * 0.5;
-            let foliage_radius = (max - min).length() * 0.5;
-            let bark_color = Color::srgb(
-                rng.range(bark.0 - 0.05, bark.0 + 0.05),
-                rng.range(bark.1 - 0.05, bark.1 + 0.05),
-                rng.range(bark.2 - 0.05, bark.2 + 0.05),
-            );
-            let foliage_color = Color::srgb(
-                rng.range(foliage.0 - 0.05, foliage.0 + 0.05),
-                rng.range(foliage.1 - 0.05, foliage.1 + 0.05),
-                rng.range(foliage.2 - 0.05, foliage.2 + 0.05),
-            );
-            BuiltTree {
-                bark_mesh,
-                foliage_meshes,
-                foliage_center,
-                foliage_radius,
-                bark_color,
-                foliage_color,
-            }
-        });
-
-        commands.spawn(PendingTree {
-            task,
-            chunk_entity: job.chunk_entity,
-            local_base: job.local_base,
-            species,
-            tree_seed,
-        });
-        in_flight += 1;
-    }
-}
-
-/// Collect finished background builds and stand the trees up in the world.
-pub(crate) fn finish_tree_build_tasks(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    foliage_skin: Res<FoliageSkin>,
-    mut pending_q: Query<(Entity, &mut PendingTree)>,
-    mut tree_counts: Query<&mut TreesPending, With<WorldChunk>>,
-) {
-    for (holder, mut pending) in &mut pending_q {
-        let Some(built) = block_on(future::poll_once(&mut pending.task)) else {
-            continue;
-        };
-
-        // The chunk may have streamed out while the tree was building.
-        if let Ok(mut count) = tree_counts.get_mut(pending.chunk_entity) {
-            count.0 = count.0.saturating_sub(1);
-            let bark_mesh = meshes.add(built.bark_mesh);
-            let foliage_meshes = built.foliage_meshes.map(|m| meshes.add(m));
-            // Trees build OPAQUE and HIDDEN, then reveal in one atomic frame once
-            // the whole chunk is standing (reveal_built_chunks), as its blocky
-            // silhouette despawns the same frame — so the swap reads as the coarse
-            // blocks snapping into full detail, seamless like the foliage-box LODs,
-            // with no cross-fade ghosting and no gap. (No fade-in from alpha 0: the
-            // one case without a silhouette stand-in is the very first chunks at
-            // spawn, which just appear when ready.)
-            let bark_material = materials.add(StandardMaterial {
-                base_color: built.bark_color,
-                alpha_mode: AlphaMode::Opaque,
-                ..default()
-            });
-            // The species tint multiplies the (grayscale) skin texture, so one
-            // player-drawn foliage.png colours itself per tree. The skin's alpha
-            // is a hard leaf-shaped cutout, so we alpha-MASK it rather than
-            // blend: Mask writes depth (Blend does not), which the distance-blur
-            // post-process needs — otherwise it reads the sky behind the canopy
-            // and the leaves stay blurred even right up close. Flat colour stays
-            // opaque. Strand-like foliage (fern fronds, casuarina needles) is
-            // drawn as thin ribbons of blocks — the cutout skin shreds those, so
-            // they stay solid.
-            let strand_foliage = matches!(
-                pending.species,
-                TreeSpecies::TreeFern | TreeSpecies::DesertOak
-            );
-            let skin = if strand_foliage {
-                None
-            } else {
-                foliage_skin.0.clone()
-            };
-            // Skinned foliage is alpha-MASKed (not blended): Mask writes depth,
-            // which the distance-blur post-process needs — otherwise it reads the
-            // sky behind the canopy and the leaves stay blurred right up close.
-            // Flat colour stays opaque.
-            let foliage_final_mode = if skin.is_some() {
-                AlphaMode::Mask(0.5)
-            } else {
-                AlphaMode::Opaque
-            };
-            let foliage_material = materials.add(StandardMaterial {
-                base_color: built.foliage_color,
-                alpha_mode: foliage_final_mode,
-                base_color_texture: skin,
-                ..default()
-            });
-
-            let species = pending.species;
-            let local_base = pending.local_base;
-
-            // Sway character scales with stature: giants heave in slow, small
-            // arcs; scrub whips about. Seeded per tree so a forest never rocks
-            // in unison.
-            let mut sway_rng = GardenRng::new(pending.tree_seed ^ 0x57A9_11FE);
-            let stature_ft = built.foliage_center.y.max(10.0);
-            let wind_sway = WindSway {
-                phase: sway_rng.range(0.0, std::f32::consts::TAU),
-                amplitude: (0.006 + 2.5 / stature_ft).min(0.03)
-                    + sway_rng.range(0.0, 0.004),
-                frequency: (60.0 / stature_ft).clamp(0.25, 2.0)
-                    * sway_rng.range(0.85, 1.15),
-            };
-
-            commands.entity(pending.chunk_entity).with_children(|trees| {
-                trees
-                    .spawn((
-                        WildTree { species },
-                        wind_sway,
-                        FoliageLodGroup {
-                            center: built.foliage_center,
-                            radius: built.foliage_radius,
-                            level: 0,
-                        },
-                        // Hidden until the whole chunk is built, then revealed
-                        // atomically as the silhouette drops — a clean snap, not a
-                        // fade. reveal_built_chunks flips this to Inherited.
-                        Visibility::Hidden,
-                        Transform::from_translation(local_base),
-                    ))
-                    .with_children(|tree_root| {
-                        tree_root.spawn((
-                            Mesh3d(bark_mesh),
-                            MeshMaterial3d(bark_material),
-                            Transform::IDENTITY,
-                            // A titan trunk towers far outside a low, close
-                            // camera's view cone, so Bevy's per-mesh frustum
-                            // test can reject the whole thing even while its base
-                            // fills the screen — the tree blinks off as you fly
-                            // at it. Trees are big landmark objects worth always
-                            // submitting; skip the cull so they never vanish.
-                            NoFrustumCulling,
-                        ));
-                        // All LOD rungs spawn hidden; update_foliage_lod shows the
-                        // right one (even while the tree root is still hidden), so
-                        // the correct rung is already live the frame we reveal.
-                        for (level, mesh) in foliage_meshes.into_iter().enumerate() {
-                            tree_root.spawn((
-                                FoliageLod { level },
-                                Mesh3d(mesh),
-                                MeshMaterial3d(foliage_material.clone()),
-                                Transform::IDENTITY,
-                                Visibility::Hidden,
-                                // Same reason as the bark: a giant's crown sits
-                                // hundreds of feet up, outside a low camera's
-                                // frustum, and would blink out. (LOD visibility
-                                // still hides the inactive rungs.)
-                                NoFrustumCulling,
-                            ));
-                        }
-                    });
-            });
-        }
-
-        commands.entity(holder).despawn();
-    }
-}
-
-fn despawn_entity_tree(entity: Entity, commands: &mut Commands) {
-    // Chunks own terrain meshes and trees as children — in Bevy 0.15 a plain
-    // despawn would orphan them and leave ghost geometry behind.
+fn despawn_chunk_entity(entity: Entity, commands: &mut Commands) {
+    // A chunk owns its terrain mesh as a child — in Bevy 0.15 a plain despawn
+    // would orphan it and leave ghost geometry behind.
     commands.entity(entity).despawn_recursive();
 }
 
@@ -346,7 +97,6 @@ fn chunk_is_queued(chunk_world: &ChunkWorld, coord: IVec2) -> bool {
 /// silhouette stands, which is why this system no longer needs Commands.
 pub(crate) fn plan_chunk_streaming(
     mut chunk_world: ResMut<ChunkWorld>,
-    mut tree_queue: ResMut<TreeSpawnQueue>,
     cam_q: Query<&Transform, With<Camera>>,
 ) {
     let Ok(cam) = cam_q.get_single() else {
@@ -400,9 +150,8 @@ pub(crate) fn plan_chunk_streaming(
     }
 
     // Leaving chunks don't despawn here — they move to the holding set, still
-    // rendering, and finalize_deferred_unloads drops them once their silhouette
-    // stands. Cancel any not-yet-built real trees for them so nothing new spawns
-    // into a chunk that's on its way out.
+    // rendering, and finalize_deferred_unloads drops them once their far ground
+    // stands.
     let to_unload: Vec<IVec2> = chunk_world
         .loaded
         .keys()
@@ -414,12 +163,11 @@ pub(crate) fn plan_chunk_streaming(
         let Some(entity) = chunk_world.loaded.remove(&coord) else {
             continue;
         };
-        tree_queue.0.retain(|job| job.chunk_entity != entity);
         chunk_world.unloading.insert(coord, entity);
     }
 }
 
-/// Drop each held-over chunk the frame its far silhouette stands. Until then its
+/// Drop each held-over chunk the frame its far ground stands. Until then its
 /// real meshes keep rendering, so the swap reads as the detailed world coarsening
 /// into blocks — never a gap where the box blinks out before popping back in.
 /// The ONLY other way a held chunk is released is once it has receded past the
@@ -463,7 +211,7 @@ pub(crate) fn finalize_deferred_unloads(
         if let Some(record) = chunk_world.active_records.remove(&coord) {
             archive_chunk(&mut archive, record);
         }
-        despawn_entity_tree(entity, &mut commands);
+        despawn_chunk_entity(entity, &mut commands);
     }
 }
 
@@ -516,17 +264,14 @@ pub(crate) fn process_chunk_load_queue(
     }
 }
 
-/// Land finished chunk builds: spawn the chunk entity, its terrain mesh and
-/// leaves, and queue its trees.
+/// Land finished chunk builds: spawn the chunk entity and its terrain mesh.
+/// (Phase 0: no leaf/grass scatter or tree queueing — terrain only.)
 pub(crate) fn finish_chunk_tasks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut chunk_world: ResMut<ChunkWorld>,
     mut archive: ResMut<ChunkArchive>,
-    mut tree_queue: ResMut<TreeSpawnQueue>,
     terrain_materials: Res<TerrainMaterials>,
-    leaf_assets: Res<LeafAssets>,
-    grass_assets: Res<GrassAssets>,
     mut pending_q: Query<(Entity, &mut PendingChunk)>,
 ) {
     for (holder, mut pending) in &mut pending_q {
@@ -550,7 +295,6 @@ pub(crate) fn finish_chunk_tasks(
         let chunk_entity = commands
             .spawn((
                 WorldChunk { coord },
-                TreesPending(built.record.trees.len()),
                 Transform::from_translation(origin),
                 Visibility::default(),
             ))
@@ -563,7 +307,7 @@ pub(crate) fn finish_chunk_tasks(
             // chunk at spawn, and anything inside the streamed neighbourhood)
             // would show straight through the world as a gaping hole for the
             // duration of the fade. The coarse far ground is despawned the same
-            // frame this appears (see plan_tree_silhouettes), so the hand-off is
+            // frame this appears (see plan_ground_silhouettes), so the hand-off is
             // gapless, and the seam fix now lands both at the same height.
             let material = terrain_materials.vertex_color_terrain.clone();
             commands.entity(chunk_entity).with_children(|parent| {
@@ -575,16 +319,7 @@ pub(crate) fn finish_chunk_tasks(
                 ));
             });
         }
-        scatter_chunk_leaves(&mut commands, chunk_entity, coord, &leaf_assets);
-        scatter_chunk_grass(
-            &mut commands,
-            chunk_entity,
-            coord,
-            &built.column_tops,
-            &grass_assets,
-        );
 
-        tree_queue.0.extend(built.record.tree_jobs(chunk_entity));
         chunk_world.surface_tops.insert(coord, built.column_tops);
         chunk_world.active_records.insert(coord, built.record);
         chunk_world.loaded.insert(coord, chunk_entity);
