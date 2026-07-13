@@ -7,6 +7,8 @@ the director: I'm the sole active agent for Phase 0; the fleet is paused.)
 **Branch:** `phase-0-terrain` (NOT `terrain`).
 
 Seen broadcast #10 (the PROJECT PIVOT to a phased build — terrain first, solo).
+Re-read the terrain inbox 2026-07-12 after Stage 1: picked up the updated Stage 2
+item 4 — **worm stays 3 inches** (spec's 1-inch superseded).
 
 ## Status
 2026-07-12: **Phase 0, Stage 1 COMPLETE — the ecology strip now RUNS.**
@@ -66,16 +68,30 @@ phase-0-terrain. Easy to retarget.
 3. **Hierarchical seed tree + progressive unfolding** (spec §4): formalize the
    flat `chunk_seed` into macro→L1→L2→leaf; unify LOD as depth-limited eval
    (can subsume the far-ground I kept).
-4. **Worm-scale calibration** (spec §2): worm is ~1 inch; code has
-   `WORM_LENGTH = 3 inches`. Flag the exact change for an owner eyeball before
-   changing (eye-height/reach/collision feel).
+4. **Worm scale — LEAVE IT ALONE (owner decision 2026-07-12, updated inbox).**
+   Keep `WORM_LENGTH = 3 inches`; the spec §2 "~1 inch worm" is SUPERSEDED. No
+   code change to worm size. Yardstick is the **3-inch worm**: 1 ft = 4
+   worm-lengths, a 3 ft bush = 12 worm-lengths = "a mighty tree" feel — use that
+   in comments/PRs.
 
 ## Design notes (carried forward)
 - **Depth authority:** `DIGGABLE_DEPTH_VOXELS` (topography.rs). Gen/collision
   agreement is load-bearing — keep new underground features column-based and
   overhang-free (the `generation_and_collision_agree...` test pins it at zero
   mismatch).
-- **Distance language: feet/inches; the worm is 1 inch** (owner's yardstick).
+- **Distance language: feet/inches; the worm is 3 INCHES** (owner's yardstick,
+  updated 2026-07-12). 1 ft = 4 worm-lengths. NOT 1 inch — the spec §2 figure is
+  superseded; `WORM_LENGTH` stays 3 in.
+
+## Flag for the director (rule 7)
+- The updated inbox item 4 keeps the 3-inch worm, but the inbox's **Process
+  footer still says "the worm is 1 inch — use that yardstick"** (a stale
+  leftover from the pre-decision text). Item 4 is newer + specific, so I'm
+  following 3 inches — flagging the internal contradiction so you can tidy the
+  footer. (Not editing `_director/` per rule 6.)
+- The extracted `docs/terrain_volume_1_spec.md` §2 still reads "~1 inch worm"
+  verbatim (faithful to the owner's source). Left as-is rather than editing the
+  owner's doc; say if you'd like a superseded-note added there.
 
 ## Done / merged
 - 2026-07-12: Phase 0 Stage 0 (spec extraction, 4829a59) + Stage 1 (ecology-strip
