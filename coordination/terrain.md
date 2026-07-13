@@ -46,7 +46,8 @@ markdown — `docs/project_roadmap.md`, `docs/terrain_volume_1_spec.md` (the
 Phase 0 source of truth).
 
 ## Currently touching
-- files: (none — Stage 1 committed; PR pending)
+- files: (none — Stage 1 shipped as **PR #27** phase-0-terrain → main, awaiting
+  owner eyeball)
 
 ## Open question for the director/owner
 **PR base + branch model.** phase-0-terrain is the designated Phase 0 branch and
@@ -78,6 +79,6 @@ phase-0-terrain. Easy to retarget.
 
 ## Done / merged
 - 2026-07-12: Phase 0 Stage 0 (spec extraction, 4829a59) + Stage 1 (ecology-strip
-  → running sandbox) — PR pending.
+  → running sandbox, ecf8b29) — **PR #27**.
 - Earlier rotation-1/2 terrain work (coastline, geology, boulders, tunnels,
   cave-alignment) shipped in PRs #7/#18/#21 — see git history.
