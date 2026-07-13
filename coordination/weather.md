@@ -76,6 +76,26 @@ What's here:
   overcast, a few cumulus barely count), grey ramps once that passes 0.5.
 
 ## Needs / requests (route via human)
+- **CORE CHANGE NEEDED — raise the camera far plane (blocker for round-2
+  clouds).** Owner's round-2 direction wants clouds ENORMOUS, HIGH (every high
+  type's base clearly above the 1000 ft treeline), and MANY across the sky.
+  That blows past the 1600 ft far plane in `worm.rs`
+  (`Projection { far: 1600.0 }`, core — I did NOT touch it). With enormous high
+  clouds spread over a ~1600 ft spawn radius up to ~2750 ft altitude, the
+  farthest cloud sits ~3500 ft out, so **requesting `far: 5000.0`**.
+  - Tradeoffs for the director to weigh: (1) depth precision — far/near grows
+    (near is ~0.1), so distant terrain z-fighting is possible; bumping the near
+    plane a touch (e.g. 0.3) would help if it doesn't clip the worm's nose.
+    (2) Fog/silhouettes are unaffected in practice — terrain silhouettes only
+    reach ~770 ft and still fog out ~1350 ft; the extra range is sky-only.
+    (3) Clouds are already `fog_enabled: false`, so they won't fog at range;
+    the distance-blur pass still softens them.
+  - Alternative if a 5000 ft world far plane is undesirable: a separate sky/
+    cloud render pass not bound by the world far plane — heavier to build; I'd
+    prefer the far-plane bump. Your call.
+  - **Until this lands, the high/enormous clouds clip at 1600 ft in-game**, so
+    the round-2 push is sized for the target and eyeball-verified only for the
+    overhead band; full-sky verification waits on the far-plane change.
 - docs/module-contracts.md update (I did NOT edit it — routing the wording):
   - `sky.rs`: no longer "fully self-contained" — now `SkyPlugin` + `SkyClock`
     (resource: day fraction + day count, read by weather). Reads

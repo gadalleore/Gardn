@@ -958,121 +958,124 @@ struct FormParams {
 }
 
 fn form_params(form: FormKind) -> FormParams {
-    // Owner's altitude layering (2026-07-12, corrected) — and the review fix:
-    // the trees are TITANS (a mountain ash tops ~1000 ft), so the whole sky had
-    // to move up to clear the treetops. Flat wide "loaves" skim the canopy
-    // (~320–440 ft), the puffy/mid types ride higher, the thin cirrus family
-    // sits high, the cumulonimbus giants are the BIGGEST and tower highest of
-    // the *main* clouds (anvil ~1150 ft), and the cirrostratus herald veil caps
-    // ABOVE them all (~1250 ft). Everything stays inside the camera's 1600 ft
-    // far plane even at the field's far edge — the guardrail the reviewer set.
-    // (Cloud material is `fog_enabled: false`, so the 650–1350 ft distance fog
-    // no longer swallows the high layers; the distance-blur pass still softens
-    // the far ones.)
+    // Owner's round-2 sky (2026-07-12): ENORMOUS, HIGH, MANY. Titan clouds over
+    // a 3-inch worm. Two bands with a big vertical gap:
+    //   • the LOW treetop loaf deck — stratus / stratocumulus / nimbostratus,
+    //     wide flat rounded loaves skimming the canopy (tops < ~700 ft);
+    //   • the HIGH band — every type's BASE clearly above the 1000 ft tall-tree
+    //     line: fluffy cumulus, the mid puffs, the WISPY cirrus family way up,
+    //     the TOWERING cumulonimbus giants (footprint ~780 ft, column ~1350 ft,
+    //     anvil ~2500 ft), and the cirrostratus veil capping highest of all
+    //     (~2750 ft). Sizes are big footprints on big cells so the meshes stay
+    //     cheap. This layout needs the raised far plane (~5000 ft) specced in
+    //     coordination — it exceeds the current 1600 ft wall on purpose.
+    // (Cloud material is `fog_enabled: false`, so distance fog can't swallow the
+    //  high layers; the distance-blur pass still softens the far ones.)
     use CloudType::*;
     match form {
-        // The herald: a wide, very thin, broken pale veil — the TOP layer of
-        // the sky, above even the cumulonimbus anvils.
+        // The herald: the widest, thinnest, broken pale veil — TOP layer of the
+        // whole sky, above even the cumulonimbus anvils.
         FormKind::Cirrostratus => FormParams {
-            dims: IVec3::new(24, 2, 24),
-            cell_ft: 15.0,
-            altitude: 1250.0,
-            alt_jitter: 30.0,
-            max_count: 9,
-            scale_jitter: (0.9, 1.25),
+            dims: IVec3::new(44, 2, 44),
+            cell_ft: 30.0,
+            altitude: 2750.0,
+            alt_jitter: 60.0,
+            max_count: 12,
+            scale_jitter: (0.9, 1.35),
             sky_weight: 0.7,
         },
         FormKind::Main(kind) => match kind {
-            // High wispy streaks combed along the wind.
+            // Way-up wispy streaks combed along the wind — long, thin, feathered.
             Cirrus => FormParams {
-                dims: IVec3::new(20, 2, 6),
-                cell_ft: 11.0,
-                altitude: 940.0,
-                alt_jitter: 40.0,
-                max_count: 7,
-                scale_jitter: (0.8, 1.3),
+                dims: IVec3::new(52, 2, 8),
+                cell_ft: 20.0,
+                altitude: 2250.0,
+                alt_jitter: 90.0,
+                max_count: 14,
+                scale_jitter: (0.85, 1.45),
                 sky_weight: 0.4,
             },
-            // A mackerel sky: many small high rippled patches.
+            // A high mackerel sky: many small thin rippled patches.
             Cirrocumulus => FormParams {
-                dims: IVec3::new(14, 2, 12),
-                cell_ft: 8.0,
-                altitude: 880.0,
-                alt_jitter: 30.0,
-                max_count: 9,
-                scale_jitter: (0.85, 1.2),
+                dims: IVec3::new(40, 3, 34),
+                cell_ft: 18.0,
+                altitude: 2050.0,
+                alt_jitter: 70.0,
+                max_count: 14,
+                scale_jitter: (0.85, 1.3),
                 sky_weight: 0.5,
             },
-            // Mid-level puff patches.
+            // Mid-high puff patches.
             Altocumulus => FormParams {
-                dims: IVec3::new(12, 3, 11),
-                cell_ft: 9.0,
-                altitude: 740.0,
-                alt_jitter: 30.0,
-                max_count: 9,
-                scale_jitter: (0.85, 1.2),
+                dims: IVec3::new(30, 6, 28),
+                cell_ft: 20.0,
+                altitude: 1550.0,
+                alt_jitter: 80.0,
+                max_count: 12,
+                scale_jitter: (0.85, 1.3),
                 sky_weight: 0.6,
             },
-            // A flat loaf skimming the canopy — wide, squat, rounded.
+            // A low flat loaf skimming the canopy — wide, squat, rounded.
             Stratocumulus => FormParams {
-                dims: IVec3::new(16, 6, 14),
-                cell_ft: 10.0,
-                altitude: 440.0,
-                alt_jitter: 24.0,
-                max_count: 8,
-                scale_jitter: (0.85, 1.2),
-                sky_weight: 0.85,
-            },
-            // The classic fluffy heap: flat bottom, cauliflower dome, riding
-            // above the treetop loaves.
-            Cumulus => FormParams {
-                dims: IVec3::new(11, 8, 11),
-                cell_ft: 8.0,
+                dims: IVec3::new(30, 6, 26),
+                cell_ft: 22.0,
                 altitude: 600.0,
                 alt_jitter: 40.0,
-                max_count: 6,
-                scale_jitter: (0.8, 1.35),
+                max_count: 14,
+                scale_jitter: (0.9, 1.35),
+                sky_weight: 0.85,
+            },
+            // The classic fluffy heap, now ENORMOUS and riding high above the
+            // trees: flat bottom, cauliflower dome.
+            Cumulus => FormParams {
+                dims: IVec3::new(26, 24, 26),
+                cell_ft: 22.0,
+                altitude: 1420.0,
+                alt_jitter: 120.0,
+                max_count: 12,
+                scale_jitter: (0.8, 1.5),
                 sky_weight: 0.4,
             },
-            // The giant: biggest footprint, tallest column (~500 ft), anvil
-            // topping the whole main layer well clear of the 1000 ft trees.
+            // The TOWERING giant: huge footprint (~780 ft), a ~1350 ft column
+            // and flared anvil, base clearing the treetops and top the tallest
+            // of the mains. Unmistakably the biggest thing in the sky.
             Cumulonimbus => FormParams {
-                dims: IVec3::new(14, 46, 14),
-                cell_ft: 11.0,
-                altitude: 900.0,
-                alt_jitter: 20.0,
-                max_count: 2,
-                scale_jitter: (0.9, 1.15),
+                dims: IVec3::new(30, 52, 30),
+                cell_ft: 26.0,
+                altitude: 1850.0,
+                alt_jitter: 60.0,
+                max_count: 4,
+                scale_jitter: (0.9, 1.2),
                 sky_weight: 0.55,
             },
             // The rain loaf: the broadest, thickest low deck.
             Nimbostratus => FormParams {
-                dims: IVec3::new(20, 6, 18),
-                cell_ft: 11.0,
-                altitude: 380.0,
-                alt_jitter: 20.0,
-                max_count: 8,
-                scale_jitter: (0.9, 1.2),
+                dims: IVec3::new(34, 5, 30),
+                cell_ft: 24.0,
+                altitude: 500.0,
+                alt_jitter: 40.0,
+                max_count: 14,
+                scale_jitter: (0.9, 1.3),
                 sky_weight: 1.0,
             },
-            // The outro sheets: altostratus a wide mid loaf, stratus the lowest
-            // loaf of all, right over the canopy.
+            // The outro sheets: altostratus a wide mid-high loaf, stratus the
+            // lowest loaf of all, right over the canopy.
             Altostratus => FormParams {
-                dims: IVec3::new(18, 4, 16),
-                cell_ft: 11.0,
-                altitude: 660.0,
-                alt_jitter: 24.0,
-                max_count: 8,
-                scale_jitter: (0.9, 1.2),
+                dims: IVec3::new(34, 5, 30),
+                cell_ft: 22.0,
+                altitude: 1500.0,
+                alt_jitter: 70.0,
+                max_count: 12,
+                scale_jitter: (0.9, 1.3),
                 sky_weight: 0.9,
             },
             Stratus => FormParams {
-                dims: IVec3::new(18, 5, 16),
-                cell_ft: 10.0,
-                altitude: 320.0,
-                alt_jitter: 18.0,
-                max_count: 8,
-                scale_jitter: (0.9, 1.2),
+                dims: IVec3::new(30, 4, 26),
+                cell_ft: 24.0,
+                altitude: 420.0,
+                alt_jitter: 40.0,
+                max_count: 16,
+                scale_jitter: (0.9, 1.3),
                 sky_weight: 0.95,
             },
         },
@@ -1108,20 +1111,32 @@ fn form_blobs(form: FormKind, dims: IVec3, rng: &mut GardenRng) -> Vec<Blob> {
             }
         }
         FormKind::Main(kind) => match kind {
-            // A streak: blobs strung along X, radius tapering to feathered ends.
+            // WISPY cirrus (owner: thin, streaky, feathered, low density — NOT
+            // chunky). A few parallel hair-thin streaks running along the wind,
+            // each a line of small blobs with feathered ends and frequent gaps,
+            // so it reads as a broken veil of mares'-tails rather than a bar.
             CloudType::Cirrus => {
-                let n = 7;
-                for i in 0..n {
-                    let f = i as f32 / (n - 1) as f32;
-                    let taper = (f * std::f32::consts::PI).sin(); // 0 at ends, 1 mid
-                    blobs.push(Blob {
-                        center: Vec3::new(
-                            f * dx,
-                            mid_y + rng.range(-0.4, 0.4),
-                            dz * 0.5 + rng.range(-1.0, 1.0),
-                        ),
-                        radius: (dy * (0.7 + 1.4 * taper)).max(1.2),
-                    });
+                let streaks = rng.range_i(2, 4);
+                for _ in 0..streaks {
+                    let z0 = rng.range(dz * 0.2, dz * 0.8);
+                    let n = (dx * 0.7) as i32;
+                    for i in 0..n.max(1) {
+                        let f = i as f32 / (n - 1).max(1) as f32;
+                        // Feather the ends to nothing.
+                        let taper = (f * std::f32::consts::PI).sin();
+                        // ~40% gaps → wispy, broken, not a solid line.
+                        if rng.chance(0.4) {
+                            continue;
+                        }
+                        blobs.push(Blob {
+                            center: Vec3::new(
+                                f * dx,
+                                mid_y + rng.range(-0.3, 0.3),
+                                z0 + rng.range(-1.2, 1.2),
+                            ),
+                            radius: (0.8 + 1.5 * taper) * rng.range(0.7, 1.1),
+                        });
+                    }
                 }
             }
             // Mackerel / puff patches: many small lumps scattered thin.
@@ -1338,9 +1353,11 @@ const FACES: [([i32; 3], [[f32; 3]; 4], [f32; 3]); 6] = [
     ([0, 0, -1], [[0., 0., 0.], [0., 1., 0.], [1., 1., 0.], [1., 0., 0.]], [0., 0., -1.]),
 ];
 
-/// Per-face baked shade (top bright → bottom dark) so the block form reads
-/// with volume even under flat ambient; the sun's lighting layers on top.
-const FACE_SHADE: [f32; 6] = [0.82, 0.82, 1.0, 0.55, 0.82, 0.82];
+/// Per-face baked shade (top bright → bottom less bright) so the block form
+/// reads with volume even under flat ambient; the sun's lighting layers on
+/// top. The bottom is only *gently* darker, not black — a worm looking up sees
+/// undersides and they must still read as light cloud, not silhouette.
+const FACE_SHADE: [f32; 6] = [0.9, 0.9, 1.0, 0.78, 0.9, 0.9];
 
 /// Build a culled-cube mesh from a grid: only faces between a filled cell and
 /// empty space are emitted, centred so the mesh's local origin is the cloud's
@@ -1362,14 +1379,15 @@ fn build_cloud_mesh(grid: &VoxelGrid, cell_ft: f32) -> Mesh {
                     continue;
                 }
                 let cell = Vec3::new(x as f32, y as f32, z as f32);
-                // Undersides in shadow: cells low in the cloud run darker.
-                let height_shade = 0.62 + 0.38 * (y as f32 / y_span);
+                // Undersides in shadow: cells low in the cloud run a little
+                // darker (gently — not toward black; see FACE_SHADE).
+                let height_shade = 0.78 + 0.22 * (y as f32 / y_span);
                 for (fi, (noff, corners, normal)) in FACES.iter().enumerate() {
                     if grid.get(x + noff[0], y + noff[1], z + noff[2]) {
                         continue; // interior face — skip
                     }
                     let base = positions.len() as u32;
-                    let shade = FACE_SHADE[fi] * (0.72 + 0.28 * height_shade);
+                    let shade = FACE_SHADE[fi] * (0.85 + 0.15 * height_shade);
                     for corner in corners {
                         let p = origin
                             + (cell + Vec3::from_array(*corner)) * cell_ft;
@@ -1401,10 +1419,11 @@ fn build_cloud_mesh(grid: &VoxelGrid, cell_ft: f32) -> Mesh {
 /// LOD block-size multipliers on the fine grid — 1× up close, 4× blocks far
 /// off, same near=detail/far=coarse ladder the foliage uses.
 const CLOUD_LOD_FACTORS: [i32; 3] = [1, 2, 4];
-/// Camera-distance cutoffs (ft) to step coarser. Pushed well out: clouds are
-/// huge and the distance blur + haze hide the swaps, so even the coarse rung
-/// only shows once it's tiny on screen.
-const CLOUD_LOD_DISTANCES_FT: [f32; 2] = [240.0, 520.0];
+/// Camera-distance cutoffs (ft) to step coarser. Pushed well out for the
+/// now-enormous, far-off clouds (bases mostly >1000 ft): the finest blocks hold
+/// close, and the coarse rungs only take over once a cloud is distant enough
+/// that the distance-blur pass is already softening the swap.
+const CLOUD_LOD_DISTANCES_FT: [f32; 2] = [700.0, 1500.0];
 /// Shape variants baked per form, so a sky of one type isn't all one cloud.
 const CLOUD_VARIANTS: usize = 3;
 
@@ -1459,6 +1478,13 @@ fn setup_cloud_library(
         base_color: Color::WHITE,
         perceptual_roughness: 1.0,
         reflectance: 0.08,
+        // A soft self-lit floor so clouds read WHITE from BELOW — the worm's
+        // main viewing angle is straight up at a cloud's shadowed underside,
+        // which under sun+ambient alone silhouettes to near-black. This gentle
+        // emissive keeps the underside a light grey (owner: white by default)
+        // without flattening the sunlit-top form. tint_clouds only touches
+        // base_color, so overcast still greys over this floor.
+        emissive: LinearRgba::rgb(0.30, 0.32, 0.38),
         // Lit (the sun models the blocks), but fog OFF: the high layers now sit
         // at 600–1250 ft — inside the 650–1350 ft distance fog that melts the
         // terrain horizon — so with fog on they'd wash out to sky. Punching
@@ -1516,6 +1542,12 @@ struct Cloud {
     /// 1 while the front still wants this cloud, 0 once it's retiring.
     target: f32,
     base_scale: f32,
+    /// Steady world-XZ drift velocity (ft/s), fixed at formation. The owner's
+    /// rule: a cloud holds a constant drift for its whole life and NEVER
+    /// freezes when the wind lulls — so drift is decoupled from the live
+    /// `wind.strength` (the same coupling bug the leaves hit). Set from the
+    /// wind heading + a baseline floor at spawn.
+    vel: Vec2,
 }
 
 /// On the cloud root: which LOD rung is showing (hysteresis lives here).
@@ -1533,15 +1565,23 @@ struct CloudLod {
 /// Where new clouds enter (a disc around the worm), and where a drifting cloud
 /// is far enough off to retire. Clouds live in world space, so the worm can
 /// crawl clear of the weather — the field just follows where it currently is.
-const CLOUD_SPAWN_RADIUS: f32 = 560.0;
-const CLOUD_DESPAWN_RADIUS: f32 = 800.0;
-/// Drift speed (ft/s) per unit of wind strength — a gale marches the ceiling
-/// visibly, a calm day barely stirs it.
-const CLOUD_DRIFT_FTPS: f32 = 3.2;
+/// Big, so a front fills the whole sky with many spread-out clumps (owner) —
+/// this needs the raised far plane specced in coordination (clouds this far
+/// out + this high otherwise clip the 1600 ft wall).
+const CLOUD_SPAWN_RADIUS: f32 = 1600.0;
+const CLOUD_DESPAWN_RADIUS: f32 = 2200.0;
+/// Steady drift: a floor speed every cloud keeps for life (so it never freezes
+/// in a lull), plus a per-unit-of-wind term sampled ONCE at formation. A cloud
+/// forms with `DRIFT_FLOOR + strength_at_spawn * DRIFT_PER_STRENGTH` ft/s along
+/// the wind and holds it — enormous ceilings visibly, steadily marching over.
+const CLOUD_DRIFT_FLOOR_FTPS: f32 = 9.0;
+const CLOUD_DRIFT_PER_STRENGTH: f32 = 4.0;
 /// Seconds for a cloud to swell in or fade out.
 const CLOUD_GROW_SECS: f32 = 7.0;
 /// Cap new clouds per frame so a front filling in doesn't spawn a wall at once.
-const CLOUD_SPAWNS_PER_FRAME: usize = 2;
+/// A touch higher now the sky holds many more clumps, so fronts still fill in a
+/// reasonable time.
+const CLOUD_SPAWNS_PER_FRAME: usize = 3;
 
 /// Keep the local cloud population matching the director's targets: spawn new
 /// clouds of the wanted forms on the upwind side of the field, and retire any
@@ -1663,6 +1703,10 @@ fn spawn_local_clouds(
             )
         };
         let base_scale = wind.rng.range(p.scale_jitter.0, p.scale_jitter.1);
+        // Freeze in a steady drift velocity now, from the wind heading and its
+        // strength at THIS moment plus the floor — the cloud keeps it for life.
+        let speed = CLOUD_DRIFT_FLOOR_FTPS + wind.strength * CLOUD_DRIFT_PER_STRENGTH;
+        let vel = wind.dir * speed;
 
         let root = commands
             .spawn((
@@ -1672,6 +1716,7 @@ fn spawn_local_clouds(
                     present: 0.0,
                     target: 1.0,
                     base_scale,
+                    vel,
                 },
                 CloudLodGroup { level: 0 },
                 Transform {
@@ -1722,9 +1767,9 @@ fn drive_clouds(
     mut clouds: Query<(Entity, &mut Cloud, &mut Transform), Without<Camera>>,
 ) {
     let dt = time.delta_secs();
-    // Drift AND grid orientation both follow the wind (owner): clouds ride the
-    // wind vector, and their shared grid axis stays aligned to it as it wanders.
-    let drift = Vec3::new(wind.dir.x, 0.0, wind.dir.y) * wind.strength * CLOUD_DRIFT_FTPS * dt;
+    // Grid orientation follows the wind (owner: shared grid axis aligned to it);
+    // per-cloud DRIFT is each cloud's own steady velocity, NOT the live wind, so
+    // a lull never freezes the sky.
     let yaw_shared = Quat::from_rotation_y((-wind.dir.y).atan2(wind.dir.x));
     let center = cam_q
         .get_single()
@@ -1732,7 +1777,7 @@ fn drive_clouds(
         .unwrap_or(Vec2::ZERO);
 
     for (entity, mut cloud, mut tf) in &mut clouds {
-        tf.translation += drift;
+        tf.translation += Vec3::new(cloud.vel.x, 0.0, cloud.vel.y) * dt;
 
         // Blown off the far edge → start retiring.
         let flat = Vec2::new(tf.translation.x - center.x, tf.translation.z - center.y);
