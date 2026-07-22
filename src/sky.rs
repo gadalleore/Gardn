@@ -3,10 +3,15 @@
 //! light, and swinging the two directional lights + their visible discs.
 //! Sundown grades blue → gold → orange → violet → moonlit night, the sun ball
 //! itself blushes at the horizon, and a starfield wheels overhead after dark.
-//! `SkyPlugin` owns the clock, the celestial entities, and the update. Fully
-//! self-contained — nothing outside reads its state.
+//! `SkyPlugin` owns the clock, the celestial entities, and the update. It
+//! publishes [`SkyClock`] — the day fraction + day count, read by weather's
+//! seasons and morning-fog windows so both modules share the same clock
+//! (including the GARDN_HOUR / GARDN_DAY_SECS dev knobs). In return it reads
+//! weather's morning-fog level and pulls the distance-fog wall in: sky.rs
+//! stays the single writer of every light, sky colour, and fog value, so the
+//! local clouds never fight it for those.
 
-use bevy::pbr::{CascadeShadowConfigBuilder, DistanceFog, NotShadowCaster};
+use bevy::pbr::{CascadeShadowConfigBuilder, DistanceFog, FogFalloff, NotShadowCaster};
 use bevy::prelude::*;
 use bevy::render::view::RenderLayers;
 
@@ -17,6 +22,7 @@ pub struct SkyPlugin;
 impl Plugin for SkyPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(DayCycle::from_env())
+            .init_resource::<SkyClock>()
             .insert_resource(SunDirection(Vec3::new(0.6, 0.6, 0.35).normalize()))
             .add_systems(Startup, setup_sky)
             .add_systems(Update, update_day_cycle);
@@ -64,6 +70,16 @@ impl DayCycle {
             day_secs,
         }
     }
+}
+
+/// The game-time clock, published for the weather systems: `frac` is the
+/// fraction of the 24-h day (0 = midnight, 0.25 = 6:00, 0.5 = noon) and `day`
+/// counts completed days since launch — seasons divide it, fog windows read
+/// it. Kept here so GARDN_HOUR / GARDN_DAY_SECS steer every consumer at once.
+#[derive(Resource, Default)]
+pub(crate) struct SkyClock {
+    pub(crate) frac: f32,
+    pub(crate) day: u32,
 }
 
 /// A directional light driven around the sky by the day cycle.
@@ -257,6 +273,8 @@ fn update_day_cycle(
     mut clear: ResMut<ClearColor>,
     mut ambient: ResMut<AmbientLight>,
     mut sun_direction: ResMut<SunDirection>,
+    mut sky_clock: ResMut<SkyClock>,
+    weather_sky: Res<crate::weather::WeatherSky>,
     mut cam_q: Query<(&Transform, Option<&mut DistanceFog>), With<Camera>>,
     mut lights: Query<(&CelestialLight, &mut DirectionalLight, &mut Transform), Without<Camera>>,
     mut discs: Query<
@@ -273,7 +291,10 @@ fn update_day_cycle(
         ),
     >,
 ) {
-    let frac = (day.start_frac + time.elapsed_secs() / day.day_secs).rem_euclid(1.0);
+    let total = day.start_frac + time.elapsed_secs() / day.day_secs;
+    let frac = total.rem_euclid(1.0);
+    sky_clock.frac = frac;
+    sky_clock.day = total as u32;
     // 0.25 of the cycle = 6:00 — sunrise on the eastern horizon.
     let angle = (frac - 0.25) * std::f32::consts::TAU;
     // Slight southward tilt keeps noon shadows from collapsing to nothing.
@@ -360,9 +381,21 @@ fn update_day_cycle(
     };
     let cam_pos = cam_tf.translation;
     if let Some(mut fog) = fog {
-        fog.color = sky_color;
+        // Morning fog (weather rolls it, sky applies it — single fog writer):
+        // pull the fog wall from its distant default (650/1350 ft, mirroring
+        // the camera setup in worm.rs) right onto the worm and pale it toward
+        // mist. Written every frame, so it glides back out as the fog burns
+        // off. `f`=0 leaves the ordinary horizon haze untouched.
+        let f = weather_sky.fog;
+        fog.falloff = FogFalloff::Linear {
+            start: 650.0 + (45.0 - 650.0) * f,
+            end: 1350.0 + (220.0 - 1350.0) * f,
+        };
+        let mist = Vec3::new(0.80, 0.83, 0.87) * (0.25 + 0.75 * day_t);
+        let fog_c = sky.lerp(mist, f);
+        fog.color = Color::srgb(fog_c.x, fog_c.y, fog_c.z);
         let glow = Vec3::new(1.0, 0.95, 0.85).lerp(Vec3::new(0.75, 0.82, 1.0), moon_t);
-        fog.directional_light_color = Color::srgba(glow.x, glow.y, glow.z, 0.6);
+        fog.directional_light_color = Color::srgba(glow.x, glow.y, glow.z, 0.6 * (1.0 - 0.5 * f));
     }
 
     for (disc, mut tf, mut vis) in &mut discs {
